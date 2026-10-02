@@ -1,0 +1,13 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    // WebWorker rather than DOM: it supplies the Web APIs core actually uses
+    // (TextEncoder, crypto.subtle) while keeping `document` and `window` out of
+    // scope entirely. Core must run identically in the page, in a Worker, and
+    // in Node, and the architecture forbids it from touching the DOM — so the
+    // type environment is set up to make that a compile error, not a code review.
+    "lib": ["ES2022", "WebWorker"]
+  },
+  "include": ["src/**/*", "test/**/*"]
+}

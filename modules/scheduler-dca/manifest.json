@@ -1,0 +1,18 @@
+{
+  "id": "scheduler-dca",
+  "version": "1.0.0",
+  "apiVersion": "1.0.0",
+  "kind": "scheduler",
+  "displayName": "Auto-buy scheduler",
+  "description": "Decides when each auto-buy is due: one buy of the plan's fixed amount per window, and a window missed while spDEX was closed is skipped, not made up. Works only from the time the app gives it; reads nothing, keeps nothing.",
+  "capabilities": [],
+  "contracts": [],
+  "limits": {
+    "maxFuel": "1000000",
+    "maxMemory": "8388608",
+    "maxCallsPerQuote": 0
+  },
+  "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "publicKey": "0x00",
+  "signature": "0x00"
+}

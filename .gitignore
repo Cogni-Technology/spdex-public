@@ -1,0 +1,29 @@
+node_modules/
+dist/
+.turbo/
+.verify/
+coverage/
+playwright-report/
+test-results/
+*.tsbuildinfo
+.env
+.env.local
+.env.*.local
+.DS_Store
+.repro/
+
+# The keeper (docs/KEEPER.md): its state and logs (docker/keeper/data is the
+# directory .env.example suggests for them), its report, and its Docker
+# settings and secrets. Only the two directories' own .gitignore files are kept.
+.keeper/
+keeper-report/
+docker/keeper/.env
+docker/keeper/data/
+docker/keeper/secrets/*
+!docker/keeper/secrets/.gitignore
+docker/keeper/report/*
+!docker/keeper/report/.gitignore
+
+# The mainnet smoke suite's run records and failure traces (docs/MAINNET-SMOKE.md).
+# Traces hold the endpoint's URL and every request the page made.
+.mainnet-smoke/

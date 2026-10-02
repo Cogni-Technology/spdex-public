@@ -1,0 +1,27 @@
+name: An idea
+description: Something that would make spDEX better.
+labels: ["idea"]
+body:
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would make spDEX better?
+      description: What you'd change or add, and what it would let you do.
+    validations:
+      required: true
+  - type: dropdown
+    id: who
+    attributes:
+      label: Who is it for?
+      multiple: true
+      options:
+        - Someone new to SPX6900 or to wallets
+        - Someone who buys SPX regularly
+        - Someone running a keeper
+        - Someone writing a module
+        - Someone else
+  - type: textarea
+    id: rules
+    attributes:
+      label: Anything it might bump into?
+      description: spDEX has no servers, no tracking and no contract anyone controls, and every transaction goes through the Guard (AGENTS.md, "Architectural rules"). If your idea needs one of those to bend, say how you'd do it without.

@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>spDEX</title>
+    <!-- What a shared link previews as. Text only: an og:image needs an absolute URL on a domain, which spDEX never names. -->
+    <meta name="description" content="spDEX: a community project for swapping and auto-buying SPX6900 on Ethereum. No servers, no tracking. Unaudited." />
+    <meta property="og:title" content="spDEX" />
+    <meta property="og:description" content="A community project for swapping and auto-buying SPX6900 on Ethereum. No servers, no tracking. Unaudited." />
+    <!--
+      No unsafe-eval: untrusted modules run in QuickJS (WASM), which needs only
+      wasm-unsafe-eval. connect-src is intentionally open because the whole point
+      is that the user chooses their own RPC — pinning it to one host would make
+      bring-your-own-endpoint impossible.
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src *; object-src 'none'; base-uri 'none'; form-action 'none'"
+    />
+    <meta name="referrer" content="no-referrer" />
+    <!--
+      The masthead's lime tile on its hard ink shadow, inline so the icon costs
+      no request. Without a declared icon the browser asks for /favicon.ico,
+      which a static bundle does not have, and every page load logged a 404.
+    -->
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='6' y='6' width='24' height='24' fill='%230a0a0a'/%3E%3Crect x='2.5' y='2.5' width='23' height='23' fill='%23e5ff1a' stroke='%230a0a0a' stroke-width='3'/%3E%3C/svg%3E"
+    />
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

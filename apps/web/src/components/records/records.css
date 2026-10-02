@@ -1,0 +1,285 @@
+/*
+ * Records: Your activity, the printable statement, and the finality badge.
+ *
+ * Built from the theme's tokens (packages/ui/src/theme.css), so NEON and
+ * PASTEL both follow, and never with lime or any other accent as a text
+ * colour on paper: accents are fills under ink text.
+ */
+
+/* ── Finality badge ──────────────────────────────────────────────────────
+ *
+ * A pill's cousin: the same 1.5px ink border and mono type, in sentence case
+ * because it says a sentence. Each state has a marker shape and a fill:
+ * hollow while sent, half full once included, solid when final, dashed when
+ * unknown or given up, a diamond when its block was replaced.
+ */
+
+.spdex-final {
+  display: inline-flex;
+  align-items: flex-start;
+  gap: 7px;
+  max-width: 100%;
+  padding: 2px 8px;
+  border: 1.5px solid var(--ink);
+  background: var(--surface);
+  color: var(--ink);
+  font-family: var(--font-data);
+  font-size: 0.65625rem;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.spdex-final::before {
+  content: "";
+  flex: none;
+  width: 8px;
+  height: 8px;
+  margin-top: 4px;
+  border: 1.5px solid var(--ink);
+  box-sizing: border-box;
+}
+.spdex-final__text { min-width: 0; }
+/* The tip's word sits in running text here: no dotted underline fighting the border. */
+.spdex-final .spdex-term { text-decoration-thickness: 1px; }
+
+.spdex-final--sent::before { background: var(--surface); }
+.spdex-final--included { background: var(--c-cyan); }
+.spdex-final--included::before { background: linear-gradient(to right, var(--ink) 50%, transparent 50%); }
+.spdex-final--final { background: var(--ok); }
+.spdex-final--final::before { background: var(--ink); }
+.spdex-final--replaced { background: var(--warn); }
+.spdex-final--replaced::before { background: var(--ink); transform: rotate(45deg) scale(0.8); }
+.spdex-final--unknown,
+.spdex-final--gave-up { background: var(--paper); border-style: dashed; }
+.spdex-final--unknown::before,
+.spdex-final--gave-up::before { border-style: dashed; }
+
+/* ── Your activity ───────────────────────────────────────────────────────
+ *
+ * A table at desktop width: date, what, sold, bought, value then, and the
+ * transaction, figures right-aligned and tabular so they compare down the
+ * column. On a phone each row is two lines of words instead ("Sep 17 ·
+ * Bought 6,912.3 SPX", then "for 0.0081589 ETH · ≈ $20.00 then · 0xab…12 ↗"):
+ * the same elements, with the words a column heading would have said.
+ */
+
+.spdex-activity { margin: 0; }
+
+.spdex-activity__head,
+.spdex-activity__row {
+  display: grid;
+  grid-template-columns: 90px 70px minmax(0, 1fr) minmax(0, 1fr) 110px 120px;
+  column-gap: 10px;
+  align-items: baseline;
+}
+
+.spdex-activity__head {
+  font-family: var(--font-data);
+  font-size: 0.65625rem;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  padding-bottom: 6px;
+  border-bottom: var(--line) solid var(--ink);
+}
+.spdex-activity__head > :nth-child(n + 3):nth-child(-n + 5) { text-align: right; }
+
+.spdex-activity__list { list-style: none; margin: 0; padding: 0; }
+
+.spdex-activity__row {
+  padding: 9px 0;
+  border-bottom: 1px dashed rgba(var(--ink-rgb), calc(0.18 + var(--hairline-boost)));
+  font-size: 0.78125rem;
+  row-gap: 6px;
+}
+.spdex-activity__row:last-child { border-bottom: 0; }
+
+/* The two lines take no box of their own at this width: their cells sit in
+   the row's grid. */
+.spdex-activity__line { display: contents; }
+
+.spdex-activity__date { grid-column: 1; grid-row: 1; font-family: var(--font-data); font-size: 0.71875rem; white-space: nowrap; }
+.spdex-activity__what {
+  grid-column: 2;
+  grid-row: 1;
+  font-family: var(--font-data);
+  font-size: 0.65625rem;
+  font-weight: 700;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+.spdex-activity__sold,
+.spdex-activity__bought,
+.spdex-activity__value {
+  grid-row: 1;
+  text-align: right;
+  font-family: var(--font-data);
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+.spdex-activity__sold { grid-column: 3; }
+.spdex-activity__bought { grid-column: 4; font-weight: 700; }
+.spdex-activity__value { grid-column: 5; color: var(--text-dim); }
+.spdex-activity__tx {
+  grid-column: 6;
+  grid-row: 1;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 8px;
+  font-family: var(--font-data);
+  font-size: 0.6875rem;
+  min-width: 0;
+}
+.spdex-activity__tx code,
+.spdex-activity__tx a { font-family: var(--font-data); white-space: nowrap; }
+
+/* "Make a card" sits under the transaction, as a link rather than a
+   button: one button per row made the list a column of buttons. */
+.spdex-activity__act { grid-column: 6; grid-row: 2; }
+.spdex-activity__card.spdex-dca-link { margin: 0; padding: 2px 0; font-size: 0.71875rem; }
+
+/* The words only a phone's two lines need. */
+.spdex-activity__word { display: none; }
+
+.spdex-activity__unknown { color: var(--text-faint); font-weight: 400; }
+
+/* A row whose wallet couldn't be told: said in words, under the figures. */
+.spdex-activity__nowallet {
+  display: inline-block;
+  padding: 1px 6px;
+  border: 1px dashed var(--ink);
+  font-family: var(--font-data);
+  font-size: 0.65625rem;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+/* The badge, and a missing wallet, get a line of their own under the figures. */
+.spdex-activity__extra {
+  grid-column: 1 / 6;
+  grid-row: 2;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+}
+.spdex-activity__extra:empty { display: none; }
+
+
+.spdex-activity__empty,
+.spdex-activity__state { margin: 0; font-size: 0.78125rem; color: var(--text-dim); }
+
+.spdex-activity__notes {
+  margin: 12px 0 0;
+  padding: 10px 12px 10px 28px;
+  background: var(--paper);
+  border: 1px dashed var(--ink);
+  font-size: 0.75rem;
+  color: var(--text-dim);
+}
+.spdex-activity__notes > li + li { margin-top: 4px; }
+
+.spdex-activity__actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 12px;
+  margin-top: 16px;
+}
+.spdex-activity__hint { margin: 8px 0 0; font-size: 0.71875rem; color: var(--text-faint); }
+.spdex-activity__result { margin: 8px 0 0; font-size: 0.75rem; color: var(--text-dim); }
+.spdex-activity__foot {
+  margin: 14px 0 0;
+  padding-top: 10px;
+  border-top: 1px dashed rgba(var(--ink-rgb), calc(0.18 + var(--hairline-boost)));
+  font-size: 0.71875rem;
+  color: var(--text-faint);
+}
+
+@media (max-width: 620px) {
+  .spdex-activity__head { display: none; }
+  .spdex-activity__row { display: block; padding: 10px 0; }
+  .spdex-activity__line { display: block; text-align: left; }
+  .spdex-activity__line + .spdex-activity__line { margin-top: 2px; font-size: 0.75rem; color: var(--text-dim); }
+
+  .spdex-activity__date,
+  .spdex-activity__sold,
+  .spdex-activity__bought,
+  .spdex-activity__value,
+  .spdex-activity__tx,
+  .spdex-activity__act { display: inline; text-align: left; font-size: inherit; }
+  .spdex-activity__bought { font-family: var(--font-body); }
+  .spdex-activity__tx { gap: 0; }
+
+  /* " · " between the parts of a line, never at the start of one. */
+  .spdex-activity__date::after,
+  .spdex-activity__line--second > :not(:last-child)::after {
+    content: " · ";
+    font-weight: 400;
+    color: var(--text-faint);
+  }
+
+  .spdex-activity__what {
+    float: right;
+    margin: 2px 0 0 8px;
+    font-size: 0.65625rem;
+  }
+  .spdex-activity__word { display: inline; }
+  .spdex-activity__desk { display: none; }
+  .spdex-activity__extra { margin-top: 8px; }
+
+  /* A full-width button each, so neither is a small target on a phone. */
+  .spdex-activity__actions > .spdex-button { flex: 1 1 100%; }
+}
+
+/* ── The printable statement ─────────────────────────────────────────────
+ *
+ * Kept off the screen. While it prints, the page is hidden and only it is
+ * shown: black on white, no halftone, no shadows, the table allowed to break
+ * across pages between rows.
+ */
+
+.spdex-statement { display: none; }
+
+@media print {
+  body.spdex-printing { background: #fff; }
+  body.spdex-printing > :not(.spdex-statement) { display: none !important; }
+  body.spdex-printing > .spdex-statement {
+    display: block;
+    color: #000;
+    font-family: var(--font-body);
+    font-size: 10.5pt;
+    line-height: 1.4;
+  }
+  @page { margin: 16mm; }
+}
+
+.spdex-statement h1 { font-family: var(--font-display); font-size: 15pt; letter-spacing: 1.5px; text-transform: uppercase; margin: 0 0 6pt; }
+.spdex-statement h2 { font-size: 11pt; margin: 14pt 0 6pt; }
+.spdex-statement dl { display: grid; grid-template-columns: max-content 1fr; gap: 2pt 12pt; margin: 0; }
+.spdex-statement dt { font-weight: 700; }
+.spdex-statement dd { margin: 0; overflow-wrap: anywhere; }
+.spdex-statement .spdex-statement__mono { font-family: var(--font-data); }
+.spdex-statement table { width: 100%; border-collapse: collapse; font-size: 9pt; }
+.spdex-statement th,
+.spdex-statement td { text-align: left; padding: 3pt 4pt; border-bottom: 0.5pt solid #999; vertical-align: top; }
+.spdex-statement td.spdex-statement__num,
+.spdex-statement th.spdex-statement__num { text-align: right; font-variant-numeric: tabular-nums; }
+.spdex-statement tr { break-inside: avoid; }
+.spdex-statement thead { display: table-header-group; }
+.spdex-statement ul { margin: 6pt 0 0; padding-left: 14pt; }
+.spdex-statement p { margin: 6pt 0 0; }
+.spdex-statement .spdex-statement__hash { font-family: var(--font-data); font-size: 7.5pt; overflow-wrap: anywhere; }
+
+/* ── Reminders, in the auto-buy panel ────────────────────────────────────── */
+
+/* The newest buy's badge takes a line of its own under the sentence. */
+.spdex-history__final { flex: 1 1 100%; }
+
+/* Under the panel's heartbeat, as part of the header. */
+.spdex-dca-check.spdex-dca-notify { margin: -6px 0 16px; align-items: flex-start; }
+.spdex-dca-check.spdex-dca-notify > input { margin-top: 2px; }
+.spdex-dca-check.spdex-dca-notify + .spdex-dca-hint { margin: -10px 0 16px; }

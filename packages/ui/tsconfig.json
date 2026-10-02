@@ -1,0 +1,12 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "jsx": "react-jsx"
+  },
+  "include": ["src/**/*"],
+  // Tests are checked by tsconfig.test.json, which adds Node's types. Leaving
+  // them out here is what keeps a Node API in a component a compile error.
+  "exclude": ["src/**/*.test.ts"]
+}

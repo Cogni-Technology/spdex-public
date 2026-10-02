@@ -1,0 +1,9 @@
+[
+  {
+    "id": "v1",
+    "factory": "0xe4a1410a9ee0833d41e7514306e65ad729b7199e",
+    "batcher": "0xc5ce65451dd5fc99d08eb18440b06f2bcca3c5a0",
+    "factoryBlock": 26100366,
+    "batcherBlock": 26100368
+  }
+]

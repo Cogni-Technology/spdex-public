@@ -1,0 +1,25 @@
+{
+  "name": "@spdex/host",
+  "version": "0.0.0",
+  "private": true,
+  "license": "AGPL-3.0-or-later",
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.test.json"
+  },
+  "dependencies": {
+    "@spdex/core": "workspace:*",
+    "@spdex/chain": "workspace:*",
+    "quickjs-emscripten-core": "^0.32.0",
+    "@jitl/quickjs-wasmfile-release-sync": "^0.32.0"
+  },
+  "devDependencies": {
+    "@spdex/testing": "workspace:*",
+    "@types/node": "^22.10.0"
+  }
+}

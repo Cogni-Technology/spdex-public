@@ -1,0 +1,22 @@
+{
+  "id": "venue-uniswap-v3",
+  "version": "1.0.0",
+  "apiVersion": "1.0.0",
+  "kind": "venue",
+  "displayName": "Uniswap v3",
+  "description": "Routes swaps through Uniswap v3 pools on Ethereum mainnet.",
+  "capabilities": ["chain:read", "log"],
+  "contracts": [
+    "0x1f98431c8ad98523631ae4a59f267346ea31f984",
+    "0x61ffe014ba17989e743c5f6cb21bf9697530b21e",
+    "0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45"
+  ],
+  "limits": {
+    "maxFuel": "5000000",
+    "maxMemory": "16777216",
+    "maxCallsPerQuote": 64
+  },
+  "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "publicKey": "0x00",
+  "signature": "0x00"
+}

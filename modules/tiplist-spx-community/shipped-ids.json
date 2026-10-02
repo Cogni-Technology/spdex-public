@@ -1,0 +1,6 @@
+{
+  "about": "Every id this list has ever shipped, with the address it shipped with. Append-only: add a line for each new entry in the same change that adds it to module.js, and never edit or remove one. A new address for someone needs a new id (the old entry retired with replacedBy). registry.test.ts checks module.js against this.",
+  "ids": {
+    "spdex-donation-vault": "0x201A4f5c79f5796dF045e82b1057d074E8b85EC1"
+  }
+}

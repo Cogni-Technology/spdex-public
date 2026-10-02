@@ -1,0 +1,440 @@
+/*
+ * Culture: Welcome, the contract badge, saying lines, Your stack, the
+ * "I bought" card and the #receipt view.
+ *
+ * Built from theme.css's tokens only, so NEON and PASTEL both come for free:
+ * every accent here is a --c-* token, and none is a text colour on a light
+ * surface (lime and cyan fail contrast as text; see theme.css).
+ */
+
+/* ── Shared ─────────────────────────────────────────────────────────────── */
+
+/* Read by a screen reader, never seen. */
+.spdex-sr {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* A button that reads as a link: for quiet actions inside a sentence ("Hide
+   this", "Features"), where a full button would shout. */
+.spdex-linkbutton {
+  background: none;
+  border: 0;
+  padding: 0;
+  /* A button centres a wrapped label; a link reads from the start. */
+  text-align: start;
+  color: var(--ink);
+  font: inherit;
+  font-weight: 600;
+  text-decoration: underline;
+  text-decoration-color: var(--link-line);
+  text-decoration-thickness: 2px;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+.spdex-linkbutton:hover { background: var(--c-lime); }
+.spdex-linkbutton:focus-visible { outline: var(--focus-ring) solid var(--ink); outline-offset: 2px; }
+
+/* An address or a hash in groups of four. The gaps are margins, not spaces,
+   so a selection copies the value whole; a line may break between groups and
+   never inside one. */
+.spdex-hex {
+  font-family: var(--font-data);
+  font-size: 0.78125rem;
+  font-weight: 700;
+  letter-spacing: 0.3px;
+  overflow-wrap: anywhere;
+}
+.spdex-hex__group { display: inline-block; margin-right: 0.55ch; white-space: nowrap; }
+.spdex-hex__group:last-child { margin-right: 0; }
+
+/* ── Preset chips ───────────────────────────────────────────────────────── */
+
+.spdex-presets { display: flex; flex-direction: column; gap: 6px; margin: 6px 0 0; }
+
+.spdex-presets__chips { display: flex; flex-wrap: wrap; gap: 8px 10px; }
+
+/* Touch-sized: at least 44 × 36, the unit switch's own minimum. */
+.spdex-presets__chip {
+  min-width: 44px;
+  min-height: 36px;
+  padding: 6px 12px;
+  background: var(--surface);
+  color: var(--ink);
+  border: var(--line) solid var(--ink);
+  box-shadow: 3px 3px 0 0 var(--shadow);
+  font-family: var(--font-data);
+  font-size: 0.8125rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+}
+.spdex-presets__chip:hover:not(:disabled) { background: var(--c-lime); }
+.spdex-presets__chip:active:not(:disabled) { transform: translate(3px, 3px); box-shadow: none; }
+.spdex-presets__chip:focus-visible { outline: var(--focus-ring) solid var(--ink); outline-offset: 3px; }
+/* Pressed wears the Toggle's mark: lime, with the hazard stripe down its edge. */
+.spdex-presets__chip[aria-pressed="true"] {
+  background: var(--hazard) left top / 7px 100% no-repeat, var(--c-lime);
+  padding-left: 17px;
+}
+.spdex-presets__chip:disabled {
+  background: var(--paper);
+  color: var(--muted);
+  border-color: var(--muted);
+  box-shadow: 3px 3px 0 0 var(--muted);
+  cursor: not-allowed;
+}
+
+/* ── Saying lines ───────────────────────────────────────────────────────── */
+
+.spdex-saying { font-size: 0.78125rem; color: var(--text-dim); margin: 8px 0 0; }
+.spdex-saying__text {
+  font-family: var(--font-display);
+  font-size: 0.71875rem;
+  font-weight: 800;
+  letter-spacing: 1.2px;
+  color: var(--ink);
+  quotes: "“" "”";
+}
+
+/* ── Contract badge ─────────────────────────────────────────────────────── */
+
+.spdex-contract {
+  border: var(--line) solid var(--ink);
+  background: var(--surface);
+  box-shadow: 4px 4px 0 0 var(--shadow);
+  padding: 12px 14px;
+}
+.spdex-contract__lead {
+  margin: 0 0 6px;
+  font-family: var(--font-data);
+  font-size: 0.6875rem;
+  font-weight: 700;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+/* The address sits on a lime strip, ink on lime, the one way the palette lets
+   an accent carry text. */
+.spdex-contract__row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
+.spdex-contract__row > .spdex-hex {
+  background: var(--c-lime);
+  border: 1.5px solid var(--ink);
+  padding: 4px 8px;
+  font-size: 0.875rem;
+  line-height: 1.6;
+}
+.spdex-contract__text { margin: 10px 0 0; font-size: 0.78125rem; }
+
+/* The one-line form under the Buy SPX card's To; the badge unfolds beneath it. */
+.spdex-contract-line { margin: 6px 0 0; font-size: 0.78125rem; }
+.spdex-contract-line > summary { cursor: pointer; color: var(--text-dim); }
+.spdex-contract-line > summary code { font-family: var(--font-data); font-weight: 700; color: var(--text); }
+.spdex-contract-line__check { text-decoration: underline; text-underline-offset: 2px; }
+.spdex-contract-line[open] > .spdex-contract { margin-top: 8px; }
+.spdex-contract__links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+  font-size: 0.78125rem;
+}
+
+/* ── Welcome ─────────────────────────────────────────────────────────────── */
+
+.spdex-welcome__lede { margin: -4px 0 14px; font-size: 0.8125rem; color: var(--text-dim); }
+.spdex-welcome__steps { list-style: none; margin: 0; padding: 0; }
+
+.spdex-welcome__step {
+  display: grid;
+  grid-template-columns: 30px minmax(0, 1fr);
+  gap: 12px;
+  padding: 12px 0;
+  border-bottom: 1px dashed rgba(var(--ink-rgb), calc(0.2 + var(--hairline-boost)));
+}
+.spdex-welcome__step:last-child { border-bottom: 0; }
+
+.spdex-welcome__num {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 30px;
+  min-height: 30px;
+  border: var(--line) solid var(--ink);
+  background: var(--surface);
+  font-family: var(--font-data);
+  font-size: 0.8125rem;
+  font-weight: 700;
+}
+.spdex-welcome__step--done .spdex-welcome__num { background: var(--c-lime); }
+.spdex-welcome__step--current .spdex-welcome__num { background: var(--ink); color: var(--surface); }
+
+.spdex-welcome__body { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.spdex-welcome__title {
+  margin: 0;
+  padding-top: 6px;
+  font-family: var(--font-display);
+  font-size: 0.75rem;
+  font-weight: 800;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+}
+.spdex-welcome__step--later .spdex-welcome__title { color: var(--text-dim); }
+.spdex-welcome__detail { display: flex; flex-direction: column; gap: 8px; font-size: 0.8125rem; }
+.spdex-welcome__detail p { margin: 0; }
+.spdex-welcome__status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  margin: 0;
+  font-size: 0.8125rem;
+  font-weight: 600;
+}
+.spdex-welcome__status code { font-family: var(--font-data); font-weight: 700; }
+.spdex-welcome__status--stack { flex-direction: column; align-items: flex-start; }
+.spdex-welcome__status--stack p { margin: 0; }
+.spdex-welcome__status--stack p + p { font-weight: 400; }
+
+.spdex-welcome__foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px 16px;
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: var(--line) solid var(--ink);
+  font-size: 0.8125rem;
+}
+.spdex-welcome__foot p { margin: 0; }
+
+.spdex-welcome__after {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 16px;
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: 0.8125rem;
+  font-weight: 800;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+}
+.spdex-welcome__after .spdex-linkbutton { font-family: var(--font-body); text-transform: none; letter-spacing: 0; }
+
+/* A phone: a stepper. A done step folds to its one line, a step not reached
+   yet to its title, and only the current step shows what it says. */
+@media (max-width: 620px) {
+  .spdex-welcome__step--done .spdex-welcome__detail,
+  .spdex-welcome__step--later .spdex-welcome__detail,
+  .spdex-welcome__step--later .spdex-welcome__status { display: none; }
+}
+
+/* Wider: four cards, two by two, all open. */
+@media (min-width: 621px) {
+  .spdex-welcome__steps {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 18px;
+  }
+  .spdex-welcome__step {
+    border: var(--line) solid var(--ink);
+    box-shadow: 4px 4px 0 0 var(--shadow);
+    padding: 14px;
+    align-content: start;
+  }
+  .spdex-welcome__step:last-child { border-bottom: var(--line) solid var(--ink); }
+  .spdex-welcome__step--done { box-shadow: 4px 4px 0 0 var(--shadow); }
+  .spdex-welcome__step--later { box-shadow: 4px 4px 0 0 rgba(var(--ink-rgb), 0.35); }
+  /* The contract badge's own frame would double the card's. */
+  .spdex-welcome__step .spdex-contract { border: 0; box-shadow: none; padding: 0; }
+}
+
+/* ── Your stack ─────────────────────────────────────────────────────────── */
+
+/* Phone: Holding | Stacked, then Put in across both. Wide: four columns, Put
+   in taking two. */
+.spdex-stack__grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.spdex-stack__putin { grid-column: 1 / -1; }
+@media (min-width: 621px) {
+  .spdex-stack__grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .spdex-stack__putin { grid-column: span 2; }
+}
+/* "0.84 ETH · 120 USDC" is a line of tokens, not one figure: a size down, so
+   two tokens fit a phone's line. */
+.spdex-stack__putin .spdex-stat__value { font-size: 1.625rem; }
+
+.spdex-stack__first {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 16px;
+  padding: 10px 0;
+  border-top: 1px dashed rgba(var(--ink-rgb), calc(0.2 + var(--hairline-boost)));
+  font-size: 0.8125rem;
+}
+.spdex-stack__first p { margin: 0; }
+.spdex-stack__first strong { font-family: var(--font-data); }
+.spdex-stack__latest { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; }
+.spdex-stack__latest .spdex-button { padding: 7px 12px; font-size: 0.6875rem; box-shadow: 3px 3px 0 0 var(--shadow); }
+
+/* "at least", small, over the figure it qualifies. */
+.spdex-stack__atleast {
+  display: block;
+  font-family: var(--font-data);
+  font-size: 0.65625rem;
+  font-weight: 700;
+  letter-spacing: 1.2px;
+  line-height: 1.3;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+.spdex-stack__notes { margin: 4px 0 8px; padding-left: 18px; font-size: 0.75rem; color: var(--text-dim); }
+
+.spdex-stack__goal {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 8px 0 0;
+  padding: 12px 14px;
+  border: var(--line) solid var(--ink);
+  background: var(--surface);
+}
+/* No goal yet: one line to open, the form under it once opened. A block,
+   since a flex <details> lays out unevenly across browsers. */
+.spdex-stack__goal--folded { display: block; padding: 0; border: 0; background: none; }
+.spdex-stack__goal--folded > summary { cursor: pointer; width: fit-content; }
+.spdex-stack__goal--folded[open] { padding: 12px 14px; border: var(--line) solid var(--ink); background: var(--surface); }
+.spdex-stack__goal--folded[open] > * + * { margin-top: 8px; }
+.spdex-stack__goalhead { margin: 0; font-size: 0.8125rem; font-weight: 600; }
+.spdex-stack__goalhead strong { font-family: var(--font-display); letter-spacing: 1px; text-transform: uppercase; }
+.spdex-stack__goalform { display: flex; flex-wrap: wrap; gap: 8px 10px; align-items: stretch; }
+.spdex-stack__goalinput { position: relative; flex: 1 1 180px; min-width: 0; display: flex; }
+.spdex-stack__goalinput .spdex-input { padding-right: 52px; }
+.spdex-stack__affix {
+  position: absolute;
+  right: 12px;
+  top: 50%;
+  transform: translateY(-50%);
+  font-family: var(--font-data);
+  font-size: 0.75rem;
+  font-weight: 700;
+  color: var(--text-dim);
+  pointer-events: none;
+}
+.spdex-stack__goalform .spdex-button { padding: 9px 14px; }
+.spdex-stack__goalfoot { margin: 0; font-size: 0.78125rem; }
+.spdex-stack__error { margin: 0; font-size: 0.78125rem; font-weight: 600; border-left: 4px solid var(--c-magenta); padding-left: 8px; }
+
+.spdex-stack__footer {
+  margin-top: 14px;
+  padding-top: 10px;
+  border-top: var(--line) solid var(--ink);
+  font-size: 0.78125rem;
+  color: var(--text-dim);
+}
+.spdex-stack__footer p { margin: 0; }
+
+/* ── The "I bought" card ────────────────────────────────────────────────── */
+
+.spdex-card__preview {
+  max-width: 640px;
+  margin: 0 auto 16px;
+  border: var(--line) solid var(--ink);
+  line-height: 0;
+}
+/* The picture scales to the column; its own width and height only fix the
+   PNG's size. */
+.spdex-card__svg { display: block; width: 100%; height: auto; }
+
+.spdex-card__controls { display: grid; gap: 14px; margin-bottom: 12px; }
+@media (min-width: 621px) {
+  .spdex-card__controls { grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr); gap: 18px; }
+}
+.spdex-card__group { display: flex; flex-direction: column; gap: 10px; min-width: 0; margin: 0; padding: 0; border: 0; }
+.spdex-card__group > legend { margin-bottom: 8px; }
+.spdex-card__caption { margin-top: 2px; }
+/* The colours switch keeps its own width rather than the column's. */
+.spdex-card__group > .spdex-mode { align-self: flex-start; }
+.spdex-card__check { display: flex; align-items: flex-start; gap: 8px; font-size: 0.8125rem; cursor: pointer; }
+.spdex-card__check input { margin-top: 2px; }
+.spdex-card__actions { margin-top: 12px; }
+/* Always there, so a screen reader hears "Copied." when it is said; no room taken until then. */
+.spdex-card__copied { margin: 8px 0 0; }
+.spdex-card__copied:empty { margin: 0; }
+.spdex-card__warnings {
+  margin: 14px 0 0;
+  padding: 10px 12px 10px 28px;
+  border: var(--line) solid var(--ink);
+  background: var(--paper);
+  font-size: 0.78125rem;
+}
+.spdex-card__warnings li + li { margin-top: 4px; }
+
+/* ── The #receipt view ──────────────────────────────────────────────────── */
+
+.spdex-receipt__lede { margin: 0 0 6px; font-size: 0.78125rem; color: var(--text-dim); }
+.spdex-receipt__tx { display: flex; flex-direction: column; gap: 4px; margin: 12px 0; }
+.spdex-receipt__hashrow { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
+.spdex-receipt__status { margin: 8px 0; font-size: 0.84375rem; font-weight: 600; }
+.spdex-receipt__deliveries { list-style: none; margin: 8px 0; padding: 0; }
+.spdex-receipt__delivery {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 10px 0;
+  border-bottom: 1px dashed rgba(var(--ink-rgb), calc(0.2 + var(--hairline-boost)));
+  overflow-wrap: anywhere;
+}
+.spdex-receipt__delivery:last-child { border-bottom: 0; }
+.spdex-receipt__amount { font-family: var(--font-stat); font-size: 1.875rem; line-height: 1.1; letter-spacing: 0.5px; }
+.spdex-receipt__to { font-size: 0.75rem; color: var(--text-dim); }
+.spdex-receipt__to code { font-family: var(--font-data); font-size: 0.71875rem; font-weight: 700; color: var(--ink); }
+.spdex-receipt__source { font-size: 0.8125rem; font-weight: 600; }
+.spdex-receipt__exact { font-family: var(--font-data); font-size: 0.71875rem; color: var(--text-faint); }
+.spdex-receipt__block { margin: 8px 0; font-family: var(--font-data); font-size: 0.75rem; }
+.spdex-receipt__actions { align-items: center; margin-top: 14px; }
+
+/* ── In a tile ──────────────────────────────────────────────────────────── */
+
+/* A panel's body inside its tile: the tile is its frame and says its title. */
+.spdex-welcome--tile .spdex-welcome__lede { margin-top: 0; }
+.spdex-stack--empty { display: flex; flex-wrap: wrap; align-items: center; gap: 0.625rem 1rem; }
+.spdex-stack__emptyline { margin: 0; font-size: 0.875rem; }
+
+/* A second part under a tile's first ("Activity" under Your stack), set off
+   by a hairline and a small heading. */
+.spdex-subpanel__title {
+  margin: 0 0 0.75rem;
+  font-family: var(--font-display);
+  font-size: 0.75rem;
+  font-weight: 800;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  color: var(--ink);
+}
+* + .spdex-subpanel,
+* + div > .spdex-subpanel {
+  margin-top: 1.25rem;
+  padding-top: 1.25rem;
+  border-top: 1px solid var(--hairline);
+}
+
+/* Touch targets: Welcome's two quiet links, the contract line's summary and
+   every preset chip (amounts, the "69 buys" count, goals, the card's sizes)
+   reach 44px on phones and touch screens, as the rest of the page does. */
+@media (max-width: 38.75em), (pointer: coarse) {
+  .spdex-welcome__foot .spdex-linkbutton { min-height: 44px; }
+  .spdex-presets__chip { min-height: 44px; }
+  .spdex-contract-line > summary { min-height: 44px; padding-block: 0.75rem; box-sizing: border-box; }
+}

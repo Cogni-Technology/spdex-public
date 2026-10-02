@@ -1,0 +1,15 @@
+{
+  "name": "@spdex/tiplist-spx-community",
+  "version": "1.0.0",
+  "private": true,
+  "license": "AGPL-3.0-or-later",
+  "type": "module",
+  "main": "./index.mjs",
+  "scripts": { "typecheck": "tsc --noEmit -p tsconfig.test.json" },
+  "devDependencies": {
+    "@spdex/core": "workspace:*",
+    "@spdex/chain": "workspace:*",
+    "@spdex/host": "workspace:*",
+    "@types/node": "^22.10.0"
+  }
+}
