@@ -12,7 +12,7 @@
 import { describe, expect, it } from "vitest";
 import type { PreparedFees } from "@spdex/chain";
 import type { Address } from "@spdex/core";
-import { CHEAP_BATCHED_BUY_THRESHOLD, FULL_FEE_BUY_THRESHOLD, buyFee } from "@spdex/vault";
+import { CHEAP_BATCHED_BUY_THRESHOLD, MAINNET_BATCHER, MAINNET_FACTORY, NETWORK_PART, buyFee } from "@spdex/vault";
 import { vaultCardStatus, vaultErrorText, vaultCosts, VAULT_LIMITS, type VaultCardStatus, type VaultFigures, type VaultHistoryEntry, type VaultPlanState } from "../../lib/dca/vault.js";
 import type { FeeRead } from "../../lib/dca/form.js";
 import recurringFormSource from "./RecurringForm.tsx?raw";
@@ -22,11 +22,16 @@ import {
   allowanceText,
   closeConfirmText,
   closedVaultText,
+  COMMUNITY_WINDOW_HINT,
+  communityWindowLine,
+  communityWindowLiveText,
+  vaultTurnsLine,
   createSendsText,
   deployFee,
   dueText,
   factoryDeployMillions,
   FEE_PAYEE,
+  HELD_BELOW,
   SIGNER_CHOICE_TITLES,
   retryFeeNote,
   retryPayeeText,
@@ -48,6 +53,7 @@ import {
   vaultTermsTail,
   WALLET_BUY_TYPICAL_GAS,
   walletFeeText,
+  windowOptionLabel,
 } from "./vaultCopy.js";
 import { fiatCostText, type MoneyView } from "../../lib/money/convert.js";
 
@@ -94,6 +100,8 @@ function figures(patch: Partial<VaultFigures> = {}): VaultFigures {
       startAt: 1_000n,
       keeperReward: FEE,
       maxSlippageBps: 200n,
+      communityWindow: 1_800n,
+      turnBuckets: 0n,
     },
     closed: false,
     buysDone: 0,
@@ -113,6 +121,15 @@ function figures(patch: Partial<VaultFigures> = {}): VaultFigures {
     clock: { seconds: 2_000, readAtMs: 0 },
     mismatches: [],
     fromFactory: true,
+    release: "v2",
+    source: "v2",
+    factory: MAINNET_FACTORY as Address,
+    communityWindow: 1_800,
+    dueSince: 87_400,
+    windowEndsAt: 89_200,
+    windowBuys: 0,
+    turnBuckets: 0,
+    turnEndsAt: null,
     ...patch,
   };
 }
@@ -124,13 +141,23 @@ const costs = vaultCosts({ amountPerBuy: USD10, maxBuys: 30, fees: MEDIAN.kind =
 
 describe("the buy fee's words", () => {
   it("states the rule and the terms a newcomer hovers over", () => {
-    expect(vaultFeeRule()).toBe("a fixed amount for network fees plus 10% of that, never more than 0.69% of the buy");
+    // v2's rule: the network cost and a quarter of a percent of the buy. No "tenth" any more.
+    expect(vaultFeeRule()).toBe("a fixed amount for network fees plus 0.25% of the buy, never more than 0.69% of the buy");
     expect(VAULT_TIPS.keeper).toBe(
-      "Whoever sends the transaction that makes a due buy happen: a bot (for example one that makes many vaults' buys in one transaction, which costs less per buy), a spDEX tab, or you. The vault pays them the buy fee. Nobody is obliged to: a buy time nobody triggers is skipped. A keeper picks only the moment, inside a due buy time; the vault fixes the amount, the price floor and where the tokens go.",
+      "Whoever makes a due buy happen: a bot (for example one that makes many vaults' buys in one transaction, which costs less per buy), a spDEX tab, or you. Community keepers make other people's buys and are paid for each one; holding 690 SPX is the entry bar. Nobody is obliged to make a buy: a buy time nobody triggers is skipped. A keeper picks only the moment, inside a due buy time, and who its own fee goes to; the vault fixes the amount, the price floor and where the tokens go.",
     );
     expect(VAULT_TIPS.fee).toBe(
-      "Set once, when the vault is created, and paid from its budget as WETH to whoever triggers each buy: a fixed estimate of one buy's network fee when many buys share a transaction, plus 10% of that estimate, and never more than 0.69% of the buy. No vault can be created with more, and nobody can change it afterwards, spDEX included. Whoever triggers a buy may be a keeper run by spDEX's developers, who keep what's left of it after the network fee.",
+      "Set once, when the vault is created, and paid from its budget as WETH to the keeper that makes each buy — or back to you when you trigger it: a fixed estimate of one buy's network fee when many buys share a transaction, plus 0.25% of the buy, and never more than 0.69% of the buy. No vault can be created with more, and nobody can change it afterwards, spDEX included. The keeper may be one run by spDEX's developers, who keep what's left of it after the network fee.",
     );
+    // A v1 vault keeps v1's rule, and pays whoever triggers it: its card says so.
+    expect(VAULT_TIPS.feeV1).toBe(
+      "Set once, when the vault was created, and paid from its budget as WETH to whoever triggers each buy: a fixed estimate of one buy's network fee when many buys share a transaction, plus 10% of that estimate, and never more than 0.69% of the buy. Nobody can change it, spDEX included. Whoever triggers a buy may be a keeper run by spDEX's developers, who keep what's left of it after the network fee.",
+    );
+    expect(VAULT_TIPS.keeperV1).toBe(
+      "Whoever sends the transaction that makes a due buy happen: a bot (for example one that makes many vaults' buys in one transaction, which costs less per buy), a spDEX tab, or you. The vault pays them the buy fee. Nobody is obliged to: a buy time nobody triggers is skipped. A keeper picks only the moment, inside a due buy time; the vault fixes the amount, the price floor and where the tokens go.",
+    );
+    // Keeping is paid work, never a return on a holding.
+    for (const tip of Object.values(VAULT_TIPS)) expect(tip).not.toMatch(/\b(APR|APY|yield|earnings)\b/i);
     expect(VAULT_TIPS.weth).toBe(
       "Wrapped Ether: ETH as a token, always worth exactly 1 ETH. A vault holds its budget, and pays its buy fees, as WETH; closing it sends what's left back to you as ETH.",
     );
@@ -139,7 +166,8 @@ describe("the buy fee's words", () => {
   /** Nearest cent, not the cent below: a $0.0476 fee cut to "$0.04" would understate it by a sixth. */
   it("prices a cost in dollars to the nearest cent, and never as nothing", () => {
     expect(fiatCostText(buyFee(USD690_CENTS).reward, RATES)).toBe("≈\u00a0$0.05");
-    expect(fiatCostText(buyFee(USD69).reward, RATES)).toBe("≈\u00a0$0.05");
+    // $0.2225: the network cost and 0.25% of $69.
+    expect(fiatCostText(buyFee(USD69).reward, RATES)).toBe("≈\u00a0$0.22");
     expect(fiatCostText(buyFee(USD1).reward, RATES)).toBe("≈\u00a0$0.01");
     expect(fiatCostText(10n ** 12n, RATES)).toBe("<\u00a0$0.01");
     expect(fiatCostText(10n ** 15n, undefined)).toBeNull();
@@ -149,9 +177,9 @@ describe("the buy fee's words", () => {
   it("prices a cost in the page's currency, and in dollars where that currency has no rate", () => {
     const fx = { block: 1n, chainTime: 10_000, rates: { EUR: { answer: 114_810_000n, decimals: 8, updatedAt: 9_000 } }, usdc: null };
     const euros: MoneyView = { ...RATES, fx, currency: "EUR" };
-    // $0.05 (unrounded, $0.0532…) at $1.1481 a euro.
-    expect(fiatCostText(buyFee(USD69).reward, euros)).toBe("≈\u00a0€0.05");
-    expect(fiatCostText(buyFee(USD69).reward, { ...euros, currency: "GBP" })).toBe("≈\u00a0$0.05");
+    // $0.2225 at $1.1481 a euro: €0.1938.
+    expect(fiatCostText(buyFee(USD69).reward, euros)).toBe("≈\u00a0€0.19");
+    expect(fiatCostText(buyFee(USD69).reward, { ...euros, currency: "GBP" })).toBe("≈\u00a0$0.22");
   });
 });
 
@@ -164,12 +192,18 @@ describe("the vault choice's cost line", () => {
   it("states the one confirmation, its fee, and the buy fee in dollars, ETH and as a share", () => {
     expect(vaultCostText(costs, MEDIAN, RATES)).toBe(
       "1 confirmation creates and funds it (≈\u00a0$0.08 network fee). " +
-        "Buy fee: ≈\u00a0$0.05 (0.00002013 ETH, 0.54%) a buy, paid to whoever triggers it — maybe spDEX's developers.",
+        "Buy fee: ≈\u00a0$0.07 (0.0000261 ETH, 0.69%) a buy, the most it can be, paid to the keeper that makes it — maybe spDEX's developers.",
     );
     // No rate: ether alone, never a guessed dollar figure.
     expect(vaultCostText(costs, MEDIAN)).toBe(
       "1 confirmation creates and funds it (≈ 0.00002904 ETH network fee). " +
-        "Buy fee: 0.00002013 ETH (0.54%) a buy, paid to whoever triggers it — maybe spDEX's developers.",
+        "Buy fee: 0.0000261 ETH (0.69%) a buy, the most it can be, paid to the keeper that makes it — maybe spDEX's developers.",
+    );
+    // $69 a buy pays the network cost and 0.25% of the buy, under the ceiling.
+    const larger = vaultCosts({ amountPerBuy: USD69, maxBuys: 30, fees: null })!;
+    expect(vaultCostText(larger, { kind: "reading" }, RATES)).toBe(
+      "1 confirmation creates and funds it; its network fee is unknown until fees are read. " +
+        "Buy fee: ≈\u00a0$0.22 (0.00008415 ETH, 0.33%) a buy, paid to the keeper that makes it — maybe spDEX's developers.",
     );
   });
 
@@ -178,11 +212,11 @@ describe("the vault choice's cost line", () => {
     expect(small.fee.atCeiling).toBe(true);
     expect(vaultCostText({ ...small, createFee: 29_040_000_000_000n }, MEDIAN, RATES)).toBe(
       "1 confirmation creates and funds it (≈\u00a0$0.08 network fee). " +
-        "Buy fee: ≈\u00a0$0.01 (0.00000261 ETH, 0.69%) a buy, the most it can be, paid to whoever triggers it — maybe spDEX's developers.",
+        "Buy fee: ≈\u00a0$0.01 (0.00000261 ETH, 0.69%) a buy, the most it can be, paid to the keeper that makes it — maybe spDEX's developers.",
     );
     expect(vaultCostText(small, { kind: "reading" })).toBe(
       "1 confirmation creates and funds it; its network fee is unknown until fees are read. " +
-        "Buy fee: 0.00000261 ETH (0.69%) a buy, the most it can be, paid to whoever triggers it — maybe spDEX's developers.",
+        "Buy fee: 0.00000261 ETH (0.69%) a buy, the most it can be, paid to the keeper that makes it — maybe spDEX's developers.",
     );
   });
 
@@ -191,21 +225,21 @@ describe("the vault choice's cost line", () => {
     const unread = { ...costs, createFee: null };
     expect(vaultCostText(unread, { kind: "reading" }, RATES)).toBe(
       "1 confirmation creates and funds it; its network fee is unknown until fees are read. " +
-        "Buy fee: ≈\u00a0$0.05 (0.00002013 ETH, 0.54%) a buy, paid to whoever triggers it — maybe spDEX's developers.",
+        "Buy fee: ≈\u00a0$0.07 (0.0000261 ETH, 0.69%) a buy, the most it can be, paid to the keeper that makes it — maybe spDEX's developers.",
     );
     expect(vaultCostText(unread, { kind: "error", message: "no" }, RATES)).toBe(
       "1 confirmation creates and funds it; its network fee is unknown: current fees couldn't be read. " +
-        "Buy fee: ≈\u00a0$0.05 (0.00002013 ETH, 0.54%) a buy, paid to whoever triggers it — maybe spDEX's developers.",
+        "Buy fee: ≈\u00a0$0.07 (0.0000261 ETH, 0.69%) a buy, the most it can be, paid to the keeper that makes it — maybe spDEX's developers.",
     );
     // No amount yet: the ceiling, as a bound.
     expect(vaultCostText(null, { kind: "reading" })).toBe(
-      "1 confirmation creates and funds it. Buy fee: up to 0.69% a buy, paid to whoever triggers it — maybe spDEX's developers.",
+      "1 confirmation creates and funds it. Buy fee: up to 0.69% a buy, paid to the keeper that makes it — maybe spDEX's developers.",
     );
   });
 
   it("splits what the creation sends into the buys and their buy fees", () => {
     expect(vaultSetupText(costs, 30n * USD10)).toBe(
-      "Created and funded in 1 confirmation: 0.1141 ETH goes in — 0.113467 ETH for the buys and 0.0006039 ETH for their buy fees.",
+      "Created and funded in 1 confirmation: 0.1143 ETH goes in — 0.113467 ETH for the buys and 0.000783 ETH for their buy fees.",
     );
     expect(vaultSetupText(null, 50n * MILLI)).toBe("Created and funded in 1 confirmation, with the plan's whole budget.");
   });
@@ -218,20 +252,23 @@ describe("the vault choice's cost line", () => {
   it("prices a trigger and the factory's deployment only from fees it has", () => {
     const fees: PreparedFees = { type: "eip1559", maxFeePerGas: 2n * 3n * GWEI + GWEI, maxPriorityFeePerGas: GWEI };
     // The base fee is recovered from the bid (2 × base + tip): 3 gwei + 1 gwei tip.
-    expect(triggerGasCost({ kind: "ok", fees }, true)).toBe(300_000n * 4n * GWEI);
-    expect(triggerGasCost({ kind: "ok", fees }, false)).toBe(230_000n * 4n * GWEI);
+    expect(triggerGasCost({ kind: "ok", fees }, true)).toBe(305_000n * 4n * GWEI);
+    expect(triggerGasCost({ kind: "ok", fees }, false)).toBe(240_000n * 4n * GWEI);
     expect(triggerGasCost({ kind: "reading" }, true)).toBeNull();
     expect(triggerGasCost({ kind: "error", message: "no" }, false)).toBeNull();
-    // 3,562,618 measured for this release's factory.
-    expect(deployFee(fees)).toBe(3_570_000n * 4n * GWEI);
-    expect(factoryDeployMillions()).toBe("3.6");
+    // About 3.85 million for this release's factory, and 1.76 million more
+    // where the SPX holder registry it needs isn't deployed either.
+    expect(deployFee(fees)).toBe(3_850_000n * 4n * GWEI);
+    expect(factoryDeployMillions()).toBe("3.9");
+    expect(deployFee(fees, true)).toBe((3_850_000n + 1_760_000n) * 4n * GWEI);
+    expect(factoryDeployMillions(true)).toBe("5.6");
     expect(deployFee(null)).toBeNull();
   });
 
   /** Trigger now pays the buy fee back, which reads like money back; when the gas is more, it is a cost. */
   it("says when triggering yourself costs more than the buy fee it pays back", () => {
     const gas = triggerGasCost(MEDIAN, false)!;
-    expect(gas).toBe(230_000n * 132_000_000n);
+    expect(gas).toBe(240_000n * 132_000_000n);
     expect(triggerCostText(MEDIAN, gas - 1n, false)).toBe("That network fee is more than the buy fee, so waiting for a keeper costs you less.");
     expect(triggerCostText(MEDIAN, gas, false)).toBeNull();
     // A first buy costs more, so the same fee can be a loss there and not later.
@@ -243,15 +280,15 @@ describe("the vault choice's cost line", () => {
   it("gives the due banner's buy fee and network fee side by side", () => {
     const gas = triggerGasCost(MEDIAN, true)!;
     expect(dueText(buyFee(USD10).reward, gas, RATES)).toBe(
-      "A keeper may trigger it for its buy fee, ≈\u00a0$0.05 (0.00002013 WETH). Or trigger it yourself: " +
-        "you pay the network fee, ≈\u00a0$0.10 (0.0000396 ETH) today, and get the buy fee as WETH.",
+      "A keeper may trigger it for its buy fee, ≈\u00a0$0.07 (0.0000260974 WETH). Or trigger it yourself: " +
+        "you pay the network fee, ≈\u00a0$0.11 (0.00004026 ETH) today, and get the buy fee as WETH.",
     );
     expect(dueText(buyFee(USD10).reward, gas)).toBe(
-      "A keeper may trigger it for its buy fee, 0.00002013 WETH. Or trigger it yourself: " +
-        "you pay the network fee, about 0.0000396 ETH today, and get the buy fee as WETH.",
+      "A keeper may trigger it for its buy fee, 0.0000260974 WETH. Or trigger it yourself: " +
+        "you pay the network fee, about 0.00004026 ETH today, and get the buy fee as WETH.",
     );
     expect(dueText(buyFee(USD10).reward, null, RATES)).toBe(
-      "A keeper may trigger it for its buy fee, ≈\u00a0$0.05 (0.00002013 WETH). Or trigger it yourself: " +
+      "A keeper may trigger it for its buy fee, ≈\u00a0$0.07 (0.0000260974 WETH). Or trigger it yourself: " +
         "you pay the network fee and get the buy fee as WETH.",
     );
   });
@@ -265,11 +302,11 @@ describe("the notes under the vault choice", () => {
     expect(notes(USD1)[0]).toEqual({
       testId: "dca-form-vault-small",
       banner: { tone: "warn", title: "Buys this small may be skipped" },
-      text: "Their buy fee is below a keeper's cost even when network fees are low. ≥ $3.88 a buy avoids this.",
+      text: "Their buy fee is below a keeper's cost even when network fees are low. ≥ $4.01 a buy avoids this.",
     });
     // Without a rate, ether alone.
     expect(vaultFeeNotes(buyFee(USD1), { amountPerBuy: USD1, fees: MEDIAN })[0]!.text).toBe(
-      "Their buy fee is below a keeper's cost even when network fees are low. ≥ 0.0015 ETH a buy avoids this.",
+      "Their buy fee is below a keeper's cost even when network fees are low. ≥ 0.0016 ETH a buy avoids this.",
     );
   });
 
@@ -277,26 +314,33 @@ describe("the notes under the vault choice", () => {
     expect(notes(USD5)[0]).toEqual({
       testId: "dca-form-vault-held",
       banner: { tone: "ok", title: "Small buys depend on low network fees" },
-      text: "Held at 0.69%, their buy fee may not cover a keeper's cost unless network fees are low. ≥ $7.71 a buy avoids this.",
+      text: "Held at 0.69%, their buy fee may not cover a keeper's cost unless network fees are low. ≥ $7.24 a buy avoids this.",
     });
     expect(vaultFeeNotes(buyFee(USD5), { amountPerBuy: USD5, fees: MEDIAN })[0]!.text).toBe(
-      "Held at 0.69%, their buy fee may not cover a keeper's cost unless network fees are low. ≥ 0.003 ETH a buy avoids this.",
+      "Held at 0.69%, their buy fee may not cover a keeper's cost unless network fees are low. ≥ 0.0028 ETH a buy avoids this.",
     );
   });
 
-  it("changes tier exactly at each threshold, and says nothing of either once the fee is below its ceiling", () => {
+  /**
+   * "Held" ends where 0.69% of the buy reaches one batched buy's network cost
+   * at the release's reference (`NETWORK_PART`): the fee there is still held
+   * at the ceiling, but it covers what larger buys pay for the network.
+   */
+  it("changes tier exactly at each threshold, and says nothing of either once the fee covers the network cost", () => {
     expect(ids(CHEAP_BATCHED_BUY_THRESHOLD - 1n)[0]).toBe("dca-form-vault-small");
     expect(ids(CHEAP_BATCHED_BUY_THRESHOLD)[0]).toBe("dca-form-vault-held");
-    expect(ids(FULL_FEE_BUY_THRESHOLD - 1n)[0]).toBe("dca-form-vault-held");
-    expect(buyFee(FULL_FEE_BUY_THRESHOLD).atCeiling).toBe(false);
-    expect(ids(FULL_FEE_BUY_THRESHOLD)).toEqual([]);
-    expect(ids(USD10)).toEqual([]);
-    expect(ids(USD69)).toEqual([]);
+    expect(ids(HELD_BELOW - 1n)[0]).toBe("dca-form-vault-held");
+    expect(buyFee(HELD_BELOW - 1n).reward).toBeLessThan(NETWORK_PART);
+    expect(buyFee(HELD_BELOW).reward).toBe(NETWORK_PART);
+    // Fees unread, so the wallet's note, which needs them, says nothing either.
+    expect(ids(HELD_BELOW, { kind: "reading" })).toEqual([]);
+    expect(ids(USD10, { kind: "reading" })).toEqual([]);
+    expect(ids(USD69, { kind: "reading" })).toEqual([]);
   });
 
   /**
-   * A wallet buy's gas at 0.05 gwei is about $0.02, under half the buy fee.
-   * At the median it is about $0.05, as much as the fee: no note.
+   * A wallet buy's gas at 0.05 gwei is about $0.02, under half a $10 buy's
+   * fee. At the median it is about $0.05, more than half of it: no note.
    */
   it("says when confirming each buy in a wallet costs less than the vault's buy fee", () => {
     const quiet: FeeRead = { kind: "ok", fees: { type: "eip1559", maxFeePerGas: 2n * 30_000_000n + 20_000_000n, maxPriorityFeePerGas: 20_000_000n } };
@@ -305,10 +349,13 @@ describe("the notes under the vault choice", () => {
       banner: null,
       text:
         "At today's network fees, confirming each buy yourself costs less: about $0.02 a buy, " +
-        "against a buy fee of ≈\u00a0$0.05 (0.00002013 ETH).",
+        "against a buy fee of ≈\u00a0$0.07 (0.0000261 ETH).",
     });
     expect(ids(USD69, quiet)).toContain("dca-form-vault-wallet-cheaper");
-    expect(ids(USD69)).not.toContain("dca-form-vault-wallet-cheaper");
+    expect(ids(USD10)).not.toContain("dca-form-vault-wallet-cheaper");
+    // A larger buy's fee grows with it (0.25% of the buy): at the median, $69's
+    // is more than twice a wallet buy's gas, and the note says so.
+    expect(ids(USD69)).toContain("dca-form-vault-wallet-cheaper");
     // More than twice a wallet buy's gas, not merely more.
     const wallet = WALLET_BUY_TYPICAL_GAS * 132_000_000n;
     const at = (reward: bigint) => vaultFeeNotes({ ...buyFee(USD69), reward }, { amountPerBuy: USD69, fees: MEDIAN }).map((n) => n.testId);
@@ -337,7 +384,7 @@ describe("the notes under the vault choice", () => {
     const dear: FeeRead = { kind: "ok", fees: { type: "eip1559", maxFeePerGas: 2n * GWEI, maxPriorityFeePerGas: 0n } };
     const plan = vaultCosts({ amountPerBuy: USD10, maxBuys: 10, fees: dear.kind === "ok" ? dear.fees : null })!;
     expect(vaultCheaperText(plan, { maxBuys: 10, fees: dear, money: RATES })).toBe(
-      "A vault would cost this plan less at today's fees: a buy fee of ≈\u00a0$0.05 a buy, plus ≈\u00a0$0.58 once to create the vault.",
+      "A vault would cost this plan less at today's fees: a buy fee of ≈\u00a0$0.07 a buy, plus ≈\u00a0$0.58 once to create the vault.",
     );
     // One buy doesn't pay for creating the vault.
     const once = vaultCosts({ amountPerBuy: USD10, maxBuys: 1, fees: dear.kind === "ok" ? dear.fees : null })!;
@@ -371,7 +418,9 @@ describe("a vault card's figures", () => {
     expect(vaultRewardText(figures())).toBe("0.0000069 WETH a buy (0.69% of each) · none paid yet");
     expect(vaultRewardText(figures({ rewardsPaid: 2n * FEE }))).toBe("0.0000069 WETH a buy (0.69% of each) · 0.0000138 WETH paid so far");
     const ten = figures({ terms: { ...figures().terms, amountPerBuy: USD10, keeperReward: buyFee(USD10).reward } });
-    expect(vaultRewardText(ten, RATES)).toBe("0.00002013 WETH a buy (≈\u00a0$0.05, 0.54% of each) · none paid yet");
+    expect(vaultRewardText(ten, RATES)).toBe("0.0000260974 WETH a buy (≈\u00a0$0.07, 0.69% of each) · none paid yet");
+    const sixtyNine = figures({ terms: { ...figures().terms, amountPerBuy: USD69, keeperReward: buyFee(USD69).reward } });
+    expect(vaultRewardText(sixtyNine, RATES)).toBe("0.0000841435 WETH a buy (≈\u00a0$0.22, 0.33% of each) · none paid yet");
   });
 
   it("asks before closing with what comes back, and that it is final", () => {
@@ -392,8 +441,16 @@ describe("a vault card's lines", () => {
   });
 
   it("says what a vault between buys is waiting for", () => {
-    expect(vaultLine(status("waiting"), active())).toBe("Waiting for the first buy time. Then anyone can trigger it.");
-    expect(vaultLine(status("waiting"), active({ buysDone: 1 }))).toBe("Waiting for the next buy time. Then anyone can trigger it.");
+    // v1: anyone may make its buy, and be paid, once due.
+    expect(vaultLine(status("waiting"), active({ release: "v1", source: "v1" }))).toBe("Waiting for the first buy time. Then anyone can trigger it.");
+    expect(vaultLine(status("waiting"), active({ release: "v1", source: "v1", buysDone: 1 }))).toBe(
+      "Waiting for the next buy time. Then anyone can trigger it.",
+    );
+    // v2: SPX holders first, which the due banner then says ("Community
+    // window until 14:32, then open to anyone."); "Then anyone" before it
+    // read as the opposite.
+    expect(vaultLine(status("waiting"), active())).toBe("Waiting for the first buy time.");
+    expect(vaultLine(status("waiting"), active({ buysDone: 1 }))).toBe("Waiting for the next buy time.");
   });
 
   it("reads a buy due by the clock carried forward, and not yet by a block, as a wait for that block", () => {
@@ -442,16 +499,21 @@ describe("a vault card's lines", () => {
   it("names the buy fee a retry would pay, exactly as a share, and whose figure it is", () => {
     expect(retryRewardText({ keeperReward: FEE / 2n, keptReward: true }, MILLI)).toBe("0.00000345 ETH a buy, 0.35% of each · as you set it up");
     const today = buyFee(USD10).reward;
-    expect(retryRewardText({ keeperReward: today, keptReward: false }, USD10)).toBe("0.00002013 ETH a buy, 0.54% of each · the current default");
+    expect(retryRewardText({ keeperReward: today, keptReward: false }, USD10)).toBe("0.0000261 ETH a buy, 0.69% of each · the current default");
     // Who gets it, on the line under it, as the form's cost line says it.
-    expect(retryPayeeText()).toBe("Each buy's fee is paid to whoever triggers it — maybe spDEX's developers.");
+    expect(retryPayeeText()).toBe("Each buy's fee is paid to the keeper that makes it — maybe spDEX's developers.");
     expect(retryPayeeText()).toContain(FEE_PAYEE);
+    // Who is paid first is the window line's to say (DESIGN §9: one plain
+    // line); the payee beside it, on the choice card's cost line and here,
+    // said it a second and third time.
+    expect(FEE_PAYEE).not.toMatch(/SPX holders/);
     expect(retryRewardText({ keeperReward: null, keptReward: false }, MILLI)).toBe("unknown: the plan's amount per buy can't be read");
   });
 
   /** What stays visible above "Create and fund vault" (UI rule R6, docs/ARCHITECTURE.md), however the plan arrived. */
   it("says who may trigger it, that only closing stops it, and the cap, above the create button", () => {
-    expect(retryRulesText("0.5 ETH")).toBe("Anyone can make its due buys; nobody has to. Only closing it stops it. At most 0.5 ETH.");
+    // R6: anyone can make its due buys and nobody has to — SPX holders first, for each buy's community window.
+    expect(retryRulesText("0.5 ETH")).toBe("Anyone can make its due buys, SPX holders first; nobody has to. Only closing it stops it. At most 0.5 ETH.");
   });
 
   /** The form's first two notes, on the card, judged on the fee the click sends: a kept one may be lower than today's. */
@@ -530,6 +592,63 @@ describe("a vault's history rows", () => {
     expect(untimed!.text).toMatch(/^#1 · Bought /);
   });
 
+  /**
+   * A v2 buy says who made it, from its `Bought` (`maker`, `buyMaker`), and
+   * whom its fee went to (`rewardTo`), which need not be whoever sent it.
+   */
+  it("says who made each v2 buy, and whom its fee was paid", () => {
+    const HOLDER = "0x00000000000000000000000000000000000000dd" as Address;
+    const BATCHER = MAINNET_BATCHER as Address;
+    const v2 = (patch: Partial<VaultHistoryEntry>): VaultHistoryEntry => ({
+      ...bought(2, null),
+      source: "v2",
+      dueSince: 1_000,
+      communityWindow: 1_800,
+      sender: null,
+      ...patch,
+    });
+    const text = (entry: VaultHistoryEntry, account: Address | null) =>
+      vaultHistoryRows({ entries: [entry], missingBuys: 0, terms: { tokenOut: SPX }, account, chainNow: null, nowMs: 0 })[0]!.text;
+    const head = "#1 · Bought 4.85575 SPX for 0.001 ETH";
+    // Trigger now: the owner's, the fee back to the owner.
+    const own = v2({ keeper: OWNER, rewardTo: OWNER, maker: "owner" });
+    expect(text(own, OWNER)).toBe(`${head} · triggered by you, paid you its 0.0000069 WETH buy fee`);
+    expect(text(own, KEEPER)).toBe(`${head} · triggered by its owner, paid its owner its 0.0000069 WETH buy fee`);
+    // Someone else named the owner: the fee came back, but not by the owner's doing.
+    expect(text(v2({ keeper: KEEPER, rewardTo: OWNER, maker: "returned" }), OWNER)).toBe(
+      `${head} · triggered by 0x0000…00bb, paid you its 0.0000069 WETH buy fee`,
+    );
+    expect(text(v2({ keeper: BATCHER, rewardTo: OWNER, sender: KEEPER, maker: "returned" }), OWNER)).toBe(
+      `${head} · triggered by 0x0000…00bb, paid you its 0.0000069 WETH buy fee`,
+    );
+    // Inside the window, a community keeper; after it, anyone.
+    expect(text(v2({ keeper: BATCHER, rewardTo: HOLDER, maker: "community" }), OWNER)).toBe(
+      `${head} · triggered by a community keeper, paid 0x0000…00dd its 0.0000069 WETH buy fee`,
+    );
+    // After it: who sent it, as for any other buy ("by anyone" read as if nobody in particular had).
+    expect(text(v2({ keeper: KEEPER, rewardTo: KEEPER, maker: "open" }), OWNER)).toBe(
+      `${head} · triggered by 0x0000…00bb after its community window, paid 0x0000…00bb its 0.0000069 WETH buy fee`,
+    );
+    expect(text(v2({ keeper: BATCHER, rewardTo: HOLDER, maker: "open" }), OWNER)).toBe(
+      `${head} · triggered in a batch after its community window, paid 0x0000…00dd its 0.0000069 WETH buy fee`,
+    );
+    expect(text(v2({ keeper: KEEPER, rewardTo: KEEPER, maker: "open" }), KEEPER)).toBe(
+      `${head} · triggered by you after its community window, paid you its 0.0000069 WETH buy fee`,
+    );
+    // The connected wallet was the community keeper.
+    expect(text(v2({ keeper: BATCHER, rewardTo: HOLDER, maker: "community" }), HOLDER)).toBe(
+      `${head} · triggered by a community keeper, paid you its 0.0000069 WETH buy fee`,
+    );
+    // Who made it unknown (no block time): who was paid, and how it was sent, but no guess at the window.
+    expect(text(v2({ keeper: BATCHER, rewardTo: HOLDER, maker: null }), OWNER)).toBe(
+      `${head} · triggered in a batch, paid 0x0000…00dd its 0.0000069 WETH buy fee`,
+    );
+    // v1 reads as it always has: the caller was paid.
+    expect(text({ ...bought(2, null), source: "v1", rewardTo: KEEPER, dueSince: null, maker: "caller" }, OWNER)).toBe(
+      `${head} · triggered by 0x0000…00bb, paid them its 0.0000069 WETH buy fee`,
+    );
+  });
+
   it("leaves fundings and closings unnumbered", () => {
     const rows = vaultHistoryRows({
       entries: [
@@ -546,6 +665,68 @@ describe("a vault's history rows", () => {
       "Closed: 0.001 ETH sent back to its owner",
       "#1 · Bought 4.85575 SPX for 0.001 ETH · triggered by 0x0000…00bb, paid them its 0.0000069 WETH buy fee",
     ]);
+  });
+});
+
+describe("the community window's words", () => {
+  it("says, in one line, who may earn the plan's fee and for how long", () => {
+    expect(communityWindowLine(1_800)).toBe(
+      "SPX holders can earn this plan's fee for its first 30 minutes after each buy falls due; then anyone can.",
+    );
+    expect(communityWindowLine(75)).toBe("SPX holders can earn this plan's fee for its first 75 seconds after each buy falls due; then anyone can.");
+    expect(communityWindowLine(60)).toMatch(/for its first minute after/);
+    expect(communityWindowLine(900)).toMatch(/for its first 15 minutes after/);
+    expect(communityWindowLine(3_600)).toMatch(/for its first hour after/);
+  });
+
+  it("gives Expert the spec's one hint, and short option labels", () => {
+    expect(COMMUNITY_WINDOW_HINT).toBe(
+      "Shorter: your buy happens sooner when no holder is online. Longer: holders have more time to earn your fee.",
+    );
+    expect(windowOptionLabel({ value: "60", seconds: 60 })).toBe("1 min");
+    expect(windowOptionLabel({ value: "3600", seconds: 3_600 })).toBe("60 min");
+    expect(windowOptionLabel({ value: "quarter", seconds: 75 })).toBe("A quarter of the interval (75 s)");
+    expect(windowOptionLabel({ value: "quarter", seconds: 900 })).toBe("A quarter of the interval (15 min)");
+  });
+
+  /** "until 14:32": the window's end, chain time, in this device's clock, as the card's other times. */
+  it("says on a due v2 card until when holders have first claim, and nothing outside the window or on v1", () => {
+    const nowMs = Date.UTC(2026, 9, 3, 12, 0);
+    // The chain is a day behind this device; the window ends ten minutes from now on the chain.
+    const chainNow = Math.floor(nowMs / 1000) - 86_400;
+    const due = figures({ nextBuyAt: chainNow - 60, dueSince: chainNow - 60, windowEndsAt: chainNow + 600 });
+    const clock = new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).format(new Date(nowMs + 600_000));
+    expect(communityWindowLiveText(due, chainNow, nowMs)).toBe(`Community window until ${clock}, then open to anyone.`);
+    // Its last second is inside; the next is open to anyone, and says nothing.
+    expect(communityWindowLiveText(due, chainNow + 599, nowMs)).not.toBeNull();
+    expect(communityWindowLiveText(due, chainNow + 600, nowMs)).toBeNull();
+    // Not due yet by the clock.
+    expect(communityWindowLiveText(figures({ nextBuyAt: chainNow + 60, dueSince: chainNow + 60, windowEndsAt: chainNow + 1_860 }), chainNow, nowMs)).toBeNull();
+    // A v1 vault has no window, and its card is unchanged.
+    expect(communityWindowLiveText({ ...due, source: "v1", windowEndsAt: null }, chainNow, nowMs)).toBeNull();
+    expect(communityWindowLiveText(due, null, nowMs)).toBeNull();
+  });
+
+  /**
+   * A plan with turns (dormant: every vault spDEX creates has none) says so in
+   * one line, and while a buy is in its turn the due banner says when the turn
+   * ends, then the window. A plan without turns says nothing of them.
+   */
+  it("says when a buy's turn ends, and nothing of turns for a plan without", () => {
+    const nowMs = Date.UTC(2026, 9, 3, 12, 0);
+    const chainNow = Math.floor(nowMs / 1000) - 86_400;
+    expect(vaultTurnsLine(0)).toBeNull();
+    expect(vaultTurnsLine(null)).toBeNull();
+    expect(vaultTurnsLine(4)).toBe(
+      "The first half of each community window is shared out in turns among 4 groups of SPX holders; then any holder can earn the fee, and after the window anyone can.",
+    );
+    const clockAt = (ms: number) => new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).format(new Date(ms));
+    const turned = figures({ nextBuyAt: chainNow - 60, dueSince: chainNow - 60, windowEndsAt: chainNow + 840, turnBuckets: 4, turnEndsAt: chainNow + 390 });
+    expect(communityWindowLiveText(turned, chainNow, nowMs)).toBe(
+      `This buy's turn until ${clockAt(nowMs + 390_000)}, for SPX holders in its group; then any SPX holder until ${clockAt(nowMs + 840_000)}, then anyone.`,
+    );
+    // From the turn's end, the window's line as for a plan without turns.
+    expect(communityWindowLiveText(turned, chainNow + 390, nowMs + 390_000)).toBe(`Community window until ${clockAt(nowMs + 840_000)}, then open to anyone.`);
   });
 });
 
@@ -597,7 +778,7 @@ describe("no vault sentence says reward", () => {
 
   it("in any sentence a vault's copy makes", () => {
     const sentences: string[] = [...Object.values(VAULT_TIPS), vaultFeeRule()];
-    for (const amount of [USD1, CHEAP_BATCHED_BUY_THRESHOLD, 10n ** 15n, USD5, FULL_FEE_BUY_THRESHOLD, USD10, USD69]) {
+    for (const amount of [USD1, CHEAP_BATCHED_BUY_THRESHOLD, 10n ** 15n, USD5, HELD_BELOW, USD10, USD69]) {
       const planned = vaultCosts({ amountPerBuy: amount, maxBuys: 7, fees: null })!;
       for (const read of fees) {
         const priced = { ...planned, createFee: read.kind === "ok" ? 1n : null };
@@ -610,6 +791,9 @@ describe("no vault sentence says reward", () => {
       sentences.push(retryRewardText({ keeperReward: planned.fee.reward, keptReward: false }, amount), createSendsText({ fund: planned.budget }, planned) ?? "");
     }
     sentences.push(vaultCostText(null, MEDIAN), retryRewardText({ keeperReward: null, keptReward: false }, 1n));
+    sentences.push(communityWindowLine(75), communityWindowLine(1_800), COMMUNITY_WINDOW_HINT, retryPayeeText(), retryRulesText("0.5 ETH"));
+    sentences.push(communityWindowLiveText(figures({ nextBuyAt: 100, windowEndsAt: 200 }), 150, 0) ?? "");
+    for (const name of ["NotEligible", "BadRewardTo", "CommunityWindowOutOfRange"]) sentences.push(vaultErrorText({ name, args: [] }) ?? "");
     sentences.push(vaultRewardText(figures(), RATES), vaultRewardText(figures({ rewardsPaid: 1n })), vaultRewardText(figures({ terms: { ...figures().terms, keeperReward: 0n } })));
     for (const name of ["RewardTooLarge", "FundingCapExceeded", "InsufficientBalance", "FullyFunded"]) sentences.push(vaultErrorText({ name, args: [] }) ?? "");
     for (const state of [active({ funded: false, balance: 0n }), active({ due: true, canTrigger: true })]) {
@@ -634,6 +818,22 @@ describe("no vault sentence says reward", () => {
     }
     expect(vaultCardSource).toContain('"Buy fee (keeperReward)"');
   });
+
+  /**
+   * The vault pays inside its window only an address the registry finds
+   * eligible — proven, an ordinary account, holding 690 SPX now — or its
+   * owner. "An SPX holder" was too loose: a holder that never proved, or a
+   * contract wallet, is refused `NotEligible`.
+   */
+  it("says who may be paid inside the window as the vault judges it: a proven account, not any holder", () => {
+    const tip = /const OWN_KEEPER_TIP =\s*"([^"]*)"/.exec(autoBuysPanelSource)?.[1] ?? "";
+    expect(tip).toContain("Out of the box it makes only buys whose fee covers that; the guide shows how to have it pay the difference for your own vaults.");
+    expect(tip).toContain("Inside a buy's community window it is paid only when it names a community keeper (an account proven to hold 690 SPX) or the vault's owner.");
+    expect(tip).not.toMatch(/an SPX holder or/);
+    expect(vaultErrorText({ name: "NotEligible", args: [] })).toBe(
+      "Inside its community window, a buy's fee can be paid only to a community keeper (an account proven to hold 690 SPX) or the vault's owner.",
+    );
+  });
 });
 
 describe("the Recurring choice cards", () => {
@@ -644,5 +844,32 @@ describe("the Recurring choice cards", () => {
     expect(recurringFormSource).toContain("title={SIGNER_CHOICE_TITLES.vault}");
     expect(recurringFormSource).toContain("holds the budget — no tab needed.");
     expect(recurringFormSource).not.toContain("Vault — no tab needed");
+    // R6, made true for v2: anyone can make its due buys, SPX holders first, and nobody has to.
+    expect(recurringFormSource).toContain("Anyone can make its due buys, SPX holders first; nobody has to.");
+  });
+
+  /**
+   * The window, as decisions 3 and 26 put it on screen: one plain line for
+   * everyone, the choice in Expert alone. The form is a component the unit
+   * project can only render statically, where it starts on the wallet choice,
+   * so the wiring is pinned in its source, and what each piece says and
+   * offers in `communityWindowLine`, `vaultWindowOptions` and `vaultWindowOf`
+   * (lib/dca/vault.test.ts).
+   */
+  it("shows every vault plan the window line, and the window's choice in Expert alone", () => {
+    const code = recurringFormSource.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
+    // Simple always gets the plan's default, whatever was chosen in Expert.
+    expect(code).toContain('vaultWindowOf(expert ? vaultWindow : "default", parsed.intervalSeconds)');
+    // The line: for every vault plan, not behind Expert.
+    expect(code).toMatch(/\{vault && windowSeconds !== null \? <p data-testid="dca-form-vault-window-line">\{communityWindowLine\(windowSeconds\)\}<\/p> : null\}/);
+    // The select: Expert's, with the hint, each option disabled above a quarter of the interval.
+    const select = code.slice(code.indexOf("{expert && parsed.intervalSeconds !== null ? ("), code.indexOf('data-testid="dca-form-vault-window"') + 200);
+    expect(select).toContain('<Field label="Community window" hint={COMMUNITY_WINDOW_HINT}>');
+    expect(select).toContain('data-testid="dca-form-vault-window"');
+    expect(code).toContain("disabled={option.disabled}");
+    // The vault is created with the window the form showed.
+    expect(code).toContain("communityWindow: windowSeconds");
+    // What will be saved writes it as Vault details does: "1,800 s".
+    expect(code).toContain("` (${formatCount(windowSeconds)} s)`");
   });
 });

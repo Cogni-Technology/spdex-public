@@ -26,8 +26,32 @@ import type { Address, Hex } from "@spdex/core";
 
 export const KEEPER_LOG_VERSION = 1;
 
-export type WaitReason = "not-cheap" | "fees-above-max" | "economics" | "pending-tx" | "dry-run" | "stale-head" | "low-balance";
-export type WarnCode = "public-mempool" | "deployment-missing" | "key-permissions" | "unknown-setting";
+export type WaitReason = "not-cheap" | "fees-above-max" | "economics" | "pending-tx" | "dry-run" | "stale-head" | "low-balance" | "holders-first";
+export type WarnCode = "public-mempool" | "deployment-missing" | "key-permissions" | "unknown-setting" | "registry-missing" | "prove-dry-run";
+
+/**
+ * Why the keeper did not prove `rewardTo` when its proof was due for renewal:
+ * the endpoint won't answer `eth_getProof`; `rewardTo` held less than 690 SPX
+ * at the finalized block; the block's header didn't hash to its hash; it is a
+ * contract, which the registry never pays; a proof already as new is there;
+ * the registry would refuse it (its test-run reverted); or the proof's
+ * test-run asked for more gas than a proof is ever sent with. Or why a proof
+ * already in flight is not sent again: a proof as new landed first
+ * (`not-newer`), proving was turned off (`off`), or `rewardTo` is another
+ * address since it was sent (`other-holder`).
+ */
+export type ProveSkipReason =
+  | "unsupported"
+  | "below-min-spx"
+  | "header-mismatch"
+  | "contract"
+  | "not-newer"
+  | "refused"
+  | "gas"
+  | "fees-above-max"
+  | "low-balance"
+  | "off"
+  | "other-holder";
 
 /** A vault in a batch as `batch_sent` reports it. */
 export interface SentVault {
@@ -41,6 +65,12 @@ export interface SentVault {
   floorOut: bigint | null;
   depth: bigint | null;
   secondsToDeadline: bigint;
+  /**
+   * A v2 buy sent inside its community window (this keeper's `rewardTo` may
+   * be paid there): the first second it is open to anyone. Null for v1, and
+   * for a buy sent after its window.
+   */
+  communityWindowEndsAt: bigint | null;
 }
 
 export interface MinedBuy {
@@ -54,6 +84,12 @@ export interface MinedBuy {
   reward: bigint;
   gasUsed: bigint;
   secondsIntoWindow: bigint;
+  /** Who the vault paid: `Bought.rewardTo` (v1: the caller, the batcher). */
+  rewardTo: Address | null;
+  /** When the buy fell due, from `Bought`; null for v1. */
+  dueSince: bigint | null;
+  /** Made inside its community window; null for v1, or when its terms are not known here. */
+  inCommunityWindow: boolean | null;
 }
 
 export interface MinedRefusal {
@@ -71,8 +107,10 @@ export type KeeperLogBody =
       rewardTo: Address | null;
       chainId: number;
       dryRun: boolean;
-      deployments: { id: string; factory: Address; batcher: Address }[];
+      deployments: { id: string; factory: Address; batcher: Address; registry: Address | null }[];
       sendMode: "public" | "private";
+      /** `SPDEX_KEEPER_PROVE`: whether this keeper may prove `rewardTo`. */
+      prove: boolean;
       sendWhen: string;
       policy: Record<string, bigint | number | string | boolean | null>;
       version: string;
@@ -92,6 +130,12 @@ export type KeeperLogBody =
       balanceWei: bigint | null;
       runwayDays: number | null;
       attention: string[];
+      /** Whether `rewardTo` may be paid inside the latest release's community windows; null when unknown. */
+      eligible: boolean | null;
+      /** Until when its proof is valid, chain time (0: never proved); null when unknown. */
+      proofValidUntil: bigint | null;
+      /** Days until the proof lapses, to a tenth; negative once lapsed; null when unknown or never proved. */
+      proofDaysLeft: number | null;
     }
   | { type: "tick"; nextBaseFeeWei: bigint | null; lowestTargetWei: bigint | null; active: number; clockDue: number; candidates: number }
   | { type: "sync"; deployment: string; scannedCount: bigint; vaultCount: bigint }
@@ -109,6 +153,10 @@ export type KeeperLogBody =
       startAt: bigint;
       keeperReward: bigint;
       maxSlippageBps: bigint;
+      /** Seconds of first claim for SPX holders after each buy falls due; null for a v1 vault. */
+      communityWindow: bigint | null;
+      /** Turns in the window's first half: 0 for none; null for a source without turns (v1). */
+      turnBuckets: bigint | null;
     }
   | { type: "vault_retired"; vault: Address; reason: "closed" | "done" }
   | { type: "wait"; reason: WaitReason; nextBaseFeeWei: bigint | null; targetWei: bigint | null; candidates: number; nextDeadline: bigint | null }
@@ -173,7 +221,8 @@ export type KeeperLogBody =
       priorityFeeWei: bigint | null;
       costWei: bigint;
       earnedWei: bigint;
-      sweptWei: bigint;
+      /** Stray WETH v1's batcher swept to `rewardTo`; null for v2's, which moves no WETH at all. */
+      sweptWei: bigint | null;
       netWei: bigint;
       sentBlock: bigint | null;
       inclusionBlocks: bigint | null;
@@ -202,6 +251,60 @@ export type KeeperLogBody =
   | { type: "unwrap_sent"; batchId: string; hash: Hex; amountWei: bigint }
   | { type: "unwrap_mined"; batchId: string; hash: Hex; amountWei: bigint; status: "success" | "reverted" }
   | { type: "batcher_deployed"; deployment: string; hash: Hex; address: Address }
+  | {
+      /**
+       * What the keeper read of its `rewardTo` in a release's SPX holder
+       * registry: logged when it changes, and once a day besides, so the day
+       * its proof lapses is in the log whether or not this keeper proves.
+       */
+      type: "eligibility";
+      deployment: string;
+      registry: Address;
+      rewardTo: Address;
+      eligible: boolean | null;
+      validUntil: bigint | null;
+      /** Days until the proof lapses, to a tenth; negative once lapsed; null when unknown or never proved. */
+      daysLeft: number | null;
+      spxWei: bigint | null;
+      minSpxWei: bigint;
+      isAccount: boolean | null;
+      /** Why it isn't eligible, in the registry's order: not-proven, lapsed, contract, below-minimum; null when it is, or unknown. */
+      reason: string | null;
+    }
+  | {
+      type: "prove_sent";
+      batchId: string;
+      hash: Hex;
+      deployment: string;
+      registry: Address;
+      holder: Address;
+      /** The finalized block whose state it proves. */
+      provenBlock: bigint;
+      gasLimit: bigint;
+      maxFeePerGas: bigint;
+      maxPriorityFeePerGas: bigint;
+      /** Until when the proof makes `holder` eligible once mined: the block's time and 30 days. */
+      validUntil: bigint;
+    }
+  | {
+      type: "prove_mined";
+      batchId: string;
+      hash: Hex;
+      deployment: string | null;
+      status: "success" | "reverted";
+      costWei: bigint;
+      /** From the registry's own `Proven`; null when it reverted, or the log is not there. */
+      validUntil: bigint | null;
+    }
+  | { type: "prove_skipped"; deployment: string; holder: Address; reason: ProveSkipReason; detail: string }
+  | {
+      /** The key's ether covers fewer days of sends than `minRunwayDays`, at its last week's spend: top it up. */
+      type: "low_runway";
+      runwayDays: number;
+      thresholdDays: number;
+      etherWei: bigint;
+      spentWeekWei: bigint;
+    }
   | { type: "error"; where: string; message: string }
   | { type: "stop"; reason: "signal" | "watchdog" | "fatal"; detail: string };
 
@@ -296,7 +399,7 @@ const escapeRegExp = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, "\\
 // ─── One line ─────────────────────────────────────────────────────────────────
 
 const HASH_FIELDS = new Set(["hash", "oldHash", "newHash", "txHash", "lastBatchHash", "hashes"]);
-const ADDRESS_FIELDS = new Set(["keeper", "vault", "rewardTo", "factory", "batcher", "owner", "address", "tokenOut", "notTried"]);
+const ADDRESS_FIELDS = new Set(["keeper", "vault", "rewardTo", "factory", "batcher", "owner", "address", "tokenOut", "notTried", "registry", "holder"]);
 const TEXT_FIELDS = new Set(["message", "lastError", "detail", "lastDetail", "text"]);
 const HASH_RE = /^0x[0-9a-f]{64}$/;
 const ADDRESS_RE = /^0x[0-9a-f]{40}$/;

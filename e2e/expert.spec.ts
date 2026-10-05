@@ -8,7 +8,7 @@
  * against real liquidity.
  */
 
-import { test, expect, fundWeth, installWallet, seedConfig, FORK_URL, openSection, openTile } from "./fixtures.js";
+import { test, expect, fundWeth, installWallet, seedConfig, sentTransactions, FORK_URL, openSection, openTile } from "./fixtures.js";
 
 const ONE_WETH = 10n ** 18n;
 
@@ -263,6 +263,73 @@ test.describe("expert mode", () => {
     await expect(page.getByTestId("submitter-url")).not.toHaveValue("");
     await openSection(page, "config-panel");
     await expect(page.getByTestId("diff-submitter.mode")).toBeVisible();
+  });
+
+  test("a vault plan's community window: one line in Simple, and in Expert a choice of it, none above a quarter of the interval", async ({
+    page,
+    account,
+  }) => {
+    await installWallet(page, { address: account });
+    await seedConfig(page);
+    await page.goto("/");
+    await openTile(page, "trade");
+    await page.getByTestId("connect-button").click();
+    await page.getByTestId("buy-mode-recurring").click();
+    const vault = page.getByTestId("dca-form-signer-vault").getByRole("radio");
+    await expect(vault).toBeEnabled({ timeout: 60_000 });
+    await vault.check();
+    await page.getByTestId("dca-form-frequency").selectOption("1h");
+
+    // Simple: who may earn the fee, and for how long, in one line, and no
+    // control for it. An hourly plan's window is a quarter of its hour.
+    const line = page.getByTestId("dca-form-vault-window-line");
+    await expect(line).toHaveText("SPX holders can earn this plan's fee for its first 15 minutes after each buy falls due; then anyone can.");
+    const select = page.getByTestId("dca-form-vault-window");
+    await expect(select).toHaveCount(0);
+
+    // Expert: the same plan, with the window to choose. Every preset longer
+    // than a quarter of the interval is offered but can't be chosen, and the
+    // quarter itself is the 15-minute preset, so it isn't listed twice.
+    await openTile(page, "settings");
+    await page.getByTestId("mode-toggle-expert").click();
+    await openTile(page, "trade");
+    await expect(page.getByTestId("dca-form-frequency")).toHaveValue("1h");
+    await expect(select).toBeVisible();
+    const options = async () =>
+      select.locator("option").evaluateAll((elements) =>
+        elements.map((element) => ({ label: element.textContent, disabled: (element as HTMLOptionElement).disabled })),
+      );
+    expect(await options()).toEqual([
+      { label: "1 min", disabled: false },
+      { label: "5 min", disabled: false },
+      { label: "15 min", disabled: false },
+      { label: "30 min", disabled: true },
+      { label: "60 min", disabled: true },
+    ]);
+    await expect(select).toHaveValue("900");
+    await expect(page.getByTestId("dca-form-vault")).toContainText(
+      "Shorter: your buy happens sooner when no holder is online. Longer: holders have more time to earn your fee.",
+    );
+    await expect(line).toHaveText("SPX holders can earn this plan's fee for its first 15 minutes after each buy falls due; then anyone can.");
+
+    // Every ten minutes: a quarter is 150 seconds, no preset, so it is the
+    // choice, and the only one beside a minute.
+    await page.getByTestId("dca-form-frequency").selectOption("custom");
+    await page.getByTestId("dca-form-custom-minutes").fill("10");
+    await expect(select.locator("option")).toHaveCount(6);
+    expect(await options()).toEqual([
+      { label: "1 min", disabled: false },
+      { label: "5 min", disabled: true },
+      { label: "15 min", disabled: true },
+      { label: "30 min", disabled: true },
+      { label: "60 min", disabled: true },
+      { label: "A quarter of the interval (150 s)", disabled: false },
+    ]);
+    await expect(select).toHaveValue("quarter");
+    await expect(line).toHaveText("SPX holders can earn this plan's fee for its first 150 seconds after each buy falls due; then anyone can.");
+    await select.selectOption({ label: "1 min" });
+    await expect(line).toHaveText("SPX holders can earn this plan's fee for its first minute after each buy falls due; then anyone can.");
+    expect(await sentTransactions(page)).toEqual([]);
   });
 
   test("runs the venue in the sandbox when strict mode is on", async ({ page, account }) => {

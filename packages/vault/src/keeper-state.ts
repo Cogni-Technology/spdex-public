@@ -11,17 +11,23 @@
  * worse than none.
  *
  * JSON, with bigints as decimal strings. Parsing checks every field it reads
- * and names the first one that is wrong. There is only version 1, and a file
- * of any other is refused; the first change of shape brings its migration.
+ * and names the first one that is wrong. This is version 2, which v2's
+ * community window brought: each release's SPX holder registry, a vault's
+ * window in its terms, what the keeper last read of its `rewardTo`'s
+ * eligibility, and the `prove` it may send. A version-1 file is migrated on
+ * reading (`migrateKeeperStateV1`) — everything it knew is kept, and what it
+ * could not know starts empty — and written back as version 2 at the next
+ * persist, after which a version-1 keeper refuses it as newer than its own
+ * (`--reset-state` is the way back). A file of any other version is refused.
  */
 
 import type { Address, Hex } from "@spdex/core";
 import type { PreparedFees } from "@spdex/chain";
-import { DEPLOYMENTS, type Deployment } from "./artifacts.js";
+import { DEPLOYMENTS, SOURCES, type Deployment } from "./artifacts.js";
 import type { VaultTerms } from "./index.js";
 import { RATIO_ONE, type SendReason } from "./keeper-plan.js";
 
-export const KEEPER_STATE_VERSION = 1;
+export const KEEPER_STATE_VERSION = 2;
 
 export type SkipCode =
   | "not-vouched"
@@ -36,7 +42,13 @@ export type SkipCode =
   | "economics"
   | "public-pair-cap"
   | "zero-reward"
-  | "sim-refused";
+  | "sim-refused"
+  /** Inside its community window, which this keeper's `rewardTo` may not be paid in: SPX holders go first. */
+  | "holders-first"
+  /** Inside its turn, another bucket's: this keeper's `rewardTo` is eligible, and may be paid once the turn ends. */
+  | "other-turn"
+  /** Its address is not where its factory puts a vault with the owner and terms read: never sent, rechecked hourly. */
+  | "unproven";
 
 /** One vault the keeper watches: what its factory's list or the allowlist said, and what it last read. */
 export interface VaultEntry {
@@ -46,6 +58,13 @@ export interface VaultEntry {
   index: bigint | null;
   owner: Address;
   terms: VaultTerms;
+  /**
+   * The factory nonce its address was proven with (`findVaultNonce`): its
+   * address is the CREATE2 address its factory gives `owner`'s vault with these
+   * terms at this nonce, so it is the factory's clone whatever an endpoint
+   * says. Null until proven: a vault is never sent in a batch before.
+   */
+  nonce: bigint | null;
   buysDone: bigint;
   /** Chain time of its last buy; 0 before the first. */
   lastBuyAt: bigint;
@@ -65,7 +84,7 @@ export interface VaultEntry {
 }
 
 export interface PendingAttempt {
-  kind: "batch" | "cancel" | "unwrap" | "deploy";
+  kind: "batch" | "cancel" | "unwrap" | "deploy" | "prove";
   hash: Hex;
   /** The signed transaction: public once broadcast, no key material; it allows an exact resend after a restart. */
   raw: Hex;
@@ -92,8 +111,8 @@ export interface Subsidy {
 export interface PendingTx {
   batchId: string;
   nonce: number;
-  purpose: "batch" | "unwrap" | "deploy";
-  /** The deployment whose batcher it calls, or deploys; null for an unwrap. */
+  purpose: "batch" | "unwrap" | "deploy" | "prove";
+  /** The deployment whose batcher it calls or deploys, or whose registry it proves to; null for an unwrap. */
   deployment: string | null;
   vaults: Address[];
   urgent: boolean;
@@ -108,6 +127,12 @@ export interface PendingTx {
   subsidy: Subsidy[];
   /** For an unwrap, what it unwraps. */
   amountWei: bigint | null;
+  /**
+   * For a `prove`, the block whose state it proves: the registry checks that
+   * block's hash only while it is one of the last 8,191, so a proof left
+   * waiting too long is cancelled rather than sent again.
+   */
+  proveBlock: bigint | null;
   resends: number;
   /** A rebuild found nothing worth sending: a private send stops resending and waits to expire. */
   stoppedResending: boolean;
@@ -133,13 +158,39 @@ export interface Orphan {
   nextCheckBlock: bigint;
 }
 
+/**
+ * What the keeper last read of its `rewardTo` in one release's SPX holder
+ * registry: whether it may be paid inside that release's community windows,
+ * and every figure that decides it. Read every tick; kept so that a heartbeat
+ * after a failed tick can still say when the proof lapses. Each figure that
+ * could not be read is null — unknown, and never taken as eligible.
+ */
+export interface Eligibility {
+  registry: Address;
+  holder: Address;
+  /** The registry's own `isEligible(holder)`; null when the registry has no code or could not be read. */
+  eligible: boolean | null;
+  /** Until when, inclusive, its proof is valid, chain time; 0 when it never proved. */
+  validUntil: bigint | null;
+  /** SPX it holds now, raw units (8 decimals). */
+  spx: bigint | null;
+  /** No code, or only an EIP-7702 delegation: the only kind of address the registry pays. */
+  isAccount: boolean | null;
+  /** Chain time of the read. */
+  readAt: bigint;
+}
+
 export interface KeeperState {
-  v: 1;
+  v: 2;
   chainId: number;
   /** The keeper's address; null for a dry run, which never signs. */
   keeper: Address | null;
-  /** By `DEPLOYMENTS` id: how far down its factory's list discovery has read. */
-  deployments: Record<string, { factory: Address; batcher: Address; scannedCount: bigint; vaultCount: bigint | null }>;
+  /**
+   * By `DEPLOYMENTS` id: its contracts, and how far down its factory's list
+   * discovery has read. `registry` is the SPX holder registry its vaults ask
+   * inside their community windows; null for v1, which has none.
+   */
+  deployments: Record<string, { factory: Address; batcher: Address; registry: Address | null; scannedCount: bigint; vaultCount: bigint | null }>;
   /** The last JSONL record's `seq`. */
   seq: number;
   /** The highest block seen: a head below it is stale. */
@@ -161,6 +212,14 @@ export interface KeeperState {
   lossLedger: { at: bigint; lossWei: bigint; vault: Address | null; owner: Address | null }[];
   /** `[chainTime, costWei]` of every transaction mined, for 7 days: the runway. */
   spend: [bigint, bigint][];
+  /**
+   * Chain time from which `spend` holds every transaction this keeper mined:
+   * its first tick's. Runway divides the spend by the time it covers — at
+   * most a week — so a keeper a day old is not taken to have spent a day's
+   * worth in a week. Null until the first tick; a version-1 file's is its
+   * oldest spend's, a bound it has certainly covered since.
+   */
+  spendSince: bigint | null;
   /** Gas used against the constants' model, in parts per million: at least `RATIO_ONE`, the constants exactly. */
   gasModel: { ratioPpm: bigint; samples: number };
   nextNonce: number | null;
@@ -178,17 +237,42 @@ export interface KeeperState {
   breakerOpen: boolean;
   /** A `low_balance` warning has been logged and not yet cleared. */
   lowBalance: boolean;
+  /** A `low_runway` warning has been logged and not yet cleared. */
+  lowRunway: boolean;
+  /** By `DEPLOYMENTS` id, for each release with a registry: what was last read of `rewardTo` there. */
+  eligibility: Record<string, Eligibility>;
+  /** What the last `eligibility` record said, so the same is logged once a day, not every tick. */
+  lastEligibility: string | null;
+  /** Chain time of the last `eligibility` record. */
+  eligibilityLoggedAt: bigint | null;
+  /**
+   * Wall-clock seconds the keeper last tried to prove `rewardTo`: at most one
+   * try an accounting period. This and the next two are kept on this
+   * machine's clock, not the chain's, which the endpoint answers (keeper.ts,
+   * `PROVE_SPACING_SECONDS`).
+   */
+  proveTriedAt: bigint | null;
+  /** Wall-clock seconds the keeper last sent a proof: at most one a day, whatever the endpoint says of it after. */
+  proveSentAt: bigint | null;
+  /**
+   * Wall-clock seconds the keeper learned that a proof of `rewardTo` it sent
+   * reverted on chain: no proof is sent for a day after, whatever an
+   * endpoint's test-run says. An honest proof doesn't revert twice (the
+   * keeper reads `validUntil` and the holding before each), so a second
+   * would be an endpoint that lies.
+   */
+  proveRevertedAt: bigint | null;
+  /** The last `prove_skipped` said, so a proof that can't be made is logged once until something changes. */
+  lastProveSkip: string | null;
   /** Wall-clock seconds of the last `heartbeat` record. */
   lastHeartbeatLogAt: bigint | null;
 }
 
 export function newKeeperState(input: { chainId: number; keeper: Address | null; deployments?: readonly Deployment[] }): KeeperState {
   const deployments: KeeperState["deployments"] = {};
-  for (const d of input.deployments ?? DEPLOYMENTS) {
-    deployments[d.id] = { factory: lower(d.factory), batcher: lower(d.batcher), scannedCount: 0n, vaultCount: null };
-  }
+  for (const d of input.deployments ?? DEPLOYMENTS) deployments[d.id] = deploymentEntry(d);
   return {
-    v: 1,
+    v: 2,
     chainId: input.chainId,
     keeper: input.keeper === null ? null : lower(input.keeper),
     deployments,
@@ -203,6 +287,7 @@ export function newKeeperState(input: { chainId: number; keeper: Address | null;
     feeSamples: [],
     lossLedger: [],
     spend: [],
+    spendSince: null,
     gasModel: { ratioPpm: RATIO_ONE, samples: 0 },
     nextNonce: null,
     nonceUses: {},
@@ -214,8 +299,21 @@ export function newKeeperState(input: { chainId: number; keeper: Address | null;
     lastWait: null,
     breakerOpen: false,
     lowBalance: false,
+    lowRunway: false,
+    eligibility: {},
+    lastEligibility: null,
+    eligibilityLoggedAt: null,
+    proveTriedAt: null,
+    proveSentAt: null,
+    proveRevertedAt: null,
+    lastProveSkip: null,
     lastHeartbeatLogAt: null,
   };
+}
+
+/** A release as the state keeps it: its contracts, lowercase, and nothing read from its list yet. */
+function deploymentEntry(d: Deployment): KeeperState["deployments"][string] {
+  return { factory: lower(d.factory), batcher: lower(d.batcher), registry: d.registry === null ? null : lower(d.registry), scannedCount: 0n, vaultCount: null };
 }
 
 // ─── Identity ─────────────────────────────────────────────────────────────────
@@ -234,9 +332,17 @@ export class KeeperStateError extends Error {
 /**
  * Refuse a state written for another chain, key or release list, naming the
  * field. A release list that has grown is accepted, and the new releases are
- * added: the registry only ever grows. One the state knows and the keeper
- * does not — or knows at another address — is refused, since its vaults would
- * be orphaned or, worse, trusted at the wrong factory.
+ * added: deployments.json only ever grows. One the state knows and the keeper
+ * does not — or knows at another address, its SPX holder registry included —
+ * is refused, since its vaults would be orphaned or, worse, trusted at the
+ * wrong factory, and its eligibility read from a registry its vaults never ask.
+ *
+ * The one address that may move is the batcher of a release whose source's
+ * batcher is bound to no factory: deployments.json lists such batchers apart,
+ * and a newer one serves every such release in the old one's place. The state
+ * takes it up, unless a transaction to that release's batcher is still in
+ * flight or might still land, whose receipt would then be read at the wrong
+ * address: that is refused until the keeper that sent it has settled it.
  */
 export function checkKeeperStateIdentity(
   state: KeeperState,
@@ -249,17 +355,27 @@ export function checkKeeperStateIdentity(
   if (state.keeper !== keeper) {
     throw new KeeperStateError("keeper", `the state is for keeper ${state.keeper ?? "(none)"}, not ${keeper ?? "(none)"}`);
   }
-  const byId = new Map(expected.deployments.map((d) => [d.id, d]));
+  const byId = new Map<string, Deployment>(expected.deployments.map((d) => [d.id, d]));
   for (const [id, known] of Object.entries(state.deployments)) {
     const d = byId.get(id);
     if (!d) throw new KeeperStateError(`deployments.${id}`, `the state knows release ${id}, which this keeper does not`);
-    if (lower(d.factory) !== known.factory || lower(d.batcher) !== known.batcher) {
+    const registry = d.registry === null ? null : lower(d.registry);
+    const batcherMoved = lower(d.batcher) !== known.batcher;
+    const shared = SOURCES[d.source]?.features.sharedBatcher === true;
+    if (lower(d.factory) !== known.factory || registry !== known.registry || (batcherMoved && !shared)) {
       throw new KeeperStateError(`deployments.${id}`, `the state has release ${id} at other addresses than this keeper`);
     }
+    if (batcherMoved) {
+      if (state.pending?.deployment === id || state.orphans.some((o) => o.deployment === id)) {
+        throw new KeeperStateError(
+          `deployments.${id}`,
+          `release ${id}'s batcher is now ${lower(d.batcher)}, but a transaction to ${known.batcher} is in flight; let the keeper that sent it settle it first`,
+        );
+      }
+      known.batcher = lower(d.batcher);
+    }
   }
-  for (const d of expected.deployments) {
-    state.deployments[d.id] ??= { factory: lower(d.factory), batcher: lower(d.batcher), scannedCount: 0n, vaultCount: null };
-  }
+  for (const d of expected.deployments) state.deployments[d.id] ??= deploymentEntry(d);
 }
 
 // ─── Operator overrides ───────────────────────────────────────────────────────
@@ -308,7 +424,11 @@ export function serializeKeeperState(state: KeeperState): string {
   return JSON.stringify(state, (_key, value: unknown) => (typeof value === "bigint" ? value.toString() : value), 2);
 }
 
-/** A state file's contents, checked field by field; throws `KeeperStateError` naming the first that is wrong. */
+/**
+ * A state file's contents, checked field by field; throws `KeeperStateError`
+ * naming the first that is wrong. A version-1 file is migrated first
+ * (`migrateKeeperStateV1`), then checked like any other.
+ */
 export function parseKeeperState(text: string): KeeperState {
   let json: unknown;
   try {
@@ -316,14 +436,15 @@ export function parseKeeperState(text: string): KeeperState {
   } catch {
     throw new KeeperStateError("(root)", "the state is not valid JSON");
   }
-  const o = obj(json, "(root)");
+  const raw = obj(json, "(root)");
+  const o = raw["v"] === 1 ? migrateKeeperStateV1(raw) : raw;
   const v = o["v"];
   if (v !== KEEPER_STATE_VERSION) {
     const newer = typeof v === "number" && v > KEEPER_STATE_VERSION;
     throw new KeeperStateError("v", newer ? `the state is version ${v}, newer than this keeper's ${KEEPER_STATE_VERSION}` : "the state has no version this keeper knows");
   }
   return {
-    v: 1,
+    v: 2,
     chainId: int(o["chainId"], "chainId"),
     keeper: nullable(o["keeper"], "keeper", address),
     deployments: record(o["deployments"], "deployments", (d, path) => {
@@ -331,6 +452,7 @@ export function parseKeeperState(text: string): KeeperState {
       return {
         factory: address(e["factory"], `${path}.factory`),
         batcher: address(e["batcher"], `${path}.batcher`),
+        registry: nullable(e["registry"], `${path}.registry`, address),
         scannedCount: big(e["scannedCount"], `${path}.scannedCount`),
         vaultCount: nullable(e["vaultCount"], `${path}.vaultCount`, big),
       };
@@ -373,6 +495,7 @@ export function parseKeeperState(text: string): KeeperState {
       };
     }),
     spend: list(o["spend"], "spend", pair),
+    spendSince: nullable(o["spendSince"], "spendSince", big),
     gasModel: {
       ratioPpm: big(obj(o["gasModel"], "gasModel")["ratioPpm"], "gasModel.ratioPpm"),
       samples: int(obj(o["gasModel"], "gasModel")["samples"], "gasModel.samples"),
@@ -386,7 +509,7 @@ export function parseKeeperState(text: string): KeeperState {
         batchId: str(e["batchId"], `${path}.batchId`),
         nonce: int(e["nonce"], `${path}.nonce`),
         hash: hash(e["hash"], `${path}.hash`),
-        kind: oneOf(e["kind"], `${path}.kind`, ["batch", "cancel", "unwrap", "deploy"] as const),
+        kind: oneOf(e["kind"], `${path}.kind`, ATTEMPT_KINDS),
         deployment: nullable(e["deployment"], `${path}.deployment`, str),
         vaults: list(e["vaults"], `${path}.vaults`, address),
         subsidy: list(e["subsidy"], `${path}.subsidy`, subsidy),
@@ -403,9 +526,67 @@ export function parseKeeperState(text: string): KeeperState {
     lastWait: nullable(o["lastWait"], "lastWait", str),
     breakerOpen: bool(o["breakerOpen"], "breakerOpen"),
     lowBalance: bool(o["lowBalance"], "lowBalance"),
+    lowRunway: bool(o["lowRunway"], "lowRunway"),
+    eligibility: record(o["eligibility"], "eligibility", (x, path) => {
+      const e = obj(x, path);
+      return {
+        registry: address(e["registry"], `${path}.registry`),
+        holder: address(e["holder"], `${path}.holder`),
+        eligible: nullable(e["eligible"], `${path}.eligible`, bool),
+        validUntil: nullable(e["validUntil"], `${path}.validUntil`, big),
+        spx: nullable(e["spx"], `${path}.spx`, big),
+        isAccount: nullable(e["isAccount"], `${path}.isAccount`, bool),
+        readAt: big(e["readAt"], `${path}.readAt`),
+      };
+    }),
+    lastEligibility: nullable(o["lastEligibility"], "lastEligibility", str),
+    eligibilityLoggedAt: nullable(o["eligibilityLoggedAt"], "eligibilityLoggedAt", big),
+    proveTriedAt: nullable(o["proveTriedAt"], "proveTriedAt", big),
+    proveSentAt: nullable(o["proveSentAt"], "proveSentAt", big),
+    proveRevertedAt: nullable(o["proveRevertedAt"], "proveRevertedAt", big),
+    lastProveSkip: nullable(o["lastProveSkip"], "lastProveSkip", str),
     lastHeartbeatLogAt: nullable(o["lastHeartbeatLogAt"], "lastHeartbeatLogAt", big),
   };
 }
+
+/**
+ * A version-1 state file's JSON in version 2's shape, before it is checked.
+ * Version 1 knew v1's vaults alone: none of its releases has an SPX holder
+ * registry, none of its vaults' terms has a community window, nothing was
+ * read of `rewardTo`'s eligibility and nothing was proven. So those start
+ * empty, and everything else it knew is kept exactly — its nonces, its
+ * transaction in flight, its traps — for the strict parse that follows to
+ * check as it checks any version-2 file. Version 1 did not say since when its
+ * spend was kept: its oldest entry is a moment it has certainly kept it
+ * since, so runway is never figured over time it did not see. Pure: the
+ * caller's object is not changed.
+ */
+export function migrateKeeperStateV1(raw: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...raw, v: 2 };
+  const each = (value: unknown, change: (entry: Record<string, unknown>) => Record<string, unknown>): unknown =>
+    isObject(value) ? Object.fromEntries(Object.entries(value).map(([k, entry]) => [k, isObject(entry) ? change(entry) : entry])) : value;
+  out["deployments"] = each(raw["deployments"], (d) => ({ ...d, registry: null }));
+  out["vaults"] = each(raw["vaults"], (e) => (isObject(e["terms"]) ? { ...e, terms: { ...e["terms"], communityWindow: null, turnBuckets: null } } : e));
+  if (isObject(raw["pending"])) out["pending"] = { ...raw["pending"], proveBlock: null };
+  const spentAt = Array.isArray(raw["spend"]) ? raw["spend"].flatMap((entry) => (Array.isArray(entry) && /^\d+$/.test(String(entry[0])) ? [BigInt(String(entry[0]))] : [])) : [];
+  const spendSince = spentAt.length === 0 ? null : spentAt.reduce((a, b) => (b < a ? b : a)).toString();
+  return {
+    ...out,
+    spendSince,
+    lowRunway: false,
+    eligibility: {},
+    lastEligibility: null,
+    eligibilityLoggedAt: null,
+    proveTriedAt: null,
+    proveSentAt: null,
+    proveRevertedAt: null,
+    lastProveSkip: null,
+  };
+}
+
+const isObject = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
+
+const ATTEMPT_KINDS = ["batch", "cancel", "unwrap", "deploy", "prove"] as const;
 
 function vaultEntry(value: unknown, path: string): VaultEntry {
   const e = obj(value, path);
@@ -429,7 +610,11 @@ function vaultEntry(value: unknown, path: string): VaultEntry {
       startAt: term("startAt"),
       keeperReward: term("keeperReward"),
       maxSlippageBps: term("maxSlippageBps"),
+      communityWindow: nullable(t["communityWindow"], `${path}.terms.communityWindow`, big),
+      turnBuckets: nullable(t["turnBuckets"], `${path}.terms.turnBuckets`, big),
     },
+    // A vault the state found before clones were proven is proven again before it is next sent.
+    nonce: nullable(e["nonce"], `${path}.nonce`, big),
     buysDone: big(e["buysDone"], `${path}.buysDone`),
     lastBuyAt: big(e["lastBuyAt"], `${path}.lastBuyAt`),
     closed: bool(e["closed"], `${path}.closed`),
@@ -452,11 +637,11 @@ function pendingTx(value: unknown, path: string): PendingTx {
   return {
     batchId: str(e["batchId"], `${path}.batchId`),
     nonce: int(e["nonce"], `${path}.nonce`),
-    purpose: oneOf(e["purpose"], `${path}.purpose`, ["batch", "unwrap", "deploy"] as const),
+    purpose: oneOf(e["purpose"], `${path}.purpose`, ["batch", "unwrap", "deploy", "prove"] as const),
     deployment: nullable(e["deployment"], `${path}.deployment`, str),
     vaults: list(e["vaults"], `${path}.vaults`, address),
     urgent: bool(e["urgent"], `${path}.urgent`),
-    reason: nullable(e["reason"], `${path}.reason`, (r, p) => oneOf(r, p, ["cheap", "deadline", "short-interval", "now"] as const)),
+    reason: nullable(e["reason"], `${path}.reason`, (r, p) => oneOf(r, p, ["cheap", "deadline", "short-interval", "now", "window"] as const)),
     gasLimit: n("gasLimit"),
     modelGas: n("modelGas"),
     expectedGas: n("expectedGas"),
@@ -465,6 +650,7 @@ function pendingTx(value: unknown, path: string): PendingTx {
     minRewards: n("minRewards"),
     subsidy: list(e["subsidy"], `${path}.subsidy`, subsidy),
     amountWei: nullable(e["amountWei"], `${path}.amountWei`, big),
+    proveBlock: nullable(e["proveBlock"], `${path}.proveBlock`, big),
     resends: int(e["resends"], `${path}.resends`),
     stoppedResending: bool(e["stoppedResending"], `${path}.stoppedResending`),
     receiptBlock: nullable(e["receiptBlock"], `${path}.receiptBlock`, big),
@@ -482,7 +668,7 @@ function pendingTx(value: unknown, path: string): PendingTx {
               maxPriorityFeePerGas: big(f["maxPriorityFeePerGas"], `${p}.fees.maxPriorityFeePerGas`),
             };
       return {
-        kind: oneOf(x["kind"], `${p}.kind`, ["batch", "cancel", "unwrap", "deploy"] as const),
+        kind: oneOf(x["kind"], `${p}.kind`, ATTEMPT_KINDS),
         hash: hash(x["hash"], `${p}.hash`),
         raw: hexBytes(x["raw"], `${p}.raw`),
         sentBlock: big(x["sentBlock"], `${p}.sentBlock`),

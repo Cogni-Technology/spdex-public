@@ -11,7 +11,14 @@
  * `packages/vault` proves the contracts and its own encoders; this proves the
  * app builds what they accept, reads them the way the card needs, and leaves
  * nothing but gas behind: every wei put in comes back as SPX bought, the
- * reward paid to whoever triggered, or ether at the close.
+ * buy fee paid back to the owner who triggered, or ether at the close.
+ *
+ * Both releases. The app creates v2 vaults alone, with the plan's community
+ * window, and its owner's Trigger now sends `execute(owner)`, which the window
+ * never refuses: the buy is made inside it. A v1 vault, made on v1's frozen
+ * factory (deployed on the fork from its own source, `deployReleaseCalls`),
+ * is still read, funded, triggered with v1's `execute()` and closed by the
+ * same app, through the same Engine: no move to v2 (decision 27).
  *
  * The fork's clock is never moved: the plan starts at the chain's own time,
  * so the first buy is due as soon as the vault exists, and a second is not
@@ -33,14 +40,29 @@ import {
 } from "@spdex/chain";
 import { recommendedConfig } from "@spdex/config";
 import type { Address, DcaPlan, Hex, SpdexConfig } from "@spdex/core";
-import { MAINNET_DEPLOYMENT, factoryAddress, readVaultNonce, vaultBudget } from "@spdex/vault";
+import {
+  MAINNET_DEPLOYMENT,
+  V1_MAINNET_FACTORY,
+  deployReleaseCalls,
+  factoryAddress,
+  readVaultNonce,
+  simulateFactoryDeployment,
+  v1BuyFee,
+  vaultBudget,
+  vaultsCreatedBy,
+  type RawLog,
+  type VaultRelease,
+} from "@spdex/vault";
 import { Engine } from "../../src/lib/engine.js";
+import { communityWindowLiveText } from "../../src/components/dca/vaultCopy.js";
 import { balanceOf } from "../../src/lib/erc20.js";
 import type { TxSender } from "../../src/lib/execute.js";
 import {
   closeVault,
   createVault,
+  defaultVaultWindow,
   deployVaultFactory,
+  factoryRefusalBeforeRegistry,
   fundVault,
   readChainClock,
   readVaultHistory,
@@ -92,7 +114,38 @@ function walletOf(key: Hex): TxSender {
 
 const etherOf = async (address: Address) => BigInt((await rpc("eth_getBalance", [address, "latest"])) as string);
 
-describe("a vault plan's life on the fork, through the app", () => {
+/** Send from a local key and wait for its receipt, which must succeed. */
+async function sendOk(key: Hex, to: Address, data: Hex, value = 0n): Promise<{ logs: RawLog[] }> {
+  const prepared = await prepareTransaction(rpc, { from: addressOfKey(key), to, data, value, chainId: CHAIN_ID });
+  const { raw, hash } = await signPrepared(key, prepared);
+  await rpc("eth_sendRawTransaction", [raw]);
+  for (let attempt = 0; attempt < 400; attempt++) {
+    const receipt = (await rpc("eth_getTransactionReceipt", [hash])) as { status: string; logs: RawLog[] } | null;
+    if (receipt) {
+      expect(BigInt(receipt.status)).toBe(1n);
+      return receipt;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`${hash} was not mined`);
+}
+
+/**
+ * A release's contracts on the fork, deployed the way anyone would
+ * (`deployReleaseCalls`, in the order their constructors need) where they
+ * aren't yet. Another suite may deploy one first, even between the check and
+ * the send; the code is there either way, and that is what is checked.
+ */
+async function ensureRelease(release: VaultRelease): Promise<void> {
+  for (const call of deployReleaseCalls(release)) {
+    if (((await rpc("eth_getCode", [call.address, "latest"])) as string) !== "0x") continue;
+    const deployer = await freshAccount(ETHER);
+    await sendOk(deployer.key, call.to, call.data).catch(() => undefined);
+    expect((await rpc("eth_getCode", [call.address, "latest"])) as string, `${release}'s ${call.name}`).not.toBe("0x");
+  }
+}
+
+describe("a v2 vault plan's life on the fork, through the app", () => {
   const config: SpdexConfig = {
     ...recommendedConfig(),
     chainId: CHAIN_ID,
@@ -112,10 +165,11 @@ describe("a vault plan's life on the fork, through the app", () => {
   const perBuy = () => AMOUNT + choices.keeperReward;
 
   const read = async (account: Address | null = owner.address): Promise<VaultPlanState> =>
-    readVaultPlan(rpc, { plan, chainId: CHAIN_ID, account, factory });
+    readVaultPlan(rpc, { plan, chainId: CHAIN_ID, account });
 
   beforeAll(async () => {
     expect(Number(BigInt((await rpc("eth_chainId", [])) as string))).toBe(CHAIN_ID);
+    await ensureRelease("v2");
     owner = await freshAccount(ETHER);
     stranger = await freshAccount(ETHER / 10n);
     deps = { engine, sender: walletOf(owner.key), chainId: CHAIN_ID };
@@ -129,13 +183,36 @@ describe("a vault plan's life on the fork, through the app", () => {
     await expect(deployVaultFactory({ rpc, sender: walletOf(stranger.key), chainId: CHAIN_ID })).rejects.toThrow(/already deployed/);
   });
 
-  it("creates the plan's vault with one buy's budget, in chain time, where the Guard predicted", async () => {
+  /**
+   * Where neither the registry nor the factory is deployed, the factory's
+   * market checks are test-run as if the registry were there (a state
+   * override), so a refused market is found before the registry is paid for.
+   * Read-only: eth_calls against the fork, nothing sent.
+   */
+  it("test-runs a factory's markets as if its registry were already there, before anything is paid for", async () => {
+    const nowhere = addressOfKey(generateSpendingKey());
+    expect(await rpc("eth_getCode", [nowhere, "latest"])).toBe("0x");
+    const market = MAINNET_DEPLOYMENT.markets[0]!;
+    const broken = { ...MAINNET_DEPLOYMENT, registry: nowhere, markets: [{ ...market, pair: nowhere }] };
+    // As it is, the constructor stops at the missing registry, and says nothing of the market.
+    expect(await simulateFactoryDeployment(rpc, broken)).toMatchObject({ deployable: false, error: { name: "NotARegistry" } });
+    // As if the registry were there, it reaches the market and refuses it.
+    expect(await factoryRefusalBeforeRegistry(rpc, broken, nowhere)).toBe("market 0's pair is not the one Uniswap v2 lists on this chain");
+    // The real market passes.
+    expect(await factoryRefusalBeforeRegistry(rpc, { ...MAINNET_DEPLOYMENT, registry: nowhere }, nowhere)).toBeNull();
+  });
+
+  it("creates the plan's vault with one buy's budget and its community window, in chain time, where the Guard predicted", async () => {
     // Chain time, not the wall clock: the fork lags it by days, and a start in
     // wall-clock time would put the first buy there.
     const clock = await readChainClock(rpc);
     const costs = vaultCosts({ amountPerBuy: AMOUNT, maxBuys: 3, fees: await readFees(rpc) });
     expect(costs).not.toBeNull();
-    choices = { maxSlippageBps: 300, keeperReward: costs!.fee.reward };
+    // An hourly plan's default window: a quarter of the interval, 15 minutes,
+    // long enough that the owner's buy below is surely made inside it.
+    const communityWindow = defaultVaultWindow(3_600)!;
+    expect(communityWindow).toBe(900);
+    choices = { maxSlippageBps: 300, keeperReward: costs!.fee.reward, communityWindow };
     plan = {
       id: "dca-vault-fork",
       paused: true,
@@ -143,7 +220,7 @@ describe("a vault plan's life on the fork, through the app", () => {
       sell: NATIVE_TOKEN,
       buy: SPX,
       amountPerBuy: AMOUNT.toString(),
-      intervalSeconds: 300,
+      intervalSeconds: 3_600,
       maxBuys: 3,
       startAt: clock.seconds,
       signer: "vault",
@@ -164,11 +241,17 @@ describe("a vault plan's life on the fork, through the app", () => {
     plan = { ...plan, vault };
     const settled = await settleCreation(rpc, {
       plan,
-      creation: { owner: owner.address, vault, nonce: nonce.toString(), hash: creationHash, at: Date.now() },
-      factory,
+      creation: { owner: owner.address, vault, factory, nonce: nonce.toString(), hash: creationHash, at: Date.now() },
       nowMs: Date.now(),
     });
     expect(settled).toEqual({ kind: "created", vault });
+    // One recorded before releases were told apart, without its factory, settles too.
+    const older = await settleCreation(rpc, {
+      plan,
+      creation: { owner: owner.address, vault, nonce: nonce.toString(), hash: creationHash, at: Date.now() },
+      nowMs: Date.now(),
+    });
+    expect(older).toEqual({ kind: "created", vault });
   });
 
   it("reads the new vault as its card needs it: the owner's, one buy funded, due now", async () => {
@@ -189,18 +272,34 @@ describe("a vault plan's life on the fork, through the app", () => {
       fundingRoom: 2n * perBuy(),
       mismatches: [],
       fromFactory: true,
+      release: "v2",
+      factory,
+      communityWindow: 900,
+      windowBuys: 0,
     });
-    expect(state.terms).toMatchObject({ amountPerBuy: AMOUNT, startAt: BigInt(plan.startAt), keeperReward: choices.keeperReward });
+    expect(state.terms).toMatchObject({
+      amountPerBuy: AMOUNT,
+      startAt: BigInt(plan.startAt),
+      keeperReward: choices.keeperReward,
+      communityWindow: 900n,
+    });
+    // Due since its start, the window running fifteen minutes from there.
+    expect(state.dueSince).toBe(plan.startAt);
+    expect(state.windowEndsAt).toBe(plan.startAt + 900);
     expect(state.canTrigger).toBe(true);
     expect(state.clock).not.toBeNull();
     expect(vaultCardStatus(state, state.clock!.seconds)).toMatchObject({ vault: "due", pillLabel: "Buy due" });
+    // The card's line while the buy is inside its window.
+    expect(communityWindowLiveText(state, state.clock!.seconds, Date.now())).toMatch(/^Community window until \d\d:\d\d, then open to anyone\.$/);
     // A stranger's view of the same vault is read-only.
     expect((await read(stranger.address)).kind).toBe("someone-else");
   });
 
-  it("makes the due buy from the owner's wallet: SPX at the owner at or above the floor, the reward back to them", async () => {
+  it("makes the due buy from the owner's wallet inside its window: SPX at the owner at or above the floor, the buy fee back to them", async () => {
     const before = await read();
     if (before.kind !== "active" || before.quote === null) throw new Error("the vault could not be read");
+    // Trigger now inside the community window: execute(owner), which the window never refuses.
+    expect(before.clock!.seconds).toBeLessThan(before.windowEndsAt!);
     const spxBefore = await balanceOf(rpc, SPX, owner.address);
     const wethBefore = await balanceOf(rpc, WETH, owner.address);
     const bought = await triggerVault(deps, { plan });
@@ -212,17 +311,36 @@ describe("a vault plan's life on the fork, through the app", () => {
 
     const after = await read();
     expect(after).toMatchObject({ kind: "active", buysDone: 1, spent: AMOUNT, received: bought.received, rewardsPaid: choices.keeperReward, balance: 0n, funded: false });
+    // Paid back to its owner: no community keeper's buy, so the window count stays where it was.
+    expect(after).toMatchObject({ windowBuys: 0 });
     // Not due again: the app refuses before asking the wallet anything.
     await expect(triggerVault(deps, { plan })).rejects.toThrow(/won't buy right now/);
   });
 
-  it("finds the buy in the vault's logs, and nothing missing", async () => {
-    const history = await readVaultHistory(rpc, { vault, buysDone: 1, startAt: plan.startAt, chainId: CHAIN_ID });
+  it("finds the buy in the vault's logs, says its owner made it, and misses nothing", async () => {
+    const history = await readVaultHistory(rpc, {
+      vault,
+      buysDone: 1,
+      startAt: plan.startAt,
+      chainId: CHAIN_ID,
+      owner: owner.address,
+      communityWindow: 900n,
+    });
     expect(history.missingBuys).toBe(0);
     expect(history.note).toBeNull();
     const buys = history.entries.filter((entry) => entry.kind === "bought");
     expect(buys).toHaveLength(1);
-    expect(buys[0]).toMatchObject({ amountIn: AMOUNT, keeper: owner.address, reward: choices.keeperReward });
+    const owned = owner.address.toLowerCase();
+    expect(buys[0]).toMatchObject({
+      amountIn: AMOUNT,
+      keeper: owned,
+      reward: choices.keeperReward,
+      source: "v2",
+      rewardTo: owned,
+      dueSince: plan.startAt,
+      communityWindow: 900,
+      maker: "owner",
+    });
     expect(buys[0]!.at).not.toBeNull();
   });
 
@@ -248,7 +366,106 @@ describe("a vault plan's life on the fork, through the app", () => {
     const state = await read();
     expect(state).toMatchObject({ kind: "active", closed: true, balance: 0n, fundingRoom: 0n, canTrigger: false });
     expect(vaultCardStatus(state, null)).toMatchObject({ vault: "closed", pill: "done" });
-    // Every wei the budget came to is accounted for: one buy, its reward, the rest back.
+    // Every wei the budget came to is accounted for: one buy, its buy fee, the rest back.
     expect(vaultBudget(vaultPlanOf(plan, choices))).toBe(3n * perBuy());
+  });
+});
+
+/**
+ * A v1 vault, made on v1's frozen factory before the app moved to v2, is the
+ * app's to show, fund, trigger and close as it always was: read from the
+ * factory that vouches for it, claimed as v1, its buy v1's `execute()`,
+ * which pays whoever sends it — the owner, here.
+ */
+describe("a v1 vault plan on the fork, through the app that creates v2", () => {
+  const config: SpdexConfig = {
+    ...recommendedConfig(),
+    chainId: CHAIN_ID,
+    rpc: { url: FORK_URL, source: "user" },
+    guard: { ...recommendedConfig().guard, requireSimulation: true },
+  };
+  const engine = new Engine(config);
+  const keeperReward = v1BuyFee(AMOUNT).reward;
+  const perBuy = AMOUNT + keeperReward;
+
+  let owner: { key: Hex; address: Address };
+  let deps: VaultOpDeps;
+  let plan: DcaPlan;
+
+  const read = async (): Promise<VaultPlanState> => readVaultPlan(rpc, { plan, chainId: CHAIN_ID, account: owner.address });
+
+  beforeAll(async () => {
+    expect(Number(BigInt((await rpc("eth_chainId", [])) as string))).toBe(CHAIN_ID);
+    await ensureRelease("v1");
+    owner = await freshAccount(ETHER);
+    deps = { engine, sender: walletOf(owner.key), chainId: CHAIN_ID };
+    const clock = await readChainClock(rpc);
+    // v1's `createVault(uint256 × 7)`, hand-encoded: the app has no way to
+    // make one, and shouldn't. The factory's own `VaultCreated`, read as v1's,
+    // is what pins it. Funded for one buy.
+    const word = (v: bigint) => v.toString(16).padStart(64, "0");
+    const create = `0x3f8f7b79${[0n, AMOUNT, 3_600n, 3n, BigInt(clock.seconds), keeperReward, 300n].map(word).join("")}` as Hex;
+    const receipt = await sendOk(owner.key, V1_MAINNET_FACTORY, create, perBuy);
+    const [created] = vaultsCreatedBy(V1_MAINNET_FACTORY, receipt.logs);
+    expect(created).toMatchObject({ source: "v1", owner: owner.address.toLowerCase(), terms: { communityWindow: null, turnBuckets: null } });
+    plan = {
+      id: "dca-vault-fork-v1",
+      paused: true,
+      chainId: CHAIN_ID,
+      sell: NATIVE_TOKEN,
+      buy: SPX,
+      amountPerBuy: AMOUNT.toString(),
+      intervalSeconds: 3_600,
+      maxBuys: 3,
+      startAt: clock.seconds,
+      signer: "vault",
+      vault: created!.vault,
+    };
+  });
+
+  it("shows it as v1's: vouched for by v1's factory, no community window, due now", async () => {
+    const state = await read();
+    expect(state).toMatchObject({
+      kind: "active",
+      mine: true,
+      release: "v1",
+      factory: V1_MAINNET_FACTORY,
+      fromFactory: true,
+      communityWindow: null,
+      dueSince: null,
+      windowEndsAt: null,
+      windowBuys: null,
+      balance: perBuy,
+      mismatches: [],
+      canTrigger: true,
+    });
+    if (state.kind !== "active") return;
+    // Its card is unchanged: no window line.
+    expect(communityWindowLiveText(state, state.clock!.seconds, Date.now())).toBeNull();
+  });
+
+  it("triggers its due buy with v1's execute(), the buy fee to the owner who sent it", async () => {
+    const wethBefore = await balanceOf(rpc, WETH, owner.address);
+    const bought = await triggerVault(deps, { plan });
+    expect(bought.reward).toBe(keeperReward);
+    expect((await balanceOf(rpc, WETH, owner.address)) - wethBefore).toBe(keeperReward);
+    expect(await read()).toMatchObject({ kind: "active", buysDone: 1, balance: 0n, funded: false });
+    const history = await readVaultHistory(rpc, {
+      vault: plan.vault!,
+      buysDone: 1,
+      startAt: plan.startAt,
+      chainId: CHAIN_ID,
+      owner: owner.address,
+      communityWindow: null,
+    });
+    expect(history.entries.find((entry) => entry.kind === "bought")).toMatchObject({ source: "v1", dueSince: null, maker: "owner" });
+  });
+
+  it("funds what its remaining buys need, then closes it, everything back to the owner", async () => {
+    const funded = await fundVault(deps, { plan });
+    expect(funded.amount).toBe(2n * perBuy);
+    const closed = await closeVault(deps, { plan });
+    expect(closed.returned).toBe(2n * perBuy);
+    expect(await read()).toMatchObject({ kind: "active", release: "v1", closed: true, balance: 0n });
   });
 });

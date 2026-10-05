@@ -9,9 +9,14 @@
  * vault is closed straight after the first, which returns the second buy's
  * ether and fee. The buy fee is the app's own default for that size, so it
  * may sit at the 0.69% ceiling: that is the case a small saver meets.
+ *
+ * A v2 vault: its community window is the app's default for a daily plan (30
+ * minutes), and Trigger now names the owner as `rewardTo`, which a vault
+ * accepts inside its window, so the fee comes straight back and the buy is
+ * not counted as a community keeper's (`windowBuys` stays 0).
  */
 
-import { encodeClose, encodeExecute, vaultBudget } from "../packages/vault/src/index.js";
+import { CURRENT_SOURCE, DEFAULT_TURN_BUCKETS, defaultCommunityWindow, encodeClose, encodeExecute, vaultBudget } from "../packages/vault/src/index.js";
 import { expect, openTile, seedConfig, sentTransactions, test } from "../e2e/fixtures.js";
 import { fillVaultForm, history, planCard } from "../e2e/vaults.js";
 import { FACTORY, SPX, WETH, ethBalance, feeOf, minedReceipt, settings, tokenBalance } from "./chain.js";
@@ -55,7 +60,15 @@ test("creates and funds a vault in one confirmation, triggers its first buy, and
   expect(created.owner).toBe(owner.address);
   await expect(card.getByTestId("dca-vault-address")).toHaveText(vault);
   const { terms } = created;
-  expect(terms).toMatchObject({ tokenOut: SPX, amountPerBuy: settings.buyWei, interval: 86_400n, maxBuys: BigInt(BUYS) });
+  expect(terms).toMatchObject({
+    tokenOut: SPX,
+    amountPerBuy: settings.buyWei,
+    interval: 86_400n,
+    maxBuys: BigInt(BUYS),
+    communityWindow: defaultCommunityWindow(86_400n),
+    // The app creates every vault without turns until decision 29 calls for them.
+    turnBuckets: DEFAULT_TURN_BUCKETS,
+  });
   const budget = vaultBudget(terms);
   expect(created.funded).toBe(budget);
   expect(await tokenBalance(WETH, vault)).toBe(budget);
@@ -73,11 +86,18 @@ test("creates and funds a vault in one confirmation, triggers its first buy, and
 
   const asked = await sentTransactions(page);
   expect(asked.at(-1)!.to?.toLowerCase()).toBe(vault);
-  expect(asked.at(-1)!.data?.toLowerCase()).toBe(encodeExecute());
+  expect(asked.at(-1)!.data?.toLowerCase()).toBe(encodeExecute(owner.address));
   expect(wallet.hashes).toHaveLength(2);
   const triggered = await minedReceipt(wallet.hashes[1]!, MINED_WITHIN_MS());
   const bought = eventIn(triggered, vault, "Bought");
-  expect(bought).toMatchObject({ keeper: owner.address, amountIn: settings.buyWei, reward: terms.keeperReward, buyNumber: 1n });
+  expect(bought).toMatchObject({
+    source: CURRENT_SOURCE,
+    keeper: owner.address,
+    rewardTo: owner.address,
+    amountIn: settings.buyWei,
+    reward: terms.keeperReward,
+    buyNumber: 1n,
+  });
   expect(bought.amountOut).toBeGreaterThanOrEqual(bought.floorOut);
   expect((await tokenBalance(SPX, owner.address)) - spx0).toBe(bought.amountOut);
   expect((await tokenBalance(WETH, owner.address)) - weth0).toBe(terms.keeperReward);
@@ -103,5 +123,6 @@ test("creates and funds a vault in one confirmation, triggers its first buy, and
   expect(eventIn(closing, vault, "Closed").amount).toBe(held);
   expect((await ethBalance(owner.address)) - ether1).toBe(held - feeOf(closing));
   expect(await tokenBalance(WETH, vault)).toBe(0n);
-  expect(await vaultOnChain(vault)).toMatchObject({ closed: true, buysDone: 1n });
+  // The owner's own buy is never a community keeper's.
+  expect(await vaultOnChain(vault)).toMatchObject({ release: "v2", closed: true, buysDone: 1n, windowBuys: 0n });
 });

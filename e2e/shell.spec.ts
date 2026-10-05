@@ -116,6 +116,27 @@ async function tradeWords(page: Page): Promise<string[]> {
   return found;
 }
 
+/**
+ * Words that would sell community keeping, or anything else here, as an
+ * investment: a rate of return (APR, APY), a yield, a "reward", a projection
+ * or an "earn up to" (decision 23 of docs/V2_UPGRADE.md). Keeping is paid
+ * work, a buy fee earned for each buy made, and said as such; past fees are
+ * stated only after the fact. Capitals only for the two abbreviations, so a
+ * date's "Apr" is no match.
+ */
+const INCOME_WORDS = /\bAP[RY]\b|\byield(?:s|ed|ing)?\b|\brewards?\b|\bprojected\b|\bearn up to\b/g;
+
+async function incomeWords(page: Page): Promise<string[]> {
+  const text = await everyWord(page);
+  const found: string[] = [];
+  for (const match of text.matchAll(new RegExp(INCOME_WORDS.source, "gi"))) {
+    // The abbreviations only in capitals: "apr" inside a date is a month.
+    if (/^ap[ry]$/i.test(match[0]) && match[0] !== match[0].toUpperCase()) continue;
+    found.push(text.slice(Math.max(0, match.index - 40), match.index + 40).replace(/\s+/g, " "));
+  }
+  return found;
+}
+
 test.describe("the tiles", () => {
   test("Buy SPX is open on load once Welcome is hidden; one opens at a time; arrows, Home, End and Esc move and close", async ({
     page,
@@ -244,7 +265,7 @@ test.describe("the tiles", () => {
     await expect(back).toHaveCount(0);
   });
 
-  test("no word on the page calls spDEX a trading tool, or anything official or a commandment, in either view, with the disclaimer, Features and a wallet", async ({
+  test("no word on the page calls spDEX a trading tool, or anything official or a commandment, or sells it as a yield, in either view, with the disclaimer, Features and a wallet", async ({
     page,
     account,
   }) => {
@@ -255,6 +276,7 @@ test.describe("the tiles", () => {
     await expect(page.getByTestId("disclaimer")).toBeVisible();
     expect(await tradeWords(page)).toEqual([]);
     expect(await standingWords(page)).toEqual([]);
+    expect(await incomeWords(page)).toEqual([]);
     // It takes input once it has been up for a moment.
     await page.waitForTimeout(450);
     await page.getByTestId("disclaimer-continue").click();
@@ -268,19 +290,26 @@ test.describe("the tiles", () => {
     await page.getByTestId("dca-form-signer-vault").click();
     // Every tile opened once, so each has read what it shows.
     for (const id of ["start", "yours", "markets", "community", "settings"]) await openTile(page, id);
+    // And Community keeping, at the foot of Help run, which draws nothing until opened.
+    await openTile(page, "community");
+    await page.getByTestId("keeper-panel-summary").click();
+    await expect(page.getByTestId("keeper-standing")).toBeVisible({ timeout: 60_000 });
     expect(await tradeWords(page)).toEqual([]);
     expect(await standingWords(page)).toEqual([]);
+    expect(await incomeWords(page)).toEqual([]);
 
     await openTile(page, "settings");
     await page.getByTestId("mode-toggle-expert").click();
     for (const id of ["trade", "markets", "settings"]) await openTile(page, id);
     expect(await tradeWords(page)).toEqual([]);
     expect(await standingWords(page)).toEqual([]);
+    expect(await incomeWords(page)).toEqual([]);
 
     await page.getByTestId("open-features").click();
     await expect(page.getByTestId("features-modal")).toBeVisible();
     expect(await tradeWords(page)).toEqual([]);
     expect(await standingWords(page)).toEqual([]);
+    expect(await incomeWords(page)).toEqual([]);
   });
 
   test("on a phone, every button, link, summary and select is a 44px target", async ({ browser, account }) => {

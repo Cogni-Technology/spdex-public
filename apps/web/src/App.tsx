@@ -107,7 +107,7 @@ import {
   type TileSummary,
 } from "./lib/tiles.js";
 import { DISCLAIMER_PREF, DISCLAIMER_VERSION, disclaimerSeen } from "./lib/disclaimer.js";
-import { onBuyDueClick } from "./lib/reminders/notify.js";
+import { onBuyDueClick, onProofLapseClick } from "./lib/reminders/notify.js";
 import { BuiltInServiceNotice, FirstRun } from "./components/FirstRun.js";
 import { OneTimeSwap, SLOW_SEND_MS, TradeCard, type BuyMode, type PendingSend } from "./components/Swap.js";
 import { OlderSavePrompt, StagedConfigPrompt } from "./components/ConfigIo.js";
@@ -135,6 +135,7 @@ import { CULTURE_AMOUNT_PRESETS_USD_CENTS } from "./lib/culture/presets.js";
 import { YourStack, useStackInputs } from "./components/culture/YourStack.js";
 import { IBoughtCard } from "./components/culture/IBoughtCard.js";
 import { ReceiptView, useReceiptLink } from "./components/culture/ReceiptView.js";
+import { VAULT_FACTORIES } from "./lib/culture/receipt.js";
 import { AfterSwap, statusAfterSwap, useAfterSwap } from "./components/records/AfterSwap.js";
 import { YourActivity } from "./components/records/YourActivity.js";
 import { CollectiveDca, useCollectiveBuys } from "./components/network/CollectiveDca.js";
@@ -929,6 +930,19 @@ export function App() {
       onBuyDueClick(() => {
         void reveal("dca-due", { block: "center" }).then((found) => {
           if (!found) void reveal("dca-panel", { block: "start" });
+        });
+      }),
+    [reveal],
+  );
+
+  // A click on a "proof lapses soon" reminder: Community keeping, unfolded,
+  // at the foot of Help run the network; or Help run itself, when it hasn't
+  // been opened yet and so hasn't drawn the fold.
+  useEffect(
+    () =>
+      onProofLapseClick(() => {
+        void reveal("keeper-panel", { block: "center" }).then((found) => {
+          if (!found) void reveal("help-run-panel", { block: "start" });
         });
       }),
     [reveal],
@@ -2085,7 +2099,7 @@ export function App() {
                         rpc={rpc}
                         configChainId={config.chainId}
                         finder={engine}
-                        factory={vaultDeployment(config.chainId) === null ? null : engine.vaultFactory}
+                        factories={vaultDeployment(config.chainId) === null ? [] : VAULT_FACTORIES}
                         onClose={receipt.close}
                         {...inTile("receipt", reporters.receipt)}
                       />

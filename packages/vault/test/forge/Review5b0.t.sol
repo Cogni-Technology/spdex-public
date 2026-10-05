@@ -129,7 +129,8 @@ contract Review5b0Test is ForkTest {
         uint256 buys,
         int256 startOffset,
         uint256 rewardBps,
-        uint256 slippage
+        uint256 slippage,
+        uint256 window
     ) public {
         Plan memory p;
         p.marketIndex = 0;
@@ -140,6 +141,9 @@ contract Review5b0Test is ForkTest {
         p.interval = 300 + interval % (366 days - 300 + 1);
         p.startAt = uint256(int256(block.timestamp) + (startOffset % int256(366 days)));
         p.maxSlippageBps = 1 + slippage % 500;
+        // A minute to the lesser of an hour and a quarter of the interval.
+        uint256 longest = p.interval / 4 < 1 hours ? p.interval / 4 : 1 hours;
+        p.communityWindow = 60 + window % (longest - 60 + 1);
 
         // Four owners, reused: each new address is an upstream fetch on the fork, and an
         // owner's nonce moving between runs exercises the salt as well.
@@ -147,12 +151,9 @@ contract Review5b0Test is ForkTest {
             string.concat("r5b.owner.", seedOwner % 2 == 0 ? "even" : "odd", seedOwner % 4 < 2 ? ".low" : ".high")
         );
         uint256 nonce = factory.nonces(who);
-        address predicted = factory.predictVault(
-            who, nonce, 0, p.amountPerBuy, p.interval, p.maxBuys, p.startAt, p.keeperReward, p.maxSlippageBps
-        );
-        vm.prank(who);
-        address vault =
-            factory.createVault(0, p.amountPerBuy, p.interval, p.maxBuys, p.startAt, p.keeperReward, p.maxSlippageBps);
+        p.marketIndex = 0;
+        address predicted = predictOn(factory, who, nonce, p);
+        address vault = createAs(factory, who, p);
         assertEq(vault, predicted, "where predictVault said");
         assertTrue(factory.isVault(vault), "vouched for");
         bytes memory args = VaultArgs.encode(
@@ -166,7 +167,9 @@ contract Review5b0Test is ForkTest {
                 p.startAt,
                 p.interval,
                 p.maxBuys,
-                p.maxSlippageBps
+                p.maxSlippageBps,
+                p.communityWindow,
+                p.turnBuckets
             )
         );
         assertEq(
@@ -182,6 +185,7 @@ contract Review5b0Test is ForkTest {
         assertEq(v.buysDone(), 0, "storage starts empty");
         assertEq(v.lastBuyAt(), 0, "storage starts empty");
         assertEq(v.totalOut(), 0, "storage starts empty");
+        assertEq(v.windowBuys(), 0, "storage starts empty");
         assertTrue(!v.closed(), "storage starts empty");
     }
 
@@ -207,7 +211,7 @@ contract Review5b0Test is ForkTest {
         assertTrue(!factory.isVault(forged), "the real factory does not vouch for it");
         assertEq(SpdexDcaVault(payable(forged)).terms().tokenOut, USDC, "a clone on an unlisted market");
         bytes32 created = keccak256(
-            "VaultCreated(address,address,uint256,(address,address,address,uint256,uint256,uint256,uint256,uint256,uint256),uint256)"
+            "VaultCreated(address,address,uint256,(address,address,address,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256),uint256)"
         );
         bool sawForgedLog;
         for (uint256 i; i < logs.length; i++) {
@@ -240,7 +244,9 @@ contract Review5b0Test is ForkTest {
             p.maxBuys,
             p.startAt,
             p.keeperReward,
-            p.maxSlippageBps
+            p.maxSlippageBps,
+            p.communityWindow,
+            p.turnBuckets
         );
         vm.deal(stranger, 2 ether);
         vm.startPrank(stranger);
@@ -253,7 +259,7 @@ contract Review5b0Test is ForkTest {
         SpdexDcaVault vault = create(p);
         assertEq(address(vault), predicted, "created anyway, where predicted");
         assertEq(vault.buysDone(), 0, "storage starts empty");
-        (,,, uint256 held, bool funded) = vault.status();
+        (,,, uint256 held, bool funded,,,,) = vault.status();
         assertGt(held, factory.MAX_FUNDING(), "holds more than the cap");
         assertTrue(funded, "funded before the owner paid anything");
 
@@ -316,7 +322,7 @@ contract Review5b0Test is ForkTest {
         deployFactory(spxMarkets());
 
         vm.prank(keeper);
-        vault.execute();
+        vault.execute(keeper);
         assertEq(vault.buysDone(), 1, "the buy did not wait for the markets to agree");
     }
 
@@ -332,7 +338,7 @@ contract Review5b0Test is ForkTest {
         (PlainToken token, address pair, address pool) = builtMarket();
         SpdexVaultFactory f = deployFactory(oneMarket(address(token), pair, pool));
         SpdexDcaVault vault = createFundedOn(f, defaultPlan());
-        (bool due,,,,) = vault.status();
+        (bool due,,,,,,,,) = vault.status();
         assertTrue(due, "due while the pool is deep");
 
         IV3PoolLiquidity(pool).burn(FULL_LOWER, FULL_UPPER, 50 ether);
@@ -341,14 +347,14 @@ contract Review5b0Test is ForkTest {
 
         uint256 nextBuyAt;
         bool funded;
-        (due, nextBuyAt,,, funded) = vault.status();
+        (due, nextBuyAt,,, funded,,,,) = vault.status();
         assertTrue(!due, "status() is not due once the depth is gone");
         assertTrue(funded && nextBuyAt <= block.timestamp, "though the clock and the budget say it could be");
         (,, uint256 depth) = vault.quote();
         assertLt(depth, factory.MIN_ORACLE_DEPTH(), "quote() says why");
         vm.prank(keeper);
         vm.expectPartialRevert(SpdexDcaVault.OracleTooThin.selector);
-        vault.execute();
+        vault.execute(keeper);
     }
 
     /// A pool that cannot answer a ten-minute average at all ("OLD") makes the buy not due,
@@ -375,14 +381,14 @@ contract Review5b0Test is ForkTest {
         SpdexDcaVault vault = handMadeFunded(address(token), pair, pool, p);
         vm.expectRevert(bytes("OLD"));
         vault.quote();
-        (bool due, uint256 nextBuyAt,,, bool funded) = vault.status();
+        (bool due, uint256 nextBuyAt,,, bool funded,,,,) = vault.status();
         assertTrue(!due, "not due, and status() did not revert");
         assertTrue(funded && nextBuyAt <= block.timestamp, "though the clock and the budget say it could be");
 
         // Ten minutes of history later, the same pool answers and the buy is due.
         vm.warp(block.timestamp + 301);
         vm.roll(block.number + 25);
-        (due,,,,) = vault.status();
+        (due,,,,,,,,) = vault.status();
         assertTrue(due, "due once the pool can answer");
     }
 

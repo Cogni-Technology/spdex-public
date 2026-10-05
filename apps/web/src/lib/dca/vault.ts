@@ -43,39 +43,57 @@ import { NATIVE_TOKEN, isNativeToken, type JsonRpc, type PreparedFees } from "@s
 import { DcaPolicySchema, type Address, type DcaPlan, type GuardVerdict, type GuardViolation, type Hex, type SpdexConfig } from "@spdex/core";
 import { findVaultNonce, vaultTermsMismatches, type VaultClaim, type VaultTermsMismatch, type VaultTxPlan } from "@spdex/guard";
 import {
-  DEPLOYMENTS,
+  COMMUNITY_WINDOW_PRESETS,
+  DEFAULT_TURN_BUCKETS,
   DETERMINISTIC_DEPLOYER,
   KEEPER_MIN_EXECUTE_GAS_LIMIT,
   MAINNET_DEPLOYMENT,
   buyFee,
+  buyMaker,
   decodeVaultError,
   decodeVaultEvent,
+  defaultCommunityWindow,
   deployFactoryCall,
+  deployRegistryCall,
   encodeClose,
   encodeCreateVault,
-  encodeExecute,
   encodeFund,
+  encodeTrigger,
   factoryAddress,
+  factoryOfRelease,
+  featuresOf,
   findVaultsByOwner,
   fundingRoom,
+  maxCommunityWindow,
   predictVault,
   readVault,
+  isListedBatcher,
   readVaultNonce,
+  releaseOfFactory,
+  releaseOfTerms,
   simulateFactoryDeployment,
+  SOURCES,
+  sourceOfRelease,
+  sourceOfTerms,
   termsProblems,
+  VAULT_EVENT_TOPICS,
   VAULT_LIMITS,
   VAULT_LOGS_FROM_BLOCK,
   vaultAvailability,
   vaultBudget,
   vaultsCreatedBy,
+  vaultTopicsOf,
   whyNotNow,
   type BuyFee,
+  type BuyMaker,
   type FactoryDeployment,
   type OwnerVaults,
   type RawLog,
   type VaultAvailability,
   type VaultPlan,
+  type VaultRelease,
   type VaultState,
+  type SourceId,
   type VaultTerms,
 } from "@spdex/vault";
 import type { Engine } from "../engine.js";
@@ -83,6 +101,7 @@ import type { TxSender } from "../execute.js";
 import { networkLabel } from "../networks.js";
 import { confirmTransaction } from "../wallet.js";
 import { averagePriceOf, amountText, ethText, formatSignificant, PRICE_DECIMALS, shortAddress, tokenFor } from "./format.js";
+import { listedFactories } from "./factoryListSearch.js";
 import type { StorageLike } from "./ledger.js";
 import { cardTitle, compactDuration, dateTime, weekdayClock, type CardStatus } from "./view.js";
 import { bpsPercentText, formatCount, formatNumber } from "../money/format.js";
@@ -100,9 +119,23 @@ import { formatAmount } from "../tokens.js";
  */
 export const VAULT_CHAINS: ReadonlySet<number> = new Set([1, 690069]);
 
-/** The factory deployment vaults use on `chainId`, or null where none is offered. */
+/**
+ * The factory deployment new vaults are created with on `chainId` — the
+ * latest release's, v2 — or null where none is offered.
+ */
 export function vaultDeployment(chainId: number): FactoryDeployment | null {
   return VAULT_CHAINS.has(chainId) ? MAINNET_DEPLOYMENT : null;
+}
+
+/**
+ * Every release's factory on `chainId`, newest first, or null where vaults
+ * aren't offered: what a vault is read, proved, funded, closed and searched
+ * for against. New vaults are created on the newest alone (`vaultDeployment`),
+ * and a v1 vault holds and buys for good, so the app lists, funds and closes
+ * vaults from every listed factory (docs/V2_UPGRADE.md, decision 27).
+ */
+export function vaultFactories(chainId: number): Address[] | null {
+  return VAULT_CHAINS.has(chainId) ? listedFactories() : null;
 }
 
 /** The one market every vault buys on: WETH → SPX, index 0 in the factory's list. */
@@ -170,11 +203,41 @@ export function chainNow(clock: ChainClock, nowMs: number): number {
  *
  * The form works in this device's time — "now", or a moment the person
  * picked — and the vault in the chain's. What carries over is how far ahead
- * the first buy was asked for; anything not ahead is now.
+ * the first buy was asked for; anything not ahead is now, held back by
+ * `vaultStartLead` so that the first buy keeps a community window too.
  */
-export function vaultStartAt(requestedSeconds: number, deviceNowSeconds: number, chainNowSeconds: number): number {
-  const ahead = requestedSeconds - deviceNowSeconds;
-  return ahead > 0 ? chainNowSeconds + ahead : chainNowSeconds;
+export function vaultStartAt(
+  requestedSeconds: number,
+  deviceNowSeconds: number,
+  chainNowSeconds: number,
+  communityWindowSeconds: number,
+): number {
+  const ahead = Math.max(0, requestedSeconds - deviceNowSeconds);
+  return chainNowSeconds + Math.max(ahead, vaultStartLead(communityWindowSeconds));
+}
+
+/**
+ * How long a creation may take to be signed and land: a wallet's
+ * confirmation and a private relay's inclusion, typically (the contracts
+ * review's finding 4).
+ */
+export const VAULT_CREATION_SECONDS = 120;
+
+/**
+ * How far after the chain's now a vault's first buy must fall due, seconds,
+ * so that its community window outlasts a creation that takes
+ * `VAULT_CREATION_SECONDS` by the shortest window the factory allows (60 s).
+ *
+ * The window is measured from when a buy falls due, and a first buy "now"
+ * falls due at `startAt`: a 75-second window would otherwise end before a
+ * slow creation lands, and the first buy would be open to anyone from the
+ * creation's block. 0 for a window of three minutes or more — the default
+ * from a 12-minute interval up, daily plans' included — whose first buy is
+ * still due at creation.
+ */
+export function vaultStartLead(communityWindowSeconds: number): number {
+  const needed = VAULT_CREATION_SECONDS + Number(VAULT_LIMITS.MIN_COMMUNITY_WINDOW);
+  return Math.max(0, needed - communityWindowSeconds);
 }
 
 // ── The terms a vault is created with ─────────────────────────────────────
@@ -201,11 +264,17 @@ export const DEFAULT_VAULT_SLIPPAGE_BPS = 200;
 export interface VaultChoices {
   /** Basis points; one of `VAULT_SLIPPAGE_CHOICES` from the form. */
   maxSlippageBps: number;
-  /** Wei of WETH paid to whoever triggers each buy. */
+  /** Wei of WETH paid for each buy: to the keeper that makes it, or back to the owner. */
   keeperReward: bigint;
+  /**
+   * Seconds after each buy falls due during which its fee can be paid only to
+   * an SPX holder (or back to the owner): the community window. The plan's
+   * default (`defaultVaultWindow`) unless Expert chose another.
+   */
+  communityWindow: number;
 }
 
-/** The terms `createVault` takes for a plan: its figures, plus the market and the two choices. */
+/** The terms `createVault` takes for a plan: its figures, plus the market and the three choices. */
 export function vaultPlanOf(
   plan: Pick<DcaPlan, "amountPerBuy" | "intervalSeconds" | "maxBuys" | "startAt">,
   choices: VaultChoices,
@@ -218,7 +287,100 @@ export function vaultPlanOf(
     startAt: BigInt(plan.startAt),
     keeperReward: choices.keeperReward,
     maxSlippageBps: BigInt(choices.maxSlippageBps),
+    communityWindow: BigInt(choices.communityWindow),
+    // No turns: the vault can share a window out in turns, and the app turns
+    // that on for new plans only if decision 29 of docs/V2_UPGRADE.md trips.
+    turnBuckets: DEFAULT_TURN_BUCKETS,
   };
+}
+
+// ── The community window ──────────────────────────────────────────────────
+
+/**
+ * The community window a plan gets unless Expert chooses another (decision 3
+ * of docs/V2_UPGRADE.md): 30 minutes, or a quarter of the interval when that
+ * is shorter — 75 seconds for a 5-minute plan, 15 minutes for an hourly one.
+ * @spdex/vault's `defaultCommunityWindow`, in seconds as a number. Null for an
+ * interval that isn't a whole number of seconds.
+ */
+export function defaultVaultWindow(intervalSeconds: number): number | null {
+  if (!Number.isSafeInteger(intervalSeconds) || intervalSeconds <= 0) return null;
+  return Number(defaultCommunityWindow(BigInt(intervalSeconds)));
+}
+
+/**
+ * The longest window a plan with this interval may have: a quarter of the
+ * interval, at most an hour (`maxCommunityWindow`). What Expert's "A quarter
+ * of the interval" chooses. Null as `defaultVaultWindow`.
+ */
+export function quarterVaultWindow(intervalSeconds: number): number | null {
+  if (!Number.isSafeInteger(intervalSeconds) || intervalSeconds <= 0) return null;
+  return Number(maxCommunityWindow(BigInt(intervalSeconds)));
+}
+
+/**
+ * Expert's window choice: the default, a preset in seconds, or "a quarter of
+ * the interval", which follows the interval as it changes.
+ */
+export type VaultWindowChoice = "default" | "quarter" | number;
+
+/** The presets Expert offers, seconds: 1, 5, 15, 30 and 60 minutes (decision 26). */
+export const VAULT_WINDOW_PRESETS: readonly number[] = COMMUNITY_WINDOW_PRESETS.map(Number);
+
+/**
+ * The window a choice gives a plan with this interval, seconds; null when the
+ * interval isn't a whole number of seconds. A preset is taken as chosen, even
+ * when it is now above a quarter of the interval (the frequency changed after
+ * it was picked): the factory refuses it then, and the form says so, rather
+ * than create the plan with a window nobody chose.
+ */
+export function vaultWindowOf(choice: VaultWindowChoice, intervalSeconds: number): number | null {
+  if (choice === "default") return defaultVaultWindow(intervalSeconds);
+  if (choice === "quarter") return quarterVaultWindow(intervalSeconds);
+  return choice;
+}
+
+/** One option of Expert's window select. */
+export interface VaultWindowOption {
+  /** The select's value: a preset's seconds, or "quarter". */
+  value: string;
+  seconds: number;
+  /** Above a quarter of the interval: the factory would refuse it. */
+  disabled: boolean;
+}
+
+/**
+ * Expert's window options for a plan with this interval: each preset, disabled
+ * when above a quarter of the interval, then "a quarter of the interval" when
+ * that is no preset already — 75 seconds for a 5-minute plan, but for an
+ * hourly one it is "15 min", and for a daily one the hour it is capped at,
+ * not a quarter of a day. Empty for an interval that isn't a whole number of
+ * seconds.
+ */
+export function vaultWindowOptions(intervalSeconds: number): VaultWindowOption[] {
+  const quarter = quarterVaultWindow(intervalSeconds);
+  if (quarter === null) return [];
+  const presets = VAULT_WINDOW_PRESETS.map((seconds) => ({ value: String(seconds), seconds, disabled: seconds > quarter }));
+  return VAULT_WINDOW_PRESETS.includes(quarter) ? presets : [...presets, { value: "quarter", seconds: quarter, disabled: false }];
+}
+
+/**
+ * The select's value for a choice: the default, or the quarter, shows as the
+ * preset it equals — 30 minutes for a daily plan, 15 for an hourly one — and
+ * as "a quarter of the interval" only when it equals none, so that Expert
+ * sees the window a Simple plan gets as one of the options.
+ */
+export function vaultWindowValue(choice: VaultWindowChoice, intervalSeconds: number): string {
+  if (choice !== "default" && choice !== "quarter") return String(choice);
+  const window = vaultWindowOf(choice, intervalSeconds);
+  return window !== null && VAULT_WINDOW_PRESETS.includes(window) ? String(window) : "quarter";
+}
+
+/** The choice a select's value names. */
+export function vaultWindowChoiceOf(value: string): VaultWindowChoice {
+  if (value === "quarter") return "quarter";
+  const seconds = Number(value);
+  return Number.isSafeInteger(seconds) && seconds > 0 ? seconds : "default";
 }
 
 /** The most that can go into a vault, `MAX_FUNDING` in VaultLimits.sol: 0.5 ETH. */
@@ -254,6 +416,8 @@ function termsProblemText(name: string): string | undefined {
       return "The first buy must be within a year of now.";
     case "FundingExceedsNeed":
       return "That's more than the plan's whole budget.";
+    case "CommunityWindowOutOfRange":
+      return "The community window must be 1 minute to an hour, and no more than a quarter of the time between buys.";
     default:
       return undefined;
   }
@@ -307,17 +471,20 @@ export function vaultPlanProblems(
 /**
  * Gas each of the owner's vault transactions uses, rounded up from real
  * transactions on the fork (`packages/vault`'s integration test and its gas
- * report): creating is 175,446 and creating with the budget about 214,650
- * (187,209 before the factory kept a list of its vaults, plus the 27,440 the
- * list and `VaultCreated`'s `funded` add); funding 54,447; closing 52,484.
+ * report). For a v2 vault, the only kind created now: creating about
+ * 177,000 and creating with the budget 216,263 (v1's were 175,446 and about
+ * 214,650: the community window adds a word to the terms and the clone);
+ * funding 54,447 and closing 52,484, the same for both releases.
  *
- * Trigger now, a buy sent on its own, from @spdex/vault's measurements on a
- * busy oracle pool, the usual case for SPX on mainnet (`EXECUTE_GAS`'s
+ * Trigger now, a buy sent on its own, from @spdex/vault's forge measurements
+ * on a busy oracle pool, the usual case for SPX on mainnet (`EXECUTE_GAS`'s
  * comment): a vault's first buy, which writes the most slots from zero, about
- * 300,300, and a later one about 70,000 less. A quiet pool costs about 53,000
- * less again (248,153 for a first buy on the fork). Not `EXECUTE_GAS`, which
- * sizes a gas limit: quoted as what a buy costs, it overstated a later buy by
- * a third, and said triggering cost more than its buy fee when it didn't.
+ * 303,300 for v2 paid back to its owner — `EXECUTE_GAS`'s 312,751 less the
+ * registry check, which Trigger now never makes — and a later one 237,089. A
+ * v1 vault's buy is about 2,000 less; a quiet pool about 50,000 less again.
+ * Not `EXECUTE_GAS`, which sizes a gas limit: quoted as what a buy costs, it
+ * overstated a later buy by a third, and said triggering cost more than its
+ * buy fee when it didn't.
  *
  * Estimates for a cost line, never a limit: the wallet sets each
  * transaction's own.
@@ -327,8 +494,8 @@ export const VAULT_GAS = {
   createAndFund: 220_000n,
   fund: 55_000n,
   close: 53_000n,
-  firstTrigger: 300_000n,
-  trigger: 230_000n,
+  firstTrigger: 305_000n,
+  trigger: 240_000n,
 } as const;
 
 /**
@@ -344,8 +511,8 @@ export function feePerGasNow(fees: PreparedFees): bigint {
 
 export interface VaultCosts {
   /**
-   * The buy fee each buy pays whoever triggers it (`buyFee`): one batched
-   * buy's network cost and a tenth more, never above 0.69% of the buy. It
+   * The buy fee each buy pays the keeper that makes it (`buyFee`): one batched
+   * buy's network cost plus 0.25% of the buy, never above 0.69% of the buy. It
    * depends only on the amount and this release, so it is known before any
    * fee is read.
    */
@@ -405,8 +572,11 @@ export function vaultSupportFrom(chainId: number, availability: VaultAvailabilit
   const reason = availability.reasons.map(sentence).join(" ") || "Vaults can't be offered right now.";
   // The deployment's own simulation ran the listing checks, which are the
   // market's health as the factory judges it; a health read that failed
-  // besides is not a reason to withhold it.
-  if (availability.factoryDeployed === false && availability.factoryDeployable === true) {
+  // besides is not a reason to withhold it. With the SPX holder registry not
+  // there either, the factory's deployment can't be simulated until it is:
+  // the registry goes first (`deployVaultFactory`), and the factory's checks
+  // are run then, before its own transaction.
+  if (availability.factoryDeployed === false && (availability.factoryDeployable === true || availability.registryDeployed === false)) {
     return { kind: "deployable", factory, reason, availability };
   }
   return { kind: "unavailable", factory, reason, availability };
@@ -473,8 +643,34 @@ export interface VaultFigures {
   clock: ChainClock | null;
   /** Where the vault's terms differ from the plan in the config; empty when they agree. */
   mismatches: VaultTermsMismatch[];
-  /** Whether the factory says it made this vault; null when it wasn't asked or didn't answer. */
+  /** Whether a factory says it made this vault; null when none was asked or none answered. */
   fromFactory: boolean | null;
+  /** Which release the vault is: its factory's, the release id shown in Details. */
+  release: VaultRelease;
+  /**
+   * The source the vault was built from, which says what it can do
+   * (`SOURCES[source].features`): pay whoever triggers (v1), or the `rewardTo`
+   * named, with a community window and, possibly, turns (v2 on).
+   */
+  source: SourceId;
+  /** The factory that vouches for it, lowercase: what a claim on it is proved against; null when none does. */
+  factory: Address | null;
+  /** Its community window, seconds; null for a v1 vault, which has none. */
+  communityWindow: number | null;
+  /** When its next buy falls (or fell) due, chain time: the window's start. Null for v1, or with no buy left. */
+  dueSince: number | null;
+  /** When that buy's community window ends, chain time; null as `dueSince`. */
+  windowEndsAt: number | null;
+  /** Buys made inside their window and paid to an SPX holder; null for v1, or when unread — never 0 for unknown. */
+  windowBuys: number | null;
+  /**
+   * How many turns the first half of each window is shared out in: 0 for none,
+   * which every vault the app creates has; null for a vault whose source has no
+   * turns (v1).
+   */
+  turnBuckets: number | null;
+  /** When the next buy's turn ends, chain time: until then only holders in its bucket may be paid. Null without turns. */
+  turnEndsAt: number | null;
 }
 
 export type VaultPlanState =
@@ -569,6 +765,18 @@ export function vaultPlanState(input: {
     clock: read.chainTime === null ? null : { seconds: Number(read.chainTime), readAtMs: input.readAtMs },
     mismatches: vaultTermsMismatches(plan, read.terms),
     fromFactory: read.fromFactory,
+    release: read.release,
+    source: read.source,
+    factory: read.factory,
+    communityWindow: read.terms.communityWindow === null ? null : Number(read.terms.communityWindow),
+    dueSince: read.status.dueSince === null ? null : Number(read.status.dueSince),
+    windowEndsAt: read.status.windowEndsAt === null ? null : Number(read.status.windowEndsAt),
+    windowBuys: read.windowBuys === null ? null : Number(read.windowBuys),
+    turnBuckets: read.terms.turnBuckets === null ? null : Number(read.terms.turnBuckets),
+    turnEndsAt:
+      read.terms.turnBuckets === null || read.terms.turnBuckets === 0n || read.status.turnEndsAt === null
+        ? null
+        : Number(read.status.turnEndsAt),
   };
   return mine === false ? { kind: "someone-else", ...figures } : { kind: "active", ...figures };
 }
@@ -609,10 +817,14 @@ export function vaultWaitReason(read: VaultState, readAtMs: number): string | nu
   return "No buy is due.";
 }
 
-/** Read a plan's vault, as its card shows it. Never throws: a failure is a state that says so. */
+/**
+ * Read a plan's vault, as its card shows it, from whichever release's factory
+ * vouches for it (`vaultFactories`, or `factories` when given). Never throws:
+ * a failure is a state that says so.
+ */
 export async function readVaultPlan(
   rpc: JsonRpc,
-  input: { plan: DcaPlan; chainId: number; account: Address | null; factory: Address; nowMs?: number },
+  input: { plan: DcaPlan; chainId: number; account: Address | null; factories?: readonly Address[]; nowMs?: number },
 ): Promise<VaultPlanState> {
   const { plan } = input;
   if (plan.chainId !== input.chainId) {
@@ -622,12 +834,13 @@ export async function readVaultPlan(
       reason: `This vault is on ${networkLabel(plan.chainId)}; spDEX is on ${networkLabel(input.chainId)} now.`,
     };
   }
-  if (vaultDeployment(input.chainId) === null) {
+  const factories = input.factories ?? vaultFactories(input.chainId);
+  if (factories === null) {
     return { kind: "unavailable", code: "unsupported", reason: unsupportedReason(input.chainId) };
   }
   if (plan.vault === undefined) return { kind: "not-created", note: null };
   try {
-    const read = await readVault(rpc, plan.vault.toLowerCase() as Address, { factory: input.factory });
+    const read = await readVault(rpc, plan.vault.toLowerCase() as Address, { factories });
     return vaultPlanState({ plan, account: input.account, read, readAtMs: input.nowMs ?? Date.now() });
   } catch (error) {
     // The endpoint's own words go to Details: a rate-limit page or a proxy's
@@ -868,38 +1081,66 @@ export function vaultAverageStat(state: VaultFigures): string {
 }
 
 /**
- * Every release's batcher, lowercase: the contract a keeper calls to make
- * many vaults' buys in one transaction, which is then the `keeper` a vault's
- * `Bought` names. The one bound to the factory this app uses,
- * `MAINNET_BATCHER`, is `DEPLOYMENTS`' last entry: `build-artifacts --check`
- * refuses a registry that doesn't end with this build, and the vault
- * package's tests hold the two equal.
+ * Whether a buy paid the `rewardTo` its trigger named (v2 on), rather than
+ * whoever called (v1): its `Bought`'s source says so.
  */
-const BATCHERS: ReadonlySet<string> = new Set(DEPLOYMENTS.map((d) => d.batcher.toLowerCase()));
+const paysRewardTo = (entry: Pick<VaultHistoryEntry, "source">): boolean =>
+  entry.source !== undefined && SOURCES[entry.source].features.executeTakesRewardTo;
 
 /**
  * A history row's sentence. `account` is the connected wallet, so a buy it
  * triggered says "you"; one a batcher triggered says "in a batch", since its
  * address would name a contract rather than whoever sent it; and the buy fee
  * is paid as WETH, and says so.
+ *
+ * A buy from v2 on says who made it (`entry.maker`): its owner, someone who
+ * paid the fee back to the owner, a community keeper inside the window, or
+ * anyone after it; and whom its fee was paid to, `rewardTo`, which need not be
+ * whoever sent it. A v1 buy reads as it always has: a v1 vault pays whoever
+ * triggers it.
  */
 export function vaultHistorySentence(entry: VaultHistoryEntry, terms: Pick<VaultTerms, "tokenOut">, account: Address | null): string {
   const weth = MAINNET_DEPLOYMENT.weth;
   switch (entry.kind) {
     case "bought": {
+      const bought = `Bought ${amountText(entry.amountOut ?? null, terms.tokenOut, undefined, "rounded")} for ${amountText(entry.amountIn ?? null, weth, undefined, "rounded").replace(/ WETH$/, " ETH")}`;
+      const fee = (payee: string) =>
+        entry.reward === undefined || entry.reward === 0n
+          ? ""
+          : `, paid${payee} its ${amountText(entry.reward, weth, undefined, "rounded")} buy fee`;
+      const viewer = account === null ? null : account.toLowerCase();
       const keeper = entry.keeper?.toLowerCase();
-      const batch = keeper !== undefined && BATCHERS.has(keeper);
-      const you = keeper !== undefined && account !== null && keeper === account.toLowerCase();
+      // A batcher spDEX lists (`LISTED_BATCHERS`): the contract a keeper calls
+      // to make many vaults' buys in one transaction, which is then the
+      // `keeper` a vault's `Bought` names.
+      const batch = keeper !== undefined && isListedBatcher(keeper as Address);
+      if (paysRewardTo(entry) && entry.rewardTo !== undefined) {
+        const rewardTo = entry.rewardTo.toLowerCase();
+        const paidYou = viewer !== null && rewardTo === viewer;
+        const payee = paidYou ? " you" : ` ${shortAddress(rewardTo)}`;
+        const sender = entry.sender ?? (keeper !== undefined && !batch ? keeper : null);
+        const caller = sender === null ? (batch ? "in a batch" : null) : `by ${viewer !== null && sender === viewer ? "you" : shortAddress(sender)}`;
+        switch (entry.maker) {
+          case "owner":
+            return `${bought} · triggered by ${paidYou ? "you" : "its owner"}${fee(paidYou ? " you" : " its owner")}`;
+          case "returned":
+            return `${bought} · triggered ${caller ?? "by someone else"}${fee(paidYou ? " you" : " its owner")}`;
+          case "community":
+            return `${bought} · triggered by a community keeper${fee(payee)}`;
+          case "open":
+            // Who sent it, when known, as Your activity says it: made after the window, when anyone could.
+            return `${bought} · triggered ${caller === null ? "" : `${caller} `}after its community window${fee(payee)}`;
+          default:
+            return `${bought}${caller === null ? "" : ` · triggered ${caller}`}${fee(payee)}`;
+        }
+      }
+      const you = keeper !== undefined && viewer !== null && keeper === viewer;
       const by = keeper === undefined ? "" : batch ? " · triggered in a batch" : ` · triggered by ${you ? "you" : shortAddress(keeper)}`;
       // The fee says whom the vault paid: a bare "paid 0.0004 WETH" read as
       // money received beside "by you", and as money spent beside "in a
       // batch", though it is the same payment either way.
       const payee = keeper === undefined ? "" : batch ? " the keeper" : you ? " you" : " them";
-      const paid =
-        entry.reward === undefined || entry.reward === 0n
-          ? ""
-          : `, paid${payee} its ${amountText(entry.reward, weth, undefined, "rounded")} buy fee`;
-      return `Bought ${amountText(entry.amountOut ?? null, terms.tokenOut, undefined, "rounded")} for ${amountText(entry.amountIn ?? null, weth, undefined, "rounded").replace(/ WETH$/, " ETH")}${by}${paid}`;
+      return `${bought}${by}${fee(payee)}`;
     }
     case "funded":
       return `Funded with ${ethText(entry.amount ?? 0n, 6)} ETH`;
@@ -986,14 +1227,17 @@ export interface FoundVault {
   state: VaultPlanState;
 }
 
-/** Read a found vault, as its card shows it. Never throws: a failure is a state that says so. */
+/**
+ * Read a found vault, as its card shows it, from whichever release's factory
+ * vouches for it. Never throws: a failure is a state that says so.
+ */
 export async function readFoundVault(
   rpc: JsonRpc,
-  input: { vault: Address; chainId: number; account: Address; factory: Address; nowMs?: number },
+  input: { vault: Address; chainId: number; account: Address; factories?: readonly Address[]; nowMs?: number },
 ): Promise<FoundVault> {
   const vault = lower(input.vault);
   try {
-    const read = await readVault(rpc, vault, { factory: input.factory });
+    const read = await readVault(rpc, vault, { factories: input.factories ?? vaultFactories(input.chainId) ?? listedFactories() });
     if (read === null) {
       return {
         vault,
@@ -1031,32 +1275,113 @@ export function foundFromPlan(plan: DcaPlan, state: VaultPlanState | undefined, 
   return { vault: state.vault, plan: rebuilt, state: { ...state, kind: "active", mine: true, mismatches: [] } };
 }
 
+/** One factory's own count of an account's vaults (`nonces(account)`), as a search read it. */
+export interface FactoryCount {
+  factory: Address;
+  expected: bigint;
+}
+
 /**
- * Every vault `account` created on this chain's factory, from the chain
- * (`findVaultsByOwner`). Null where there is nothing to search: a chain
- * vaults aren't offered on, or one the factory isn't deployed on yet. Throws
- * when the search can't start: the endpoint didn't answer.
+ * An owner search over every release's factory: `OwnerVaults` for them all —
+ * every vault found, newest release first, `expected` the factories' counts
+ * summed — with each factory's own count, which is what a vault on the page is
+ * proved one of the account's against (`provenVaults`).
+ */
+export interface AccountVaults extends OwnerVaults {
+  counts: FactoryCount[];
+}
+
+/**
+ * Every vault `account` created on this chain's factories, every release's,
+ * from the chain (`findVaultsByOwner`, one search per factory, each with its
+ * own release's `VaultCreated`). Null where there is nothing to search: a
+ * chain vaults aren't offered on, or one no factory is deployed on yet; a
+ * factory not deployed is skipped. Throws when a search can't start: the
+ * endpoint didn't answer.
  *
  * `known` are the account's vaults the page has already read (a plan's vault,
  * one carried over from a deleted card), with their terms. Each counts toward
- * the factory's count once its address proves it one of the account's
+ * its factory's count once its address proves it one of the account's
  * (`provenVaults`), so a search the plans already cover reads no log at all.
+ *
+ * Merged, it is complete only when every factory's search is, and it reports
+ * as having read logs (`searchedFrom`, the latest such block) only when every
+ * factory's search that fell short did: a note then says the missing vaults
+ * are older than what the service let spDEX search, never that the service
+ * refused, and the other way round.
  *
  * Never further back than `VAULT_LOGS_FROM_BLOCK`, before which no factory of
  * spDEX's can have made a vault. The chains vaults are offered on share
- * mainnet's factory, so they share its first block. On the local fork that
+ * mainnet's factories, so they share its first block. On the local fork that
  * floor is what keeps the search off the endpoint the fork was seeded from.
  */
 export async function searchAccountVaults(
   rpc: JsonRpc,
-  input: { chainId: number; account: Address; factory: Address; known?: readonly ShownVault[] },
-): Promise<OwnerVaults | null> {
-  if (vaultDeployment(input.chainId) === null) return null;
-  if (((await rpc("eth_getCode", [input.factory, "latest"])) as string) === "0x") return null;
-  return findVaultsByOwner(rpc, input.factory, lower(input.account), {
-    oldestBlock: VAULT_LOGS_FROM_BLOCK,
-    ...(input.known === undefined ? {} : { known: input.known }),
-  });
+  input: { chainId: number; account: Address; factories?: readonly Address[]; known?: readonly ShownVault[] },
+): Promise<AccountVaults | null> {
+  const factories = input.factories ?? vaultFactories(input.chainId);
+  if (factories === null) return null;
+  const deployed = await Promise.all(
+    factories.map(async (factory) => (((await rpc("eth_getCode", [factory, "latest"])) as string) === "0x" ? null : lower(factory))),
+  );
+  const searches: { factory: Address; result: OwnerVaults }[] = [];
+  for (const factory of deployed) {
+    if (factory === null) continue;
+    // A vault's terms say which source it was built from, and only a factory
+    // of that source can have made it: the others would hash it in vain.
+    const known = input.known?.filter((shown) => termsFitFactory(shown.terms, factory));
+    const result = await findVaultsByOwner(rpc, factory, lower(input.account), {
+      oldestBlock: VAULT_LOGS_FROM_BLOCK,
+      ...(known === undefined ? {} : { known }),
+    });
+    searches.push({ factory, result });
+  }
+  if (searches.length === 0) return null;
+  return mergeFactorySearches(searches);
+}
+
+/** Each factory's owner search, as one (`searchAccountVaults`). */
+function mergeFactorySearches(searches: readonly { factory: Address; result: OwnerVaults }[]): AccountVaults {
+  const results = searches.map((search) => search.result);
+  const short = results.filter((result) => !result.complete);
+  const blocks = (short.length > 0 ? short : results).map((result) => result.searchedFrom);
+  const read = blocks.filter((block): block is bigint => block !== undefined);
+  // Fallen short: "older than the service let spDEX search" only when every
+  // search that fell short read logs. Complete: whichever read any.
+  const searchedFrom =
+    read.length === 0 || (short.length > 0 && read.length < blocks.length)
+      ? undefined
+      : read.reduce((latest, block) => (block > latest ? block : latest));
+  const refusal = (short.length > 0 ? short : results).find((result) => result.refusal !== undefined)?.refusal;
+  return {
+    vaults: [...new Set(results.flatMap((result) => result.vaults))],
+    expected: results.reduce((sum, result) => sum + result.expected, 0n),
+    complete: short.length === 0,
+    ...(searchedFrom === undefined ? {} : { searchedFrom }),
+    ...(refusal === undefined ? {} : { refusal }),
+    counts: searches.map(({ factory, result }) => ({ factory, expected: result.expected })),
+  };
+}
+
+/**
+ * Each factory's count for a search's answer: its own, from a search across
+ * the factories (`AccountVaults`); or, for an answer that has none (a
+ * factory-list search, which counts only what it found), its total held
+ * against every release's factory — the same bound the one factory's count
+ * once was, a vault proving under one release's factory alone.
+ */
+export function factoryCountsOf(result: OwnerVaults & { counts?: readonly FactoryCount[] }): FactoryCount[] {
+  return result.counts !== undefined ? [...result.counts] : listedFactories().map((factory) => ({ factory, expected: result.expected }));
+}
+
+/**
+ * Whether a vault with these terms could be `factory`'s: its terms' shape is
+ * the source the factory's release was built from. True for a factory no
+ * release lists, which then says for itself, by its address, what it made.
+ */
+function termsFitFactory(terms: VaultTerms, factory: Address): boolean {
+  const release = releaseOfFactory(factory);
+  return release === null || sourceOfTerms(terms) === sourceOfRelease(release).id;
 }
 
 /** A vault on the page, with the terms a read of it gave: what a search's count is checked against. */
@@ -1066,9 +1391,11 @@ export interface ShownVault {
 }
 
 /**
- * The vaults in `shown` that are among the `expected` the factory counted for
- * `account`: each whose address is the one `account`'s vault with that nonce
- * and those terms would have (`findVaultNonce` below the count).
+ * The vaults in `shown` that are among those a factory counted for `account`
+ * (`counts`, each factory's `expected`): each whose address is the one
+ * `account`'s vault from that factory, with that nonce and those terms, would
+ * have (`findVaultNonce` below its count). A vault proves under its own
+ * release's factory alone.
  *
  * This, not "the read says it's the account's", is what lets a vault on the
  * page count toward a search's count. A vault created after the count was
@@ -1077,18 +1404,19 @@ export interface ShownVault {
  * search didn't reach. Its nonce is at or above the count, so it fails here.
  * Pure: one hash per nonce below the count, no read.
  */
-export function provenVaults(input: {
-  shown: readonly ShownVault[];
-  expected: bigint;
-  factory: Address;
-  account: Address;
-}): Address[] {
+export function provenVaults(input: { shown: readonly ShownVault[]; counts: readonly FactoryCount[]; account: Address }): Address[] {
   const owner = lower(input.account);
   const proven = new Set<Address>();
   for (const { vault, terms } of input.shown) {
     const address = lower(vault);
     if (proven.has(address)) continue;
-    if (findVaultNonce({ factory: input.factory, owner, terms, vault: address, below: input.expected }) !== null) proven.add(address);
+    for (const { factory, expected } of input.counts) {
+      if (!termsFitFactory(terms, factory)) continue;
+      if (findVaultNonce({ factory, owner, terms, vault: address, below: expected }) !== null) {
+        proven.add(address);
+        break;
+      }
+    }
   }
   return [...proven];
 }
@@ -1174,8 +1502,8 @@ export function vaultSearchNote(result: OwnerVaults, accounted: number): VaultSe
     result.searchedFrom !== undefined
       ? `${one ? "it was" : "they were"} created before the oldest block this network service let spDEX search`
       : result.refusal !== undefined
-        ? "this network service wouldn't let spDEX search the vault factory's records"
-        : "spDEX couldn't search the vault factory's records on this network service";
+        ? "this network service wouldn't let spDEX search the vault factories' records"
+        : "spDEX couldn't search the vault factories' records on this network service";
   return { missing, expected, text: `${which}: ${why}.`, refusal: result.refusal ?? null };
 }
 
@@ -1214,7 +1542,7 @@ export function vaultSearchFailed(result: OwnerVaults, accounted: number): boole
  * search that an endpoint cut short, or refused outright, doesn't unfind what
  * an earlier one found; the count, the bound and the refusal are the later's.
  */
-export function mergeVaultSearches(earlier: OwnerVaults | null, later: OwnerVaults): OwnerVaults {
+export function mergeVaultSearches<T extends OwnerVaults>(earlier: OwnerVaults | null, later: T): T {
   const vaults = [...new Set([...later.vaults, ...(earlier?.vaults ?? [])].map(lower))];
   return { ...later, vaults, complete: later.complete || BigInt(vaults.length) >= later.expected };
 }
@@ -1229,7 +1557,7 @@ export function mergeVaultSearches(earlier: OwnerVaults | null, later: OwnerVaul
  * taking it would silence the note when some listed owners couldn't be read.
  * It is complete when either search was, or when it found every one counted.
  */
-export function withListSearch(log: OwnerVaults, list: OwnerVaults): OwnerVaults {
+export function withListSearch<T extends OwnerVaults>(log: T, list: OwnerVaults): T {
   const vaults = [...new Set([...list.vaults, ...log.vaults].map(lower))];
   const expected = log.expected > BigInt(vaults.length) ? log.expected : BigInt(vaults.length);
   return { ...log, vaults, expected, complete: log.complete || list.complete || BigInt(vaults.length) >= log.expected };
@@ -1337,6 +1665,9 @@ const sameAddress = (a: string | undefined, b: string | undefined): boolean =>
  *   refuse one above 0.69%, and nobody chose to pay it under the rule the app
  *   now states. Null only for an amount that isn't a buy.
  * - `fund`: the whole budget at that fee: every buy and its buy fee.
+ * - `communityWindow`: the draft's, when the factory would take it for this
+ *   plan's interval, else the plan's default (`defaultVaultWindow`). Null only
+ *   for an interval that isn't one.
  */
 export interface VaultRetryTerms {
   maxSlippageBps: number | null;
@@ -1344,32 +1675,39 @@ export interface VaultRetryTerms {
   /** Whether the buy fee is the one this browser kept from the first attempt. */
   keptReward: boolean;
   fund: bigint | null;
+  communityWindow: number | null;
 }
 
 export function vaultRetryTerms(input: {
-  plan: Pick<DcaPlan, "amountPerBuy" | "maxBuys">;
-  draft: Pick<VaultDraft, "maxSlippageBps" | "keeperReward"> | null;
+  plan: Pick<DcaPlan, "amountPerBuy" | "maxBuys" | "intervalSeconds">;
+  draft: Pick<VaultDraft, "maxSlippageBps" | "keeperReward" | "communityWindow"> | null;
   /** An allowance picked on the card, overriding the draft's. */
   chosen?: number | null;
 }): VaultRetryTerms {
   const offered = (bps: number | null | undefined): number | null =>
     bps !== null && bps !== undefined && (VAULT_SLIPPAGE_CHOICES as readonly number[]).includes(bps) ? bps : null;
   const maxSlippageBps = offered(input.chosen) ?? offered(input.draft?.maxSlippageBps);
+  const quarter = quarterVaultWindow(input.plan.intervalSeconds);
+  const kept = input.draft?.communityWindow;
+  const communityWindow =
+    quarter !== null && kept !== undefined && kept >= Number(VAULT_LIMITS.MIN_COMMUNITY_WINDOW) && kept <= quarter
+      ? kept
+      : defaultVaultWindow(input.plan.intervalSeconds);
   let amountPerBuy: bigint;
   try {
     amountPerBuy = BigInt(input.plan.amountPerBuy);
   } catch {
     amountPerBuy = 0n;
   }
-  if (amountPerBuy <= 0n) return { maxSlippageBps, keeperReward: null, keptReward: false, fund: null };
+  if (amountPerBuy <= 0n) return { maxSlippageBps, keeperReward: null, keptReward: false, fund: null, communityWindow };
   const today = buyFee(amountPerBuy).reward;
-  const kept = input.draft === null || !/^\d+$/.test(input.draft.keeperReward) ? null : BigInt(input.draft.keeperReward);
+  const keptFee = input.draft === null || !/^\d+$/.test(input.draft.keeperReward) ? null : BigInt(input.draft.keeperReward);
   // No more than today's fee is within the ceiling too: `buyFee` never
   // proposes a fee above it.
-  const keptFits = kept !== null && kept <= today;
-  const keeperReward = keptFits ? kept : today;
+  const keptFits = keptFee !== null && keptFee <= today;
+  const keeperReward = keptFits ? keptFee : today;
   const fund = BigInt(input.plan.maxBuys) * (amountPerBuy + keeperReward);
-  return { maxSlippageBps, keeperReward, keptReward: keptFits, fund };
+  return { maxSlippageBps, keeperReward, keptReward: keptFits, fund, communityWindow };
 }
 
 function keptVaultText(plan: DcaPlan, state: VaultPlanState | undefined, reason: KeptVaultReason, incoming: Address | undefined): string {
@@ -1396,19 +1734,29 @@ function keptVaultText(plan: DcaPlan, state: VaultPlanState | undefined, reason:
 
 /**
  * The claim the vault Guard proves a vault by: its address, owner and terms
- * as read, and the factory nonce it was created with, found by predicting
- * each one below the owner's count (`findVaultNonce`). Null when none puts a
- * vault with those terms at that address: it is not the factory's vault for
- * that owner, and the Guard would refuse it anyway.
+ * as read, its release, and the factory nonce it was created with, found by
+ * predicting each one below the owner's count on that release's factory
+ * (`findVaultNonce`). The factory is the one that vouched for it when read
+ * (`VaultState.factory`), else the one its release has on mainnet; the release
+ * is the read's, else that factory's, else the newest built from the source
+ * its terms are shaped as. Null when the terms are not that release's
+ * source's shape, or none puts a vault with those terms at that address: it is
+ * not that factory's vault for that owner, and the Guard would refuse it anyway.
  */
 export async function vaultClaim(
   rpc: JsonRpc,
-  factory: Address,
-  state: Pick<VaultState, "address" | "owner" | "terms">,
+  state: Pick<VaultState, "address" | "owner" | "terms"> & Partial<Pick<VaultState, "factory" | "release">>,
 ): Promise<VaultClaim | null> {
+  const vouching = state.factory ? lower(state.factory) : null;
+  const release = state.release ?? (vouching === null ? null : releaseOfFactory(vouching)) ?? releaseOfTerms(state.terms);
+  const factory = vouching ?? lower(factoryOfRelease(release));
+  // The vouching factory is the release's own, and the terms its source's
+  // shape, or something is wrong with the read.
+  if (releaseOfFactory(factory) !== null && releaseOfFactory(factory) !== release) return null;
+  if (sourceOfTerms(state.terms) !== sourceOfRelease(release).id) return null;
   const below = await readVaultNonce(rpc, factory, state.owner);
   const nonce = findVaultNonce({ factory, owner: state.owner, terms: state.terms, vault: state.address, below });
-  return nonce === null ? null : { address: state.address, owner: state.owner, nonce, terms: state.terms };
+  return nonce === null ? null : { address: state.address, owner: state.owner, nonce, terms: state.terms, release };
 }
 
 // ── The four transactions ─────────────────────────────────────────────────
@@ -1451,6 +1799,8 @@ export function createVaultTx(input: {
       startAt: input.terms.startAt,
       keeperReward: input.terms.keeperReward,
       maxSlippageBps: input.terms.maxSlippageBps,
+      communityWindow: input.terms.communityWindow,
+      turnBuckets: input.terms.turnBuckets,
     },
   });
   return {
@@ -1507,7 +1857,14 @@ export function closeVaultTx(input: { chainId: number; account: Address; plan: D
   };
 }
 
-/** Triggering a due buy: the owner is held to receive at least `floorOut`, and the caller the buy fee. */
+/**
+ * Triggering a due buy, Trigger now: the owner is held to receive at least
+ * `floorOut`, and the buy fee goes back to the owner. A vault whose source
+ * takes `rewardTo` (v2 on) is sent `execute(owner)`, which its community window
+ * and its turns never refuse; a v1 vault `execute()`, which pays whoever sends
+ * it — the owner, who is the only one the card offers Trigger now to
+ * (`encodeTrigger`).
+ */
 export function triggerVaultTx(input: {
   chainId: number;
   account: Address;
@@ -1515,18 +1872,21 @@ export function triggerVaultTx(input: {
   claim: VaultClaim;
   floorOut: bigint;
 }): VaultTxPlan {
+  const account = lower(input.account);
+  const owner = lower(input.claim.owner);
   return {
     version: 1,
     intent: {
       version: 1,
       action: "trigger",
       chainId: input.chainId,
-      account: lower(input.account),
+      account,
       plan: input.plan,
       vault: input.claim,
       floorOut: input.floorOut,
+      rewardTo: featuresOf(input.claim.release).executeTakesRewardTo ? owner : account,
     },
-    calls: [{ to: input.claim.address, data: encodeExecute(), value: 0n }],
+    calls: [{ to: input.claim.address, data: encodeTrigger({ release: input.claim.release, owner }), value: 0n }],
   };
 }
 
@@ -1741,9 +2101,9 @@ export async function createVault(
  */
 async function freshVault(engine: VaultEngine, plan: DcaPlan): Promise<{ state: VaultState; claim: VaultClaim }> {
   if (plan.vault === undefined) throw new Error("This plan has no vault yet.");
-  const state = await readVault(engine.rpc, lower(plan.vault), { factory: engine.vaultFactory });
+  const state = await readVault(engine.rpc, lower(plan.vault), { factories: vaultFactories(plan.chainId) ?? listedFactories() });
   if (state === null) throw new Error(`There's no vault at ${plan.vault}. Nothing was sent.`);
-  const claim = await vaultClaim(engine.rpc, engine.vaultFactory, state);
+  const claim = await vaultClaim(engine.rpc, state);
   if (claim === null) {
     throw new Error(`${plan.vault} isn't a vault spDEX's factory made for its owner on these terms. Nothing was sent.`);
   }
@@ -1799,10 +2159,13 @@ export async function closeVault(
 }
 
 /**
- * Trigger the plan's due buy from the connected wallet, which is paid the
- * buy fee as any keeper is. Refused, with the vault's own reason, unless a
- * read says it would go through now. `received` and `reward` are what the
- * vault announced, or null when its receipt couldn't be read.
+ * Trigger the plan's due buy from the connected wallet, the vault's owner's,
+ * which the buy fee comes back to: named as who is paid on a v2 vault, any
+ * moment the buy is due, its community window included; the caller, which
+ * the owner is, on a v1 vault. Refused, with the vault's own reason, unless a
+ * read says it would go through now, and by the Guard unless the wallet is the
+ * owner's. `received` and `reward` are what the vault announced, or null when
+ * its receipt couldn't be read.
  */
 export async function triggerVault(
   deps: VaultOpDeps,
@@ -1826,17 +2189,20 @@ export async function triggerVault(
 
 /**
  * The vault factory's one-time deployment, sent from the connected wallet
- * through the standard deterministic deployer.
+ * through the standard deterministic deployer — after the SPX holder registry
+ * it names, when that isn't on the chain yet either: the factory's constructor
+ * refuses a registry with no code. Two transactions then, each confirmed.
  *
  * Not a Guard path, and why that is acceptable: it moves nobody's money — it
  * sends no ether, grants nothing and touches no balance — and anyone may send
  * it, with the same result whoever does. What it can cost is its gas, about
- * 3.6 million. So what is checked is that it does what it says: the chain is
- * one vaults are offered on, the factory is not there yet, the constructor's
- * listing checks pass right now (`simulateFactoryDeployment`), and a call of
- * exactly this transaction from this account returns the address the app
- * trusts — the deployer answers with where it put the contract. After the
- * receipt, the factory's code must be there.
+ * 3.9 million, and 1.8 million more for the registry. So what is checked is
+ * that it does what it says: the chain is one vaults are offered on, the
+ * factory is not there yet, the constructor's listing checks pass right now
+ * (`simulateFactoryDeployment`, once the registry is there), and a call of
+ * exactly each transaction from this account returns the address the app
+ * trusts — the deployer answers with where it put the contract. After each
+ * receipt, the contract's code must be there.
  */
 export async function deployVaultFactory(
   deps: { rpc: JsonRpc; sender: TxSender; chainId: number } & VaultHooks,
@@ -1844,27 +2210,65 @@ export async function deployVaultFactory(
   const deployment = vaultDeployment(deps.chainId);
   if (deployment === null) throw new Error(`Vaults aren't offered on ${networkLabel(deps.chainId)}.`);
   const call = deployFactoryCall(deployment);
-  const account = lower(deps.sender.account);
   deps.onStep?.({ phase: "check", label: "Checking the deployment…" });
-  if (((await deps.rpc("eth_getCode", [call.factory, "latest"])) as string) !== "0x") {
+  if (await hasCode(deps.rpc, call.factory)) {
     throw new Error("The vault factory is already deployed on this chain. Nothing was sent.");
+  }
+  const registry = deployRegistryCall();
+  if (lower(deployment.registry) === registry.registry && !(await hasCode(deps.rpc, registry.registry))) {
+    // The factory's own checks, its market's health, can't run while the
+    // registry it names has no code (its constructor refuses `NotARegistry`
+    // first), so they are run as if it were there: a factory that would be
+    // refused is said before the registry's deployment is paid for.
+    const refused = await factoryRefusalBeforeRegistry(deps.rpc, deployment, registry.registry);
+    if (refused !== null) throw new Error(`Deploying the vault factory would be refused right now: ${refused}. Nothing was sent.`);
+    await deployThroughDeployer(deps, { ...registry, address: registry.registry, name: "the SPX holder registry" });
+    deps.onStep?.({ phase: "check", label: "Checking the deployment…" });
   }
   const check = await simulateFactoryDeployment(deps.rpc, deployment);
   if (!check.deployable) throw new Error(`Deploying the vault factory would be refused right now: ${check.reason}. Nothing was sent.`);
+  const hash = await deployThroughDeployer(deps, { ...call, address: call.factory, name: "the vault factory" });
+  return { hash, factory: call.factory };
+}
+
+const hasCode = async (rpc: JsonRpc, address: Address): Promise<boolean> => ((await rpc("eth_getCode", [address, "latest"])) as string) !== "0x";
+
+/**
+ * Why the factory's deployment would be refused, test-run as if the SPX
+ * holder registry it names were already there: an `eth_call` whose state
+ * override gives that address code, which is all the factory's constructor
+ * asks of it. Null when it would be deployed — and when this service can't
+ * say (it takes no state override, or ignored it and answered `NotARegistry`
+ * again): the factory's own test-run still runs, after the registry lands
+ * and before the factory's transaction.
+ */
+export async function factoryRefusalBeforeRegistry(rpc: JsonRpc, deployment: FactoryDeployment, registry: Address): Promise<string | null> {
+  const overridden: JsonRpc = (method, params) => rpc(method, method === "eth_call" ? [...params, { [registry]: { code: "0x00" } }] : params);
+  const check = await simulateFactoryDeployment(overridden, deployment).catch(() => null);
+  if (check === null || check.deployable || check.error?.name === "NotARegistry") return null;
+  return check.reason;
+}
+
+/** One deployment through the deterministic deployer, checked, sent and confirmed (`deployVaultFactory`). */
+async function deployThroughDeployer(
+  deps: { rpc: JsonRpc; sender: TxSender; chainId: number } & VaultHooks,
+  call: { to: Address; data: Hex; address: Address; name: string },
+): Promise<Hex> {
+  const account = lower(deps.sender.account);
   const answered = (await deps.rpc("eth_call", [{ from: account, to: call.to, data: call.data, value: "0x0" }, "latest"])) as string;
   // The deterministic deployer returns the new contract's address as 20 bytes.
-  if (typeof answered !== "string" || `0x${answered.slice(-40)}`.toLowerCase() !== call.factory || call.to !== DETERMINISTIC_DEPLOYER) {
-    throw new Error(`The deployment would not land at the factory's address, ${call.factory}. Nothing was sent.`);
+  if (typeof answered !== "string" || `0x${answered.slice(-40)}`.toLowerCase() !== call.address || call.to !== DETERMINISTIC_DEPLOYER) {
+    throw new Error(`The deployment would not land at ${call.name}'s address, ${call.address}. Nothing was sent.`);
   }
   // Checked once more right before the wallet opens: someone else's
   // deployment landing since the first check turns this one into a creation
-  // that collides with the factory already there, which reverts having used
-  // nearly all of its gas limit — about 3.6 million, a real sum. The check
+  // that collides with the contract already there, which reverts having used
+  // nearly all of its gas limit — millions of gas, a real sum. The check
   // narrows that window; it can't close it, and the button says so.
-  if (((await deps.rpc("eth_getCode", [call.factory, "latest"])) as string) !== "0x") {
-    throw new Error("The vault factory has just been deployed on this chain by someone else. Nothing was sent.");
+  if (await hasCode(deps.rpc, call.address)) {
+    throw new Error(`${call.name[0]!.toUpperCase()}${call.name.slice(1)} has just been deployed on this chain by someone else. Nothing was sent.`);
   }
-  deps.onStep?.({ phase: "send", label: "Confirm deploying the vault factory in your wallet…" });
+  deps.onStep?.({ phase: "send", label: `Confirm deploying ${call.name} in your wallet…` });
   const sent = await deps.sender.send({ to: call.to, data: call.data, value: 0n, chainId: deps.chainId });
   const sentHash = sent.hash.toLowerCase() as Hex;
   await deps.onSent?.(sentHash);
@@ -1875,10 +2279,10 @@ export async function deployVaultFactory(
   } catch (error) {
     throw new VaultTxFailed(sentHash, error);
   }
-  if (((await deps.rpc("eth_getCode", [call.factory, "latest"])) as string) === "0x") {
-    throw new VaultTxFailed(hash, new Error(`the deployment confirmed, and there is still no code at ${call.factory}`));
+  if (!(await hasCode(deps.rpc, call.address))) {
+    throw new VaultTxFailed(hash, new Error(`the deployment confirmed, and there is still no code at ${call.address}`));
   }
-  return { hash, factory: call.factory };
+  return hash;
 }
 
 // ── A vault's refusals, in words ──────────────────────────────────────────
@@ -1915,6 +2319,10 @@ export function vaultErrorText(error: { name: string; args: readonly unknown[] }
       return "Nothing was sent to fund the vault.";
     case "UnknownMarket":
       return termsProblemText("UnknownMarket")!;
+    case "NotEligible":
+      return "Inside its community window, a buy's fee can be paid only to a community keeper (an account proven to hold 690 SPX) or the vault's owner.";
+    case "BadRewardTo":
+      return "A buy's fee can't be paid to that address.";
     default:
       return null;
   }
@@ -1935,11 +2343,33 @@ export interface VaultHistoryEntry {
   logIndex: number;
   /** Unix seconds (chain time) of its block; null when that couldn't be read. */
   at: number | null;
-  /** A buy: WETH in, tokens delivered to the owner, who triggered it and what they were paid. */
+  /**
+   * A buy: WETH in, tokens delivered to the owner, who called `execute`
+   * (`keeper`: an account, the owner, or a batcher) and what the buy fee was.
+   */
   amountIn?: bigint;
   amountOut?: bigint;
   keeper?: Address;
   reward?: bigint;
+  /** A buy: which source's `Bought` it is laid out as, which says whether it paid `rewardTo` or its caller. */
+  source?: SourceId;
+  /**
+   * A buy: who was paid its buy fee — the `rewardTo` its trigger named (v2 on),
+   * or the caller (v1, which pays whoever calls: the same as `keeper`).
+   */
+  rewardTo?: Address;
+  /** A buy: when it fell due, unix seconds, chain time (v2); null for v1, which never logged it. */
+  dueSince?: number | null;
+  /** A buy: the vault's community window, seconds (v2); null for v1, or when the reader wasn't told it. */
+  communityWindow?: number | null;
+  /**
+   * A buy: the account that sent its transaction, when it was read; null when
+   * it wasn't. Read only where who made the buy turns on it: a v2 buy paid back
+   * to the owner through a batcher, whose `keeper` names the batcher.
+   */
+  sender?: Address | null;
+  /** A buy: who made it (`buyMaker`); null when something it needs is unknown. */
+  maker?: BuyMaker | null;
   /** A funding or a closing: the amount, wei. */
   amount?: bigint;
 }
@@ -1957,17 +2387,14 @@ export interface VaultHistory {
 }
 
 /**
- * The vault's `Bought`, `Funded` and `Closed` topics: keccak256 of each
- * event's signature. Written out because this package does not depend on an
- * ABI encoder; a unit test holds each to the vault's ABI by decoding a log
- * that carries it.
+ * The topics a vault's history is read with: every source's `Bought` (v2's
+ * carries `rewardTo` and `dueSince`, so its signature, and its topic, differ
+ * from v1's), and `Funded` and `Closed`, which are the same in all. From
+ * @spdex/vault's `vaultTopicsOf`, never copied by hand: a v2 buy read with
+ * v1's topic alone would be filtered out by the endpoint, and every v2 buy
+ * reported "not shown".
  */
-export const VAULT_EVENT_TOPICS = {
-  Bought: "0xd2423a0b788a514c63e7297eb3d53ac18227830670fc6fa504be37ed61b296b6",
-  Funded: "0xc4c14883ae9fd8e26d5d59e3485ed29fd126d781d7e498a4ca5c54c8268e4936",
-  Closed: "0x6cc09e7b5c3e49861ebe8f6867e1618fbfc14c8d0e968fde37c4243ca02a6f83",
-} as const;
-const EVENT_TOPICS = Object.values(VAULT_EVENT_TOPICS);
+const EVENT_TOPICS = [...new Set([...vaultTopicsOf("Bought"), ...vaultTopicsOf("Funded"), ...vaultTopicsOf("Closed")])];
 
 /**
  * Log windows to try, widest first. Hosted endpoints cap `eth_getLogs`
@@ -1981,6 +2408,13 @@ export const MAX_HISTORY_QUERIES = 20;
 
 /** Blocks whose times are looked up for the newest entries; older ones show no date. */
 const MAX_TIMED_BLOCKS = 20;
+
+/**
+ * Transactions whose sender is looked up, newest first: only buys whose maker
+ * turns on it (`VaultHistoryEntry.sender`), which are rare. Past this, their
+ * maker is unknown.
+ */
+const MAX_SENDER_READS = 20;
 
 /**
  * A vault's history from its own `Bought`, `Funded` and `Closed` logs, best
@@ -2001,10 +2435,27 @@ const MAX_TIMED_BLOCKS = 20;
  * assumed) can land above the buy it was meant to reach, and the card then
  * said a buy it holds was "not shown". There the walk is bounded by
  * `MAX_HISTORY_QUERIES` alone.
+ *
+ * Buys of every release are read. Each says who was paid (`rewardTo`) and,
+ * from v2 on, when it fell due; with the vault's `owner` and `communityWindow` (from a
+ * read of the vault) each also says who made it (`maker`, `buyMaker`): its
+ * owner, a community keeper inside the window, anyone after it, the fee
+ * returned to the owner by someone else, or, for v1, a keeper. Without them,
+ * or without its block's time, a buy's maker is null: unknown, never guessed.
  */
 export async function readVaultHistory(
   rpc: JsonRpc,
-  input: { vault: Address; buysDone: number; startAt: number; chainId: number; maxQueries?: number },
+  input: {
+    vault: Address;
+    buysDone: number;
+    startAt: number;
+    chainId: number;
+    maxQueries?: number;
+    /** The vault's owner, from a read of it: who made each buy is said against it. */
+    owner?: Address | null;
+    /** The vault's community window, seconds (`VaultTerms.communityWindow`): null for v1. */
+    communityWindow?: bigint | null;
+  },
 ): Promise<VaultHistory> {
   const vault = lower(input.vault);
   const head = BigInt((await rpc("eth_blockNumber", [])) as string);
@@ -2058,7 +2509,21 @@ export async function readVaultHistory(
       };
       if (event.name === "Bought") {
         bought += 1;
-        entries.push({ ...base, kind: "bought", amountIn: event.amountIn, amountOut: event.amountOut, keeper: event.keeper, reward: event.reward });
+        entries.push({
+          ...base,
+          kind: "bought",
+          amountIn: event.amountIn,
+          amountOut: event.amountOut,
+          keeper: event.keeper,
+          reward: event.reward,
+          source: event.source,
+          rewardTo: event.rewardTo,
+          dueSince: event.dueSince === null ? null : Number(event.dueSince),
+          communityWindow:
+            SOURCES[event.source].features.communityWindow && input.communityWindow != null ? Number(input.communityWindow) : null,
+          sender: null,
+          maker: null,
+        });
       } else if (event.name === "Funded") {
         entries.push({ ...base, kind: "funded", amount: event.amount });
       } else if (event.name === "Closed") {
@@ -2084,6 +2549,43 @@ export async function readVaultHistory(
     }),
   );
   for (const entry of entries) entry.at = times.get(entry.blockNumber) ?? null;
+
+  const owner = input.owner ? lower(input.owner) : null;
+  const makerOf = (entry: VaultHistoryEntry) =>
+    buyMaker({
+      source: entry.source!,
+      owner,
+      rewardTo: entry.rewardTo ?? null,
+      keeper: entry.keeper ?? null,
+      sender: entry.sender ?? null,
+      at: entry.at === null ? null : BigInt(entry.at),
+      dueSince: entry.dueSince == null ? null : BigInt(entry.dueSince),
+      communityWindow: entry.communityWindow == null ? null : BigInt(entry.communityWindow),
+    });
+  const buys = entries.filter((entry) => entry.kind === "bought" && entry.source !== undefined);
+  for (const entry of buys) entry.maker = makerOf(entry);
+  // A buy paid back to the owner through a batcher (v2 on) is the owner's own
+  // (the owner ran Help run) or someone else's courtesy: only its
+  // transaction's sender tells which, so that alone is read, for the newest few.
+  const unsent = buys.filter(
+    (entry) => entry.maker === null && owner !== null && paysRewardTo(entry) && entry.rewardTo === owner,
+  );
+  const hashes = [...new Set(unsent.map((entry) => entry.hash))].slice(0, MAX_SENDER_READS);
+  const senders = new Map<Hex, Address>();
+  await Promise.all(
+    hashes.map(async (hash) => {
+      try {
+        const read = (await rpc("eth_getTransactionByHash", [hash])) as { from?: string } | null;
+        if (typeof read?.from === "string" && /^0x[0-9a-fA-F]{40}$/.test(read.from)) senders.set(hash, lower(read.from));
+      } catch {
+        // Its maker stays unknown, never a guess.
+      }
+    }),
+  );
+  for (const entry of unsent) {
+    entry.sender = senders.get(entry.hash) ?? null;
+    if (entry.sender !== null) entry.maker = makerOf(entry);
+  }
 
   const missingBuys = Math.max(0, input.buysDone - bought);
   let note: string | null = null;
@@ -2111,6 +2613,12 @@ export interface VaultCreation {
   owner: Address;
   /** The predicted address: where the factory puts this owner's vault for this nonce and these terms. */
   vault: Address;
+  /**
+   * The factory it was sent to, lowercase: the one its receipt's `VaultCreated`
+   * is read from. Absent from a creation recorded before releases were told
+   * apart; every release's factory is asked then.
+   */
+  factory?: Address;
   nonce: string;
   /** The creation's hash, once the wallet gave one. */
   hash: Hex | null;
@@ -2125,6 +2633,12 @@ export interface VaultDraft {
   keeperReward: string;
   /** Wei, decimal: what the creation sends along. */
   fund: string;
+  /**
+   * The community window, seconds, as chosen when the plan was set up. Absent
+   * from a draft written before vaults had one; a retry then takes the plan's
+   * default (`vaultRetryTerms`).
+   */
+  communityWindow?: number;
   creation?: VaultCreation;
 }
 
@@ -2177,6 +2691,8 @@ function isDraft(value: unknown): value is VaultDraft {
   const d = value as Record<string, unknown>;
   if (typeof d["maxSlippageBps"] !== "number" || typeof d["keeperReward"] !== "string" || typeof d["fund"] !== "string") return false;
   if (!/^\d+$/.test(d["keeperReward"]) || !/^\d+$/.test(d["fund"])) return false;
+  const window = d["communityWindow"];
+  if (window !== undefined && !(Number.isSafeInteger(window) && (window as number) >= 60 && (window as number) <= 3_600)) return false;
   const c = d["creation"];
   if (c === undefined) return true;
   if (typeof c !== "object" || c === null) return false;
@@ -2186,6 +2702,7 @@ function isDraft(value: unknown): value is VaultDraft {
     typeof creation["vault"] === "string" &&
     /^0x[0-9a-fA-F]{40}$/.test(creation["vault"]) &&
     typeof creation["nonce"] === "string" &&
+    (creation["factory"] === undefined || (typeof creation["factory"] === "string" && /^0x[0-9a-fA-F]{40}$/.test(creation["factory"]))) &&
     (creation["hash"] === null || (typeof creation["hash"] === "string" && /^0x[0-9a-fA-F]{64}$/.test(creation["hash"]))) &&
     typeof creation["at"] === "number"
   );
@@ -2211,15 +2728,22 @@ export type CreationOutcome =
  * predicted address settles it — the address commits to the factory, the
  * owner and every term, so a vault there is this creation's — then the
  * transaction's receipt, then time.
+ *
+ * The receipt is read for the factory the creation was sent to
+ * (`creation.factory`); a creation recorded without one, before releases were
+ * told apart, is looked for under every release's factory (`factories`, by
+ * default all of them), so one under way when the app moved to v2 still
+ * settles.
  */
 export async function settleCreation(
   rpc: JsonRpc,
-  input: { plan: DcaPlan; creation: VaultCreation; factory: Address; nowMs: number },
+  input: { plan: DcaPlan; creation: VaultCreation; factories?: readonly Address[]; nowMs: number },
 ): Promise<CreationOutcome> {
   const { creation, plan } = input;
   const vault = lower(creation.vault);
+  const factories = creation.factory !== undefined ? [lower(creation.factory)] : (input.factories ?? listedFactories());
   if (((await rpc("eth_getCode", [vault, "latest"])) as string) !== "0x") {
-    const state = await readVault(rpc, vault, { factory: input.factory });
+    const state = await readVault(rpc, vault, { factories });
     if (state !== null && state.fromFactory === true && state.owner === lower(creation.owner) && vaultTermsMismatches(plan, state.terms).length === 0) {
       return { kind: "created", vault };
     }
@@ -2231,7 +2755,9 @@ export async function settleCreation(
       if (BigInt(receipt.status) === 0n) {
         return { kind: "failed", note: "The last attempt to create the vault failed on chain; only its network fee was spent. Create it again." };
       }
-      const made = vaultsCreatedBy(input.factory, receipt.logs ?? []).find((event) => event.owner === lower(creation.owner));
+      const made = factories
+        .flatMap((factory) => vaultsCreatedBy(factory, receipt.logs ?? []))
+        .find((event) => event.owner === lower(creation.owner));
       if (made !== undefined) return { kind: "created", vault: made.vault };
     }
     const known = await Promise.resolve(rpc("eth_getTransactionByHash", [creation.hash])).catch(() => null);
@@ -2256,6 +2782,6 @@ function messageOf(error: unknown): string {
 }
 
 // Re-exported so the UI has one import for a vault's figures.
-export { FACTORY_LIMITS, KEEPER_MIN_EXECUTE_GAS_LIMIT, VAULT_LIMITS, describeMarketGap } from "@spdex/vault";
-export type { OwnerVaults, VaultAvailability, VaultState, VaultTerms } from "@spdex/vault";
+export { FACTORY_LIMITS, KEEPER_MIN_EXECUTE_GAS_LIMIT, VAULT_EVENT_TOPICS, VAULT_LIMITS, describeMarketGap } from "@spdex/vault";
+export type { BuyMaker, OwnerVaults, VaultAvailability, VaultRelease, VaultState, VaultTerms } from "@spdex/vault";
 export type { VaultTermsMismatch } from "@spdex/guard";

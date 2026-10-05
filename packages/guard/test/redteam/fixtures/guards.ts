@@ -6,7 +6,10 @@
  * The plans and logs are the ones the per-Guard red-team files start from
  * (attacks, tips, tips-permit2, budget, schedule, vault, vault-batch), kept
  * small: each path here only has to come back `verified` when both services
- * agree, so that what changes it is the second opinion alone.
+ * agree, so that what changes it is the second opinion alone. VaultGuard's
+ * cover both releases' buys — a v2 vault's Trigger now and a v1 vault's
+ * `execute()` — and the proof of SPX held, which moves no money and so may be
+ * signed `unverified` when the second service doesn't answer.
  */
 
 import {
@@ -50,10 +53,13 @@ import type { SimLog, SimulationProvider } from "@spdex/chain";
 import {
   MAINNET_DEPLOYMENT,
   MAINNET_FACTORY,
+  V1_MAINNET_FACTORY,
+  VAULT_EVENT_TOPICS,
   buyFee,
   encodeClose,
   encodeCreateVault,
   encodeExecute,
+  encodeExecuteV1,
   encodeFund,
   predictVault,
   termsOfPlan,
@@ -63,8 +69,9 @@ import {
 import { Guard, type GuardInput } from "../../../src/guard.js";
 import { ScheduledBuyGuard } from "../../../src/schedule.js";
 import { TipGuard, type TipGuardOptions } from "../../../src/tips.js";
-import { VaultGuard, type VaultClaim, type VaultTxPlan } from "../../../src/vault.js";
+import { VaultGuard, type VAULT_PLAN_ACTIONS, type VaultClaim, type VaultGuardOptions, type VaultTxPlan } from "../../../src/vault.js";
 import { batchPlan, honestBatchLogs } from "./batch.js";
+import { honestProofLogs, provePlan, serviceBlockHash } from "./proof.js";
 
 /** The Guard classes the Engine constructs, by name as `new …(` spells them. */
 export type GuardClass = "Guard" | "TipGuard" | "ScheduledBuyGuard" | "VaultGuard";
@@ -82,6 +89,12 @@ export interface GuardPath {
    * never sign unchecked. Never `verified`.
    */
   unavailable: "unverified" | "rejected";
+  /**
+   * For a VaultGuard path, which kind of plan it checks: every one of
+   * `VAULT_PLAN_ACTIONS` must have a path here (the structural test), so a
+   * new kind of vault transaction can't skip the second opinion unnoticed.
+   */
+  vaultAction?: (typeof VAULT_PLAN_ACTIONS)[number];
 }
 
 // ── A swap ──
@@ -197,16 +210,22 @@ const TERMS: VaultPlan = {
   startAt: NOW,
   keeperReward: REWARD,
   maxSlippageBps: 300n,
+  communityWindow: 900n,
+  turnBuckets: 0n,
 };
 const VAULT_TERMS: VaultTerms = termsOfPlan(TERMS);
 const VAULT = predictVault({ factory: MAINNET_FACTORY, owner: USER, nonce: 0n, terms: VAULT_TERMS });
+/** The same plan's vault on v1's factory. */
+const V1_TERMS: VaultTerms = { ...VAULT_TERMS, communityWindow: null, turnBuckets: null };
+const V1_VAULT = predictVault({ factory: V1_MAINNET_FACTORY, owner: USER, nonce: 0n, terms: V1_TERMS });
 const PAIR = MAINNET_DEPLOYMENT.markets[0].pair;
 const OUT = 4_877_097_969n;
 const FLOOR = 4_800_000_000n;
 
 const TOPIC = {
-  created: "0xb888b71d90fcdc2e1651a455bddf729f7b1b568ec746d390afa2c35ac599e961",
-  bought: "0xd2423a0b788a514c63e7297eb3d53ac18227830670fc6fa504be37ed61b296b6",
+  created: VAULT_EVENT_TOPICS.v2.VaultCreated,
+  bought: "0xa4e7d498bb99e1cbc60382035c43839f92324815f578268f03ea5b8ba4224764",
+  v1Bought: "0xd2423a0b788a514c63e7297eb3d53ac18227830670fc6fa504be37ed61b296b6",
   deposit: "0xe1fffcc4923d04b559f4d29a8bfc6cda04eb5b0d3c460751c2402c5c5cc9109c",
   withdrawal: "0x7fcf532c15f0a6db0bd6d0e038bea71d30d808c7d98cb3bf7268a95bf5081b65",
 } as const satisfies Record<string, Hex>;
@@ -227,7 +246,8 @@ const vaultPlan = (overrides: Partial<DcaPlan> = {}): DcaPlan => ({
   signer: "vault",
   ...overrides,
 });
-const claim = (): VaultClaim => ({ address: VAULT, owner: USER, nonce: 0n, terms: { ...VAULT_TERMS } });
+const claim = (): VaultClaim => ({ address: VAULT, owner: USER, nonce: 0n, terms: { ...VAULT_TERMS }, release: "v2" });
+const v1Claim = (): VaultClaim => ({ address: V1_VAULT, owner: USER, nonce: 0n, terms: { ...V1_TERMS }, release: "v1" });
 
 const createPlan = (value: bigint): VaultTxPlan => ({
   version: 1,
@@ -239,7 +259,21 @@ const createdLog = (funded: bigint): SimLog => {
   return {
     address: MAINNET_FACTORY,
     topics: [TOPIC.created, addressTopic(USER), addressTopic(VAULT)],
-    data: words(0n, t.tokenOut, t.pair, t.oraclePool, t.amountPerBuy, t.interval, t.maxBuys, t.startAt, t.keeperReward, t.maxSlippageBps, funded),
+    data: words(
+      0n,
+      t.tokenOut,
+      t.pair,
+      t.oraclePool,
+      t.amountPerBuy,
+      t.interval,
+      t.maxBuys,
+      t.startAt,
+      t.keeperReward,
+      t.maxSlippageBps,
+      t.communityWindow!,
+      t.turnBuckets!,
+      funded,
+    ),
   };
 };
 const createLogs = (value: bigint): SimLog[] =>
@@ -280,8 +314,8 @@ const closeLogs = (): SimLog[] => [
 
 const triggerPlan = (): VaultTxPlan => ({
   version: 1,
-  intent: { version: 1, action: "trigger", chainId: 1, account: USER, plan: vaultPlan({ vault: VAULT }), vault: claim(), floorOut: FLOOR },
-  calls: [{ to: VAULT, data: encodeExecute(), value: 0n }],
+  intent: { version: 1, action: "trigger", chainId: 1, account: USER, plan: vaultPlan({ vault: VAULT }), vault: claim(), floorOut: FLOOR, rewardTo: USER },
+  calls: [{ to: VAULT, data: encodeExecute(USER), value: 0n }],
 });
 const triggerLogs = (): SimLog[] => [
   transferLog(WETH, VAULT, PAIR, AMOUNT),
@@ -289,7 +323,23 @@ const triggerLogs = (): SimLog[] => [
   transferLog(WETH, VAULT, USER, REWARD),
   {
     address: VAULT,
-    topics: [TOPIC.bought, uint256Data(0n), addressTopic(USER)],
+    topics: [TOPIC.bought, uint256Data(0n), addressTopic(USER), addressTopic(USER)],
+    data: words(AMOUNT, OUT, REWARD, FLOOR, 1n, 20n * 10n ** 18n, NOW),
+  },
+];
+
+const v1TriggerPlan = (): VaultTxPlan => ({
+  version: 1,
+  intent: { version: 1, action: "trigger", chainId: 1, account: USER, plan: vaultPlan({ vault: V1_VAULT }), vault: v1Claim(), floorOut: FLOOR, rewardTo: USER },
+  calls: [{ to: V1_VAULT, data: encodeExecuteV1(), value: 0n }],
+});
+const v1TriggerLogs = (): SimLog[] => [
+  transferLog(WETH, V1_VAULT, PAIR, AMOUNT),
+  transferLog(SPX, PAIR, USER, OUT),
+  transferLog(WETH, V1_VAULT, USER, REWARD),
+  {
+    address: V1_VAULT,
+    topics: [TOPIC.v1Bought, uint256Data(0n), addressTopic(USER)],
     data: words(AMOUNT, OUT, REWARD, FLOOR, 1n, 20n * 10n ** 18n),
   },
 ];
@@ -297,7 +347,8 @@ const triggerLogs = (): SimLog[] => [
 // ── Every path ──
 
 const swapOptions = (requireSimulation: boolean) => ({ chainId: 1, requireSimulation, oracleDivergenceBps: 200 });
-const vaultOptions = (requireSimulation: boolean) => ({ chainId: 1, requireSimulation });
+/** The person's own service answers for the proof's block (fixtures/proof.ts). */
+const vaultOptions = (requireSimulation: boolean): VaultGuardOptions => ({ chainId: 1, requireSimulation, blockHash: serviceBlockHash });
 
 export const GUARD_PATHS: readonly GuardPath[] = [
   {
@@ -348,6 +399,7 @@ export const GUARD_PATHS: readonly GuardPath[] = [
   {
     name: "VaultGuard.check (a creation that sends ether)",
     guard: "VaultGuard",
+    vaultAction: "create",
     logs: () => createLogs(PER_BUY),
     check: (provider, requireSimulation) => new VaultGuard(provider, vaultOptions(requireSimulation)).check(createPlan(PER_BUY)),
     unavailable: "rejected",
@@ -355,6 +407,7 @@ export const GUARD_PATHS: readonly GuardPath[] = [
   {
     name: "VaultGuard.check (a creation that sends none)",
     guard: "VaultGuard",
+    vaultAction: "create",
     logs: () => createLogs(0n),
     check: (provider, requireSimulation) => new VaultGuard(provider, vaultOptions(requireSimulation)).check(createPlan(0n)),
     unavailable: "unverified",
@@ -362,6 +415,7 @@ export const GUARD_PATHS: readonly GuardPath[] = [
   {
     name: "VaultGuard.check (a funding)",
     guard: "VaultGuard",
+    vaultAction: "fund",
     logs: fundLogs,
     check: (provider, requireSimulation) => new VaultGuard(provider, vaultOptions(requireSimulation)).check(fundPlan()),
     unavailable: "rejected",
@@ -369,20 +423,40 @@ export const GUARD_PATHS: readonly GuardPath[] = [
   {
     name: "VaultGuard.check (closing)",
     guard: "VaultGuard",
+    vaultAction: "close",
     logs: closeLogs,
     check: (provider, requireSimulation) => new VaultGuard(provider, vaultOptions(requireSimulation)).check(closePlan()),
     unavailable: "unverified",
   },
   {
-    name: "VaultGuard.check (a buy the owner triggers)",
+    name: "VaultGuard.check (Trigger now on a v2 vault)",
     guard: "VaultGuard",
+    vaultAction: "trigger",
     logs: triggerLogs,
     check: (provider, requireSimulation) => new VaultGuard(provider, vaultOptions(requireSimulation)).check(triggerPlan()),
     unavailable: "unverified",
   },
   {
+    name: "VaultGuard.check (a v1 buy the owner triggers)",
+    guard: "VaultGuard",
+    vaultAction: "trigger",
+    logs: v1TriggerLogs,
+    check: (provider, requireSimulation) => new VaultGuard(provider, vaultOptions(requireSimulation)).check(v1TriggerPlan()),
+    unavailable: "unverified",
+  },
+  {
+    name: "VaultGuard.check (a proof of SPX held)",
+    guard: "VaultGuard",
+    vaultAction: "prove",
+    logs: honestProofLogs,
+    check: (provider, requireSimulation) => new VaultGuard(provider, vaultOptions(requireSimulation)).check(provePlan()),
+    // It moves no money: checked on one service, it may still be signed.
+    unavailable: "unverified",
+  },
+  {
     name: "VaultGuard.check (a batch for other people's vaults)",
     guard: "VaultGuard",
+    vaultAction: "batch",
     logs: honestBatchLogs,
     check: (provider, requireSimulation) => new VaultGuard(provider, vaultOptions(requireSimulation)).check(batchPlan()),
     unavailable: "rejected",

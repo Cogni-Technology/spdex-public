@@ -121,7 +121,9 @@ control". It isn't:
   wallet forwards what it receives (a code read of your own address), a
   vault's history, the check that a vault creation went through (a code read
   of the new vault, which no list can name), and Help run the network, which
-  hides itself when the batcher's code can't be read.
+  hides itself when the batcher's code can't be read. Whether the list
+  touches `eth_getProof`, which proving SPX held needs ("Proving SPX held",
+  below), is *unverified*.
 
 If you add it anyway, list all of these, and accept that the features above
 degrade:
@@ -136,6 +138,9 @@ degrade:
 0x7a250d5630b4cf539739df2c5dacb4c659f2488d  Uniswap v2 Router02
 0xe4a1410a9ee0833d41e7514306e65ad729b7199e  SpdexVaultFactory (v1)
 0xc5ce65451dd5fc99d08eb18440b06f2bcca3c5a0  SpdexVaultBatcher (v1)
+0x164080e374f3a924245c3a99fbadbd2c98ed48eb  SpdexVaultFactory (v2, once deployed)
+0x5dff93903e3d2de06b8d729413500a938444bf1d  SpdexVaultBatcher (v2, once deployed)
+0x2c7f732a453fe0a4a65f36ac564ff16007b5610d  SpxHolderRegistry (v2, once deployed)
 0x52c77b0cb827afbad022e6d6caf2c44452edbc39  SPX pool (volume)
 0x7c706586679af2ba6d1a9fc2da9c6af59883fdd3  SPX pool (volume)
 0x00ed26e794b949e18b142f9108429b74ce08ac99  SPX pool (volume)
@@ -213,6 +218,9 @@ curl -sS -X POST "$U" -H 'content-type: application/json' -H "Origin: $O" --data
 
 # The browser's preflight: expect access-control-allow-origin: $O
 curl -sS -i -X OPTIONS "$U" -H "Origin: $O" -H 'Access-Control-Request-Method: POST' | grep -i '^access-control'
+
+# Prove my SPX's read: expect a "result" holding "accountProof", not an "error".
+curl -sS -X POST "$U" -H 'content-type: application/json' -H "Origin: $O" --data '{"jsonrpc":"2.0","id":1,"method":"eth_getProof","params":["0xE0f63A424a4439cBE457D80E4f4b51aD25b2c56C",["0x2cd15052f745ae9a174ed167090c02aab286845a4a6c734be356630a513bcdd9"],"finalized"]}' | head -c 200; echo
 ```
 
 If `eth_simulateV1` is refused, switch on the Transaction Simulation service
@@ -220,6 +228,10 @@ and try again: which service gates it is *unverified* (it is priced as a
 standard Node API method). The same key against
 `https://base-mainnet.g.alchemy.com/v2/…` should be refused by the chain
 setting; that a switched-off service refuses its methods is *unverified*.
+
+The last check asks for SPX's balance slot of one holder (the Uniswap v2
+SPX/WETH pair, chosen only because its address is public) at the `finalized`
+block. "Proving SPX held: `eth_getProof`", below, says what a refusal means.
 
 Alchemy's documentation lists these refusals as HTTP 403 with JSON-RPC code
 -32600. Whether a 403 carries CORS headers is *unverified*: if it doesn't, a
@@ -395,6 +407,81 @@ release's own address, swaps are test-run and checked before signing; on the
 public fallback, they may not be. Alchemy documents it on the Ethereum
 endpoint on every plan (*unverified* against a live key: step 5's curl checks
 it).
+
+## Proving SPX held: `eth_getProof`
+
+**Why the app needs it.** A community keeper makes other people's v2 vault
+buys and is paid for each one; holding 690 SPX is the entry bar. Once every 30
+days the address it is paid at proves, from Ethereum's own state, that it held
+690 SPX at the end of a recent block (`docs/THREAT-MODEL.md`, "The community
+window and the SPX holder registry"). **Prove my SPX** and **Prove another
+address**, in **Community keeping** at the foot of Help run the network,
+build that proof in the browser from two reads through the person's own
+network service:
+
+- `eth_getBlockByNumber("finalized", false)`: the block proven, about 13
+  minutes old, whose header the app rebuilds and refuses to use unless it
+  hashes to the block's hash;
+- `eth_getProof(SPX, [key], <that block>)`, where `key` is
+  `keccak256(abi.encode(holder, 1))`, the holder's slot in SPX's balances
+  (`cast index address <holder> 1` prints it): a proof from the block's state
+  root to SPX's account, and from there to the holder's balance.
+
+Nothing else in the app uses `eth_getProof`, so a service that refuses it
+breaks proving and nothing more. The proof's transaction is a separate cost,
+paid by the wallet: about 655,000 to 685,000 gas (`test/forge/Registry.t.sol`
+measures the call; the rest is its 8 KB of calldata and the 21,000 every
+transaction pays), about 0.00007 ETH at 0.1 gwei. What the two requests cost
+in compute units is *unverified*.
+
+**Which services answer it.** Asked for the `finalized` block, about 64
+blocks behind the head, on 2026-10-03 with the commands below:
+
+| Service | `eth_getProof` at `finalized` |
+|---|---|
+| Alchemy's Node API, the test account's archive key (`SPDEX_FORK_RPC_URL`) | Answers: an account proof of 9 nodes (3,759 bytes) and the storage proof |
+| The public fallback, `ethereum-rpc.publicnode.com` | Refuses: "distance to target block exceeds maximum proof window". It answered for the head block alone |
+| The built-in key | *unverified*: the same Node API as the test account's. Step 5's last check asks it |
+| Your own node | An archive node answers for any block. A full node answers only for blocks whose state it still holds: geth keeps the last 128 (*unverified*), which covers `finalized`; reth answers only as far back as its `--rpc.eth-proof-window` allows, the head alone by default (*unverified*) |
+
+So at the release's own address proving should work as it is, and on the
+public fallback it doesn't: someone using the fallback needs another service
+for the proof, or the paste-a-proof path below.
+
+**Check one.** Either command; `U` is the endpoint, read without printing it:
+
+```bash
+read -rs U        # paste the endpoint URL, then Enter
+SPX=0xE0f63A424a4439cBE457D80E4f4b51aD25b2c56C
+KEY=0x2cd15052f745ae9a174ed167090c02aab286845a4a6c734be356630a513bcdd9   # the SPX/WETH pair's balance slot; any address's will do
+
+# With Foundry: expect JSON with "accountProof" and "storageProof".
+cast proof --rpc-url "$U" -B finalized $SPX $KEY
+
+# With curl alone: expect a "result", not an "error".
+curl -sS -X POST "$U" -H 'content-type: application/json' --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_getProof\",\"params\":[\"$SPX\",[\"$KEY\"],\"finalized\"]}" | head -c 200; echo
+```
+
+For the built-in key, send the origin its Domains list expects, as step 5
+does: `-H "Origin: $O"` on the curl, `--rpc-headers "Origin: $O"` on the
+`cast`. Without one the key refuses the request, whatever the method.
+
+**When the person's service refuses it: Paste a proof.** The panel says the
+service doesn't answer `eth_getProof`, points here, and offers **Paste a
+proof**. It shows the two requests above, written out in full for one block
+it names (the `finalized` block as the person's own service reports it), to
+run against any service that answers them, with `curl`, `cast` or any other
+tool, and a box for the answers. Before anything is sent, the app rebuilds the
+header from the pasted block, hashes it, and compares that hash with the one
+the person's own service reports for that block number, and checks the
+proof against that header's state root; answers that don't match are
+refused, and so is a holder that is a contract or holds under 690 SPX now,
+whom no proof could make a community keeper. The page never fetches from the other service itself (rule
+4 in `AGENTS.md`): the person runs the requests, wherever they choose. The
+proof then goes through the Guard like any proof, and the registry checks it
+against the chain once more. Run the requests soon after the panel shows them:
+a full node soon stops holding that block's state, and the registry accepts a
+block only while it is among the last 8,191, about 27 hours.
 
 ## The test key is a different account
 

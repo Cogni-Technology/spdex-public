@@ -27,7 +27,8 @@ import { useEffect, useRef, useState } from "react";
 import { Button, Disclosure, Pill, Progress, Row, Term } from "@spdex/ui";
 import { strayVaultKey, type AutoBuy, type AutoBuyDeps, type StrayVaultsView } from "../../lib/dca/useAutoBuy.js";
 import { shortAddress } from "../../lib/dca/format.js";
-import { vaultProgress, type FoundVault, type VaultCardStatus, type VaultSearchNote } from "../../lib/dca/vault.js";
+import { releaseOfFactory } from "@spdex/vault";
+import { vaultFactories, vaultProgress, type FoundVault, type VaultCardStatus, type VaultSearchNote } from "../../lib/dca/vault.js";
 import { amountEvery, cardTitle, explorerAddressUrl } from "../../lib/dca/view.js";
 import { GoTo } from "../../lib/places.js";
 import { localClock } from "../../lib/steps.js";
@@ -151,7 +152,8 @@ function SearchNote({ note, deps, retrying }: { note: VaultSearchNote; deps: Aut
   const them = note.missing === 1 ? "it" : "them";
   const account = deps.account;
   const accountPage = account === null ? null : explorerAddressUrl(deps.config.chainId, account);
-  const factory = deps.engine?.vaultFactory ?? null;
+  // Every release's factory, newest first: a v1 vault's creation went to v1's.
+  const factories = deps.engine === null ? [] : (vaultFactories(deps.config.chainId) ?? [deps.engine.vaultFactory]);
   return (
     <div className="spdex-dca-strays__note" data-testid="dca-strays-note">
       <p className="spdex-dca-line spdex-dca-line--warn" data-testid="dca-strays-note-text">
@@ -172,15 +174,15 @@ function SearchNote({ note, deps, retrying }: { note: VaultSearchNote; deps: Aut
             your wallet's transactions ↗
           </a>
         )}{" "}
-        include each vault's creation, sent to the vault factory
-        {factory === null ? "." : ":"}
+        include each vault's creation, sent to {factories.length > 1 ? "one of spDEX's vault factories" : "the vault factory"}
+        {factories.length === 0 ? "." : ":"}
       </p>
-      {factory !== null ? (
-        <div className="spdex-dca-strays__factory">
-          <AddressText address={factory} testId="dca-strays-factory" />
+      {factories.map((factory, index) => (
+        <div key={factory} className="spdex-dca-strays__factory">
+          <AddressText address={factory} testId={index === 0 ? "dca-strays-factory" : `dca-strays-factory-${releaseOfFactory(factory) ?? index}`} />
           <CopyButton text={factory} />
         </div>
-      ) : null}
+      ))}
       {note.refusal !== null ? (
         <details className="spdex-dca-detail">
           <summary>Details</summary>

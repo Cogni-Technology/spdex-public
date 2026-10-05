@@ -1,9 +1,14 @@
 /**
  * `pnpm mainnet:smoke:sweep <your address> [--send]`: give back everything
- * the agent wallets hold. It closes any vault an agent owns that still holds
- * something (its WETH comes back to that agent as ETH), sends each agent's
- * SPX and WETH to the address, then its ether, all but the last transfer's
- * network fee.
+ * the agent wallets hold, but the holder agent's SPX. It closes any vault an
+ * agent owns that still holds something, on every release's factory (its
+ * WETH comes back to that agent as ETH), sends each agent's SPX and WETH to
+ * the address, then its ether, all but the last transfer's network fee.
+ *
+ * The holder agent's SPX stays where it is, and the sweep says so: it is the
+ * 690 SPX the wallets' owner sent it to be a community keeper, and nothing in
+ * this suite moves it (decision 33). Sending it back is the owner's own
+ * transaction, by hand (docs/MAINNET-SMOKE.md, "Giving the ether back").
  *
  * Without `--send` it only says what it would do. It refuses a fork unless
  * told `--fork`, which is for rehearsing it with throwaway keystores (a
@@ -21,9 +26,10 @@ import {
   type PreparedTransaction,
 } from "../packages/chain/src/index.js";
 import {
+  DEPLOYMENTS,
   MAINNET_DEPLOYMENT,
+  SPX_TOKEN,
   encodeClose,
-  factoryAddress,
   readVault,
   readVaultCount,
   readVaultsPage,
@@ -31,13 +37,14 @@ import {
 import { resolvedEnv } from "../scripts/env.mjs";
 import { openKeystore } from "./keys.js";
 import { smokeRpc } from "./rpc.js";
-import { AGENT_NAMES, GWEI, eth, smokeHome } from "./settings.js";
+import { AGENT_NAMES, GWEI, HOLDER, eth, smokeHome } from "./settings.js";
 
 type Hex = `0x${string}`;
 
-const SPX = "0xe0f63a424a4439cbe457d80e4f4b51ad25b2c56c" as Hex;
+const SPX = SPX_TOKEN.toLowerCase() as Hex;
 const WETH = MAINNET_DEPLOYMENT.weth.toLowerCase() as Hex;
-const FACTORY = factoryAddress(MAINNET_DEPLOYMENT).toLowerCase() as Hex;
+/** Every release's factory, oldest first: a v1 vault an earlier run left open is closed too. */
+const FACTORIES = DEPLOYMENTS.map((d) => d.factory.toLowerCase() as Hex);
 const TIP = GWEI / 20n;
 
 const args = process.argv.slice(2);
@@ -95,16 +102,18 @@ async function sendAndWait(key: Hex, tx: PreparedTransaction, what: string): Pro
 }
 
 // Vaults first: closing one sends its WETH to its owner, as ETH, for the steps after.
-const factoryDeployed = ((await rpc("eth_getCode", [FACTORY, "latest"])) as string) !== "0x";
-const count = factoryDeployed ? await readVaultCount(rpc, FACTORY) : 0n;
-for (let offset = 0n; offset < count; offset += 1_000n) {
-  for (const vault of await readVaultsPage(rpc, FACTORY, offset, 1_000n)) {
-    const state = await readVault(rpc, vault, { factory: FACTORY });
-    const owner = state === null ? undefined : byAddress.get(state.owner.toLowerCase() as Hex);
-    if (!state || !owner || state.closed || state.status.wethBalance === 0n) continue;
-    const from = addressOfKey(owner.key) as Hex;
-    const tx = tipped(await prepareTransaction(rpc, { from, to: vault.toLowerCase() as Hex, data: encodeClose(), value: 0n, chainId: 1 }));
-    await sendAndWait(owner.key, tx, `close ${owner.name}'s vault ${vault} (${eth(state.status.wethBalance)} WETH back as ETH)`);
+for (const factory of FACTORIES) {
+  const factoryDeployed = ((await rpc("eth_getCode", [factory, "latest"])) as string) !== "0x";
+  const count = factoryDeployed ? await readVaultCount(rpc, factory) : 0n;
+  for (let offset = 0n; offset < count; offset += 1_000n) {
+    for (const vault of await readVaultsPage(rpc, factory, offset, 1_000n)) {
+      const state = await readVault(rpc, vault, { factory });
+      const owner = state === null ? undefined : byAddress.get(state.owner.toLowerCase() as Hex);
+      if (!state || !owner || state.closed || state.status.wethBalance === 0n) continue;
+      const from = addressOfKey(owner.key) as Hex;
+      const tx = tipped(await prepareTransaction(rpc, { from, to: vault.toLowerCase() as Hex, data: encodeClose(), value: 0n, chainId: 1 }));
+      await sendAndWait(owner.key, tx, `close ${owner.name}'s vault ${vault} (${eth(state.status.wethBalance)} WETH back as ETH)`);
+    }
   }
 }
 
@@ -117,6 +126,13 @@ for (const agent of agents) {
   ] as const) {
     const amount = await balanceOf(token, from);
     if (amount === 0n) continue;
+    if (agent.name === HOLDER && token === SPX) {
+      console.log(
+        `  leaves its ${amount} base units of SPX where they are: the holder agent's SPX never leaves it in this suite. ` +
+          "Send it back yourself if you are retiring the agents (docs/MAINNET-SMOKE.md).",
+      );
+      continue;
+    }
     const tx = tipped(await prepareTransaction(rpc, { from, to: token, data: encodeErc20Transfer(to, amount), value: 0n, chainId: 1 }));
     await sendAndWait(agent.key, tx, `send ${amount} base units of ${name} to ${to}`);
   }

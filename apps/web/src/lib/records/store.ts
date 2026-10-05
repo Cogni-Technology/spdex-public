@@ -103,7 +103,7 @@ export interface StoredLeg {
 /**
  * A swap, a tip, or a batch of other people's due vault buys, made in this
  * browser (`buy-fees-earned`: Help run the network; its `bought` is the WETH
- * the batch paid in buy fees, and its `sold` a known 0 of WETH), or a buy of
+ * its buys paid in buy fees, and its `sold` a known 0 of WETH), or a buy of
  * a plan since deleted (`plan-buy`, kept by `keepPlanBuys`).
  */
 export interface StoredReceipt {
@@ -721,9 +721,11 @@ export interface RecordBuyFeesInput {
   /** The batch's receipt, as `waitForBatch` read it. */
   receipt: ChainReceipt;
   /**
-   * The WETH the batch paid `account`, from the receipt's `Batch` event
-   * (never from the preview); null when it couldn't be read. Ignored for a
-   * batch that reverted, which paid nothing.
+   * The WETH other people's vaults paid `account`, from the receipt (never
+   * from the preview): the `Batch` event's `earned`, less the fees the
+   * account's own vaults paid back to it (`feesEarnedFromOthers`), which
+   * their own buy rows count as paid back. Null when it couldn't be read.
+   * Ignored for a batch that reverted, which paid nothing.
    */
   earned: bigint | null;
   /** The WETH the buy fees are paid in (the factory's). */
@@ -938,7 +940,14 @@ export function useRecords(deps: UseRecordsDeps): Records {
   const vaults: VaultBuys[] = vaultPlans.flatMap(({ plan, state }) => {
     const read = histories[plan.id];
     if (read === undefined || read.key !== `${state.vault}:${state.buysDone}`) return [];
-    const base = { plan, owner: state.owner, tokenOut: state.terms.tokenOut, maxBuys: state.maxBuys, buysDone: state.buysDone };
+    const base = {
+      plan,
+      owner: state.owner,
+      tokenOut: state.terms.tokenOut,
+      maxBuys: state.maxBuys,
+      buysDone: state.buysDone,
+      communityWindow: state.terms.communityWindow,
+    };
     return [{ ...base, ...("history" in read ? { history: read.history } : { error: read.error }) }];
   });
 
@@ -993,6 +1002,9 @@ export function useRecords(deps: UseRecordsDeps): Records {
             buysDone: state.buysDone,
             startAt: Number(state.terms.startAt),
             chainId,
+            // Who made each buy is said against these, which never change for a vault.
+            owner: state.owner,
+            communityWindow: state.terms.communityWindow,
           });
           return [plan.id, { key, history }] as const;
         } catch (error) {

@@ -1,7 +1,8 @@
 /**
- * The report's summary: its twenty questions, each answered from the finished
- * tables and the report's context — and the arithmetic over a table's column
- * (sums, medians, spreads, counts) that the daily table does too.
+ * The report's summary: its twenty-one questions, each answered from the
+ * finished tables and the report's context — and the arithmetic over a
+ * table's column (sums, medians, spreads, counts, how concentrated the
+ * community windows' buys are) that the daily table does too.
  *
  * `report.ts` builds the tables, calls `summarise`, and puts the answers
  * between the summary's version and provenance and what it cannot know. This
@@ -11,12 +12,13 @@
  */
 
 import type { Address, Hex } from "@spdex/core";
+import { SOURCES, type Deployment } from "./artifacts.js";
 import { percentile } from "./keeper-plan.js";
 import type { Cell, Context, KeeperRecord, Report, Row } from "./report.js";
 
 // ─── The questions ────────────────────────────────────────────────────────────
 
-/** The answers to the report's twenty questions, `q1` to `q20`, in order. */
+/** The answers to the report's twenty-one questions, `q1` to `q21`, in order. */
 export function summarise(c: Context, t: Report["tables"]): Record<string, unknown> {
   const { buys, batches, windows, vaults, refusals, keeper } = t;
   const input = c.input;
@@ -37,6 +39,13 @@ export function summarise(c: Context, t: Report["tables"]): Record<string, unkno
   const logCount = (type: string) => (hasLogs ? records.filter((r) => r.type === type).length : null);
   const refusedForDepth = refusals.filter((r) => r["reason_name"] === "OracleTooThin").length;
   const span = c.keeperLog.span;
+  const heartbeats = records.filter((r) => r.type === "heartbeat");
+  const lastRunway = heartbeats.filter((r) => typeof r["runwayDays"] === "number").at(-1)?.["runwayDays"];
+  // Decision 29's figure: the 30 days ending at the report's last block, when the range reaches back that far.
+  const { fromTime, toTime } = input.range;
+  const concentrationFrom = toTime - CONCENTRATION_SECONDS;
+  const covers30Days = fromTime <= concentrationFrom;
+  const window = concentration(buys, covers30Days ? concentrationFrom : fromTime, toTime, input.deployments);
 
   return {
     q1: q("Buys per day, volume, active vaults, unique owners", {
@@ -60,8 +69,11 @@ export function summarise(c: Context, t: Report["tables"]): Record<string, unkno
       feesWei: sum(buys, "fee_wei"),
       medianFeePerBuyWei: median(buys, "fee_wei"),
       batchesEarnedWei: sum(batches, "earned_wei"),
+      // v1's sweeps alone: v2's batcher has none, and its batches leave the column empty rather than 0.
       sweptWei: sum(batches, "swept_wei"),
       byRewardTo: groupSum(batches.filter((b) => b["reward_to"] !== null), "reward_to", "earned_wei", "earned_wei"),
+      // Every buy's fee by whom it paid, batched or not: a v2 vault pays its `rewardTo` directly, the owner's own trigger included.
+      feesByRewardTo: groupSum(buys.filter((b) => b["reward_to"] !== null), "reward_to", "fee_wei", "fee_wei"),
       oursEarnedWei: sum(ours, "earned_wei"),
     }),
     q5: q("Gas per batch and per buy; revenue against cost", {
@@ -83,7 +95,12 @@ export function summarise(c: Context, t: Report["tables"]): Record<string, unkno
       medianExecVsFairBps: median(buys, "exec_vs_fair_bps"),
       worstExecVsFairBps: min(buys, "exec_vs_fair_bps"),
     }),
-    q8: q("Every elapsed window, classified", { windows: windows.length, byClass, boughtBy: countBy(windows.filter((w) => w["class"] === "bought"), "by") }),
+    q8: q("Every elapsed window, classified", {
+      windows: windows.length,
+      byClass,
+      boughtBy: countBy(windows.filter((w) => w["class"] === "bought"), "by"),
+      boughtByMadeBy: countBy(windows.filter((w) => w["class"] === "bought"), "made_by"),
+    }),
     q9: q("Time into the window when bought; delay after due", {
       medianSecondsIntoWindow: median(buys, "seconds_into_window"),
       medianSecondsAfterDue: median(buys, "seconds_after_due"),
@@ -104,6 +121,10 @@ export function summarise(c: Context, t: Report["tables"]): Record<string, unkno
       uptimePct: span === null ? null : c.uptime(span[0], span[1]),
       errors: logCount("error"),
       attention: hasLogs ? attentionCounts(records) : null,
+      // Days of sends the key's ether covered at the last heartbeat, and how often it fell below the operator's threshold.
+      lastRunwayDays: typeof lastRunway === "number" ? lastRunway : null,
+      lowRunwayWarnings: logCount("low_runway"),
+      proves: logCount("prove_sent"),
     }),
     q12: q("Inclusion, resends, drops and cancels; private against public", {
       sent: logCount("batch_sent"),
@@ -122,6 +143,7 @@ export function summarise(c: Context, t: Report["tables"]): Record<string, unkno
     }),
     q14: q("Who triggers", {
       byTrigger: countBy(buys, "trigger"),
+      byMadeBy: countBy(buys, "made_by"),
       callers: groupCount(batches.filter((b) => b["caller"] !== null), "caller"),
       rewardTos: groupCount(batches.filter((b) => b["reward_to"] !== null), "reward_to"),
     }),
@@ -137,7 +159,9 @@ export function summarise(c: Context, t: Report["tables"]): Record<string, unkno
       refusedForDepth,
     }),
     q18: q("Is the data complete?", {
-      complete: input.uncovered.length === 0 && gaps.length === 0 && mismatched.length === 0 && unjoined.length === 0,
+      complete: input.uncovered.length === 0 && gaps.length === 0 && mismatched.length === 0 && unjoined.length === 0 && window.unknownBuys === 0,
+      // v2 buys q21 can't tell in or out of its count: their window, owner or time unknown.
+      communityWindowUnknownBuys: window.unknownBuys,
       buyNumberGaps: gaps.map((v) => ({ vault: v["vault"], gaps: v["buy_number_gaps"] })),
       batchesWhoseEarnedDisagrees: mismatched.map((b) => b["tx_hash"]),
       batchesNotJoined: unjoined.map((b) => b["tx_hash"]),
@@ -152,8 +176,97 @@ export function summarise(c: Context, t: Report["tables"]): Record<string, unkno
       transfers: t.tips ? t.tips.length : null,
       byToken: t.tips ? groupSum(t.tips, "token", "amount", "amount") : null,
     }),
+    q21: q("How concentrated are v2's community window buys? The top 1 and top 5 rewardTo's share over a rolling 30 days (decision 29)", {
+      from: isoOf(covers30Days ? concentrationFrom : fromTime),
+      to: isoOf(toTime),
+      covers30Days,
+      ...window,
+      // Top 1 above half for a rolling 30 days formally reopens turns among holders (decision 6). Shorter ranges can't say.
+      reopensDecision6: covers30Days && window.top1Above50 !== null ? window.top1Above50 : null,
+    }),
   };
 }
+
+// ─── The community window's concentration ─────────────────────────────────────
+
+/** Decision 29's period: a rolling 30 days. */
+export const CONCENTRATION_SECONDS = 30n * 86_400n;
+
+/**
+ * How concentrated the buys made inside community windows were over
+ * `[from, to]`, by the `rewardTo` they paid: the buys decision 29 counts are
+ * buys of a release whose source has a community window (`deployments` says
+ * which source each release is), made inside their window and paid to someone
+ * other than the vault's owner — community keepers', this operator's own and
+ * the developers' among them, alike. Every share is null when there were none:
+ * unknown, not 0%. Ties fall to the lower address, so the same buys always
+ * give the same top.
+ *
+ * Such a buy that may be one of them but can't be told — its window unknown
+ * (the vault's terms or the block's time unread), its owner unknown while it
+ * was inside its window, or its time unknown, so not placed in or out of the
+ * period — is counted in `unknownBuys`, never left out: while any is, the
+ * counts are lower bounds and every share and `top1Above50` is null, since a
+ * share of a subset is a share of nothing decision 29 names.
+ */
+export function concentration(
+  buys: readonly Row[],
+  from: bigint,
+  to: bigint,
+  deployments: readonly Pick<Deployment, "id" | "source">[],
+): {
+  windowBuys: number;
+  unknownBuys: number;
+  rewardTos: number;
+  top1: { rewardTo: string; buys: number; sharePct: string | null } | null;
+  top5: { rewardTos: string[]; buys: number; sharePct: string | null } | null;
+  top1Above50: boolean | null;
+} {
+  const windowed = new Set(deployments.filter((d) => SOURCES[d.source]?.features.communityWindow).map((d) => d.id as string));
+  const counts = new Map<string, number>();
+  let unknownBuys = 0;
+  for (const row of buys) {
+    if (!windowed.has(String(row["release"])) || row["in_community_window"] === false) continue;
+    const at = secondsOf(row["time"]);
+    if (at !== null && (at < from || at > to)) continue;
+    const inWindow = row["in_community_window"] === true;
+    if (at === null || !inWindow || row["reward_to"] === null || row["owner"] === null) {
+      unknownBuys += 1;
+      continue;
+    }
+    if (row["reward_to"] === row["owner"]) continue;
+    counts.set(String(row["reward_to"]), (counts.get(String(row["reward_to"])) ?? 0) + 1);
+  }
+  const ranked = [...counts.entries()].sort(([a, x], [b, y]) => y - x || cmp(a, b));
+  const total = ranked.reduce((n, [, k]) => n + k, 0);
+  if (total === 0) return { windowBuys: 0, unknownBuys, rewardTos: 0, top1: null, top5: null, top1Above50: null };
+  const top5 = ranked.slice(0, 5);
+  const top5Buys = top5.reduce((n, [, k]) => n + k, 0);
+  const known = unknownBuys === 0;
+  return {
+    windowBuys: total,
+    unknownBuys,
+    rewardTos: ranked.length,
+    top1: { rewardTo: ranked[0]![0], buys: ranked[0]![1], sharePct: known ? shareText(ranked[0]![1], total) : null },
+    top5: { rewardTos: top5.map(([a]) => a), buys: top5Buys, sharePct: known ? shareText(top5Buys, total) : null },
+    top1Above50: known ? ranked[0]![1] * 2 > total : null,
+  };
+}
+
+/** `part` of `whole` as a percentage to a tenth, rounded down: 2 of 3 → "66.6". */
+function shareText(part: number, whole: number): string {
+  const permille = (BigInt(part) * 1000n) / BigInt(whole);
+  return `${permille / 10n}.${permille % 10n}`;
+}
+
+/** An ISO time cell back as chain seconds; null for anything else. */
+function secondsOf(cell: Cell | undefined): bigint | null {
+  if (typeof cell !== "string") return null;
+  const ms = Date.parse(cell);
+  return Number.isFinite(ms) ? BigInt(Math.floor(ms / 1000)) : null;
+}
+
+const isoOf = (seconds: bigint): string => new Date(Number(seconds) * 1000).toISOString().replace(/\.000Z$/, "Z");
 
 function balancesAnswer(c: Context): Record<string, unknown> {
   let deposits = 0n;

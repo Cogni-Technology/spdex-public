@@ -37,7 +37,16 @@ one of these to bend needs a different design.
 `docs/WRITING-MODULES.md`, and the conformance kit in `packages/module-sdk`.
 
 **Copy is part of the product.** Short, plain sentences; say "buy" or "swap",
-never "trade"; a figure spDEX doesn't know is "unknown", never 0.
+never "trade"; a figure spDEX doesn't know is "unknown", never 0. Community
+keeping is paid work: "Community keepers make other people's buys and are
+paid for each one; holding 690 SPX is the entry bar." Never an APR, APY,
+yield or projected earnings; only what was earned, after the fact.
+
+**The contracts are frozen once deployed.** `packages/vault/releases/v1` is
+the source v1 was deployed from and is never edited; a change under
+`packages/vault/contracts` is a new release at new addresses (`AGENTS.md`,
+rule 6), and a timing edge that needs the clock moved is tested in forge,
+never on the shared fork.
 
 ## Licence
 

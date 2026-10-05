@@ -1,13 +1,16 @@
-# Foundry project for spDEX's three contracts: the auto-buy vault, its factory,
-# and the batcher that triggers many vaults' buys in one transaction.
+# Foundry project for spDEX's contracts: the auto-buy vault, its factory, the
+# batcher that triggers many vaults' buys in one transaction and, from v2, the
+# SPX holder registry a vault asks inside its community window. The default
+# profile builds the current release (v2, `contracts/`); the `v1` profile at the
+# end builds the frozen source of the release already on mainnet.
 #
 # The settings below are chosen so that a build is byte-identical on any
-# machine, because the factory's and the batcher's addresses are pure functions
-# of their bytecode (each is deployed through the deterministic deployer with a
-# fixed salt) and the app and the keeper ship the addresses they expect. Anyone
-# can rebuild from this source and check those addresses;
-# `pnpm --filter @spdex/vault check:artifacts` does exactly that against the
-# committed src/artifacts.ts and deployments.json.
+# machine, because the registry's, the factory's and the batcher's addresses are
+# pure functions of their bytecode (each is deployed through the deterministic
+# deployer with a fixed salt) and the app and the keeper ship the addresses they
+# expect. Anyone can rebuild from this source and check those addresses;
+# `pnpm --filter @spdex/vault check:artifacts` does exactly that, for both
+# releases, against the committed src/artifacts.ts and deployments.json.
 
 [profile.default]
 src = "contracts"
@@ -36,8 +39,9 @@ cbor_metadata = false
 
 # The fork tests read SPDEX_FORK_RPC_URL (an archive endpoint) from the
 # environment and fork mainnet at the pinned block themselves. They never touch
-# the shared local fork on :8545.
-fs_permissions = []
+# the shared local fork on :8545. The one thing they read from disk is the
+# registry's recorded mainnet proofs (test/fixtures/proofs), read-only.
+fs_permissions = [{ access = "read", path = "./test/fixtures" }]
 
 # Every test runs as one transaction, and the gas tests measure a call's own
 # gas, as the batcher's call to a vault spends it: EXECUTE_GAS, BATCH_FIXED_GAS
@@ -55,5 +59,29 @@ isolate = false
 # the price floor is a ten-minute average that a few seconds cannot shift.
 exclude_lints = ["block-timestamp"]
 # Lint what ships. The tests move tokens they minted a line earlier and cast
-# values they just computed; annotating each would be noise, not safety.
-ignore = ["test/**/*.sol"]
+# values they just computed; annotating each would be noise, not safety. The
+# vendored trie verifier is linted where it is maintained, and v1's frozen
+# source is what was deployed: neither is edited here.
+ignore = ["test/**/*.sol", "contracts/vendor/**/*.sol", "releases/**/*.sol"]
+
+# v1, the release already on mainnet, frozen: releases/v1/contracts is a
+# verbatim copy of the source v1's factory and batcher were deployed from, kept
+# so that anyone can rebuild them and check their addresses, and so the app and
+# the keeper go on shipping v1's ABIs and creation code. Same compiler and
+# settings as above (a profile inherits nothing, so each is repeated);
+# build-artifacts.mjs refuses a v1 build whose addresses are not the ones
+# deployments.json records. It has no tests of its own: v1 was tested before it
+# was deployed, and its source never changes again.
+[profile.v1]
+src = "releases/v1/contracts"
+test = "releases/v1/contracts"
+out = "out-v1"
+cache_path = "cache-v1"
+libs = []
+solc_version = "0.8.33"
+auto_detect_solc = false
+optimizer = true
+optimizer_runs = 200
+evm_version = "cancun"
+bytecode_hash = "none"
+cbor_metadata = false

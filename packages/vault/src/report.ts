@@ -32,16 +32,32 @@
  * - **Complete, or says where not.** Every vault's `buyNumber` must run
  *   without gaps and every batch's `earned` must equal the fees of the buys it
  *   triggered; block ranges the endpoint would not serve are listed.
+ *
+ * ## Every release
+ *
+ * Every release's vaults, factories and batchers are read side by side, each
+ * event by its own source's layout (`decodeVaultEvent`, `decodeBatcherEvent`),
+ * and judged by what that source can do (`SOURCES[source].features`), never
+ * by a release's name. A buy from a source that pays `rewardTo` says who it
+ * paid and when it fell due, so each buy is put down to who made it
+ * (`made_by`): this keeper, another community keeper inside the vault's
+ * community window, its owner, someone who paid the fee back to the owner,
+ * anyone after the window, or — v1 — whoever called. And the summary
+ * publishes how concentrated the community windows' buys are: the share won
+ * by the top one and top five `rewardTo` over a rolling 30 days, the figure
+ * decision 29 reopens turns among holders by (docs/V2_UPGRADE.md). The
+ * developers' own keeper counts like anyone's; there is no list here of whose
+ * keeper is whose.
  */
 
 import type { Address, Hex } from "@spdex/core";
 import { TOPICS } from "@spdex/chain";
-import type { Deployment } from "./artifacts.js";
+import { SOURCES, type Deployment } from "./artifacts.js";
 import { joinBatchLogs, type BatchRun, type BatcherEvent } from "./batcher.js";
 import { feeShareBps } from "./fee.js";
-import { decodeVaultEvent, type VaultEvent, type VaultTerms } from "./index.js";
+import { buyMaker, decodeVaultEvent, type VaultEvent, type VaultRelease, type VaultTerms } from "./index.js";
 import { earliestBuyAt, percentile } from "./keeper-plan.js";
-import { big, median, stringField, sum, sumKnown, summarise, usdOfProduct } from "./report-summary.js";
+import { CONCENTRATION_SECONDS, big, concentration, median, stringField, sum, sumKnown, summarise, usdOfProduct } from "./report-summary.js";
 
 // ─── Inputs ───────────────────────────────────────────────────────────────────
 
@@ -83,6 +99,12 @@ export interface VaultAtEnd {
   closed: boolean | null;
   /** Its WETH, wei. */
   balance: bigint | null;
+  /**
+   * v2's count of its buys made inside their community window by someone
+   * other than its owner, at the last block; null for v1, which has no such
+   * count (its `windowBuys()` does not exist), and where the read failed.
+   */
+  windowBuys: bigint | null;
 }
 
 /** One ETH/USD reading: when it was made, and the answer with Chainlink's 8 decimals. */
@@ -108,6 +130,12 @@ export interface KeeperRecord {
 export interface ReportInput {
   chainId: number;
   deployments: readonly Deployment[];
+  /**
+   * Batchers read beside the releases' own (`Deployment.batcher`): every shared
+   * batcher deployments.json lists, older ones included, whose logs the range
+   * may hold. Absent: the releases' own alone.
+   */
+  batchers?: readonly Address[];
   range: { fromBlock: bigint; toBlock: bigint; fromTime: bigint; toTime: bigint; fromHash: Hex; toHash: Hex };
   /** Every vault a listed factory vouches for (its list, and `VaultCreated` in range). */
   vaults: readonly VaultAtEnd[];
@@ -140,37 +168,43 @@ export type Row = Record<string, Cell>;
 
 /** Every table and its columns, in order. */
 export const REPORT_COLUMNS = {
+  // v2's columns are appended at each table's end, so a reader that takes columns by position still finds v1's.
   vaults: [
     "deployment", "vault", "owner", "list_index", "created_block", "created_at", "market_index", "amount_per_buy_wei",
     "interval_s", "max_buys", "start_at", "fee_wei", "fee_bps", "max_slippage_bps", "funded_at_creation_wei",
     "funded_later_wei", "buys_done", "windows_elapsed", "windows_missed_funded", "windows_missed_unfunded",
     "buy_number_gaps", "closed", "closed_at", "closed_amount_wei", "total_out", "subsidy_wei", "trapped", "not_vouched",
+    "release", "community_window_s", "window_buys", "turn_buckets",
   ],
   buys: [
     "tx_hash", "log_index", "block", "time", "vault", "owner", "slot", "buy_number", "window_start",
     "seconds_into_window", "seconds_after_due", "amount_in_wei", "amount_out", "floor_out", "fair_out",
     "exec_vs_floor_bps", "exec_vs_fair_bps", "oracle_depth_wei", "fee_wei", "fee_bps", "subsidy_wei", "trigger", "via_batcher",
     "batch_caller", "reward_to", "vault_gas_used", "eth_usd",
+    "release", "due_since", "community_window_ends_at", "in_community_window", "made_by",
   ],
   batches: [
     "tx_hash", "batch_id", "status", "nonce", "block", "time", "endpoint", "caller", "reward_to", "listed", "tried",
     "bought", "refused", "not_tried", "earned_wei", "swept_wei", "earned_matches_rewards", "gas_used",
     "effective_gas_price", "priority_fee_wei", "base_fee", "cost_wei", "net_wei", "net_usd", "expected_gas",
     "expected_cost_wei", "keeper_reason", "urgent", "inclusion_blocks", "attempts", "eth_usd",
+    "release",
   ],
   refusals: ["source", "tx_hash", "block", "time", "vault", "reason", "reason_name", "gas_used"],
-  windows: ["vault", "slot", "window_start", "window_end", "class", "by", "last_skip"],
+  windows: ["vault", "slot", "window_start", "window_end", "class", "by", "last_skip", "made_by"],
   owners: ["owner", "vaults", "buys", "volume_wei", "fees_wei", "subsidy_wei"],
   daily: [
     "date", "buys", "active_vaults", "owners", "volume_wei", "volume_usd", "fees_wei", "batches", "gas_cost_wei",
     "net_wei", "subsidy_wei", "vaults_created", "vaults_closed", "deposits_wei", "withdrawals_wei",
     "windows_missed_funded", "windows_missed_unfunded", "median_seconds_into_window", "median_exec_vs_fair_bps",
     "median_oracle_depth_wei", "keeper_uptime_pct", "eth_usd",
+    "community_window_buys", "window_top1_share_30d_pct",
   ],
   keeper: [
     "date", "heartbeats", "uptime_pct", "errors", "waits_not_cheap", "sends_cheap", "sends_deadline",
     "sends_short_interval", "resends", "resends_blocked", "abandoned", "cancels", "median_inclusion_blocks",
     "model_gas_ratio",
+    "sends_window", "proves", "runway_days", "low_runway_warnings",
   ],
   tips: ["tx_hash", "block", "time", "token", "from", "to", "amount"],
 } as const;
@@ -182,6 +216,9 @@ export interface Report {
   tables: Partial<Record<ReportTable, Row[]>> & Omit<Record<ReportTable, Row[]>, "tips">;
   summary: Record<string, unknown>;
 }
+
+/** The version of `summary.json`'s shape: 2 since v2's community window (`made_by`, q21, `swept` null for v2). */
+export const REPORT_SUMMARY_VERSION = 2;
 
 /** What the report cannot say, on purpose: rule 4 keeps the app from recording it. */
 export const UNKNOWABLE = [
@@ -197,6 +234,14 @@ export const UNKNOWABLE = [
 export type WindowClass = "bought" | "closed" | "unfunded" | "keeper-skipped" | "keeper-down" | "unknown";
 /** Who made a buy: its owner, the operator's own batch, someone else's batch, or anyone else. */
 export type Trigger = "owner" | "our-batch" | "batch" | "other";
+/**
+ * Who made a buy, by who was paid for it (`buyMaker`): this operator's own
+ * keeper, whatever the release and whenever; else, for v2, another community
+ * keeper inside the vault's community window, its owner, someone else paying
+ * the fee back to the owner, or anyone after the window; for v1, whoever
+ * called ("caller").
+ */
+export type MadeBy = "this-keeper" | "community" | "owner" | "returned" | "open" | "caller";
 
 // ─── Keeper logs ──────────────────────────────────────────────────────────────
 
@@ -415,7 +460,7 @@ export function buildReport(input: ReportInput): Report {
   };
   const { range } = input;
   const summary = {
-    v: 1,
+    v: REPORT_SUMMARY_VERSION,
     provenance: {
       chainId: input.chainId,
       fromBlock: range.fromBlock,
@@ -424,7 +469,7 @@ export function buildReport(input: ReportInput): Report {
       toHash: range.toHash,
       fromTime: iso(range.fromTime),
       toTime: iso(range.toTime),
-      deployments: input.deployments.map((d) => ({ id: d.id, factory: lower(d.factory), batcher: lower(d.batcher) })),
+      deployments: input.deployments.map((d) => ({ id: d.id, factory: lower(d.factory), batcher: lower(d.batcher), registry: d.registry === null ? null : lower(d.registry) })),
       vaultFilter: input.selected === null ? null : [...input.selected].map(lower).sort(),
       ...input.provenance,
       uncovered: input.uncovered,
@@ -444,7 +489,7 @@ function context(input: ReportInput) {
   const blocks = new Map(input.blocks.map((b) => [b.number, b]));
   const receipts = new Map(input.receipts.map((r) => [r.transactionHash.toLowerCase() as Hex, r]));
   const factories = new Set(input.deployments.map((d) => lower(d.factory)));
-  const batchers = new Map(input.deployments.map((d) => [lower(d.batcher), d.id]));
+  const batchers = new Set([...input.deployments.map((d) => lower(d.batcher)), ...(input.batchers ?? []).map(lower)]);
   const selected = input.selected === null ? null : new Set(input.selected.map(lower));
   const isSelected = (vault: Address) => selected === null || selected.has(vault);
 
@@ -518,7 +563,8 @@ function context(input: ReportInput) {
     runs,
     runByTx,
     buys: allBuys,
-    ours,
+    ours: ours.run,
+    oursBuy: ours.buy,
     keeperLog,
     hasLogs: records.length > 0,
     dates,
@@ -533,7 +579,12 @@ function context(input: ReportInput) {
   };
 }
 
-/** The operator's own batches: sent by a keeper whose logs these are, or paid to a reward address it names. */
+/**
+ * The operator's own batches: sent by a keeper whose logs these are, or paid
+ * to a reward address it names. And its own buys: in such a batch; or, sent
+ * some other way, called by its keeper, or — a buy whose source pays
+ * `rewardTo`, which says whom it paid — paid to its reward address.
+ */
 function oursOf(input: ReportInput, records: readonly KeeperRecord[]) {
   const callers = new Set<Address>();
   const rewardTos = new Set<Address>(input.rewardTo.map(lower));
@@ -543,7 +594,12 @@ function oursOf(input: ReportInput, records: readonly KeeperRecord[]) {
     if (r.type === "start" && typeof r["rewardTo"] === "string") rewardTos.add(lower(r["rewardTo"]));
     if (r.type === "batch_mined" || r.type === "batch_sent") hashes.add(String(r["hash"]));
   }
-  return (run: Run) => callers.has(run.batch.caller) || rewardTos.has(run.batch.rewardTo) || hashes.has(run.tx);
+  const run = (r: Run) => callers.has(r.batch.caller) || rewardTos.has(r.batch.rewardTo) || hashes.has(r.tx);
+  const buy = (b: Buy) =>
+    b.run
+      ? run(b.run)
+      : hashes.has(b.tx) || callers.has(b.event.keeper) || (SOURCES[b.event.source].features.executeTakesRewardTo && rewardTos.has(b.event.rewardTo));
+  return { run, buy };
 }
 
 /**
@@ -678,6 +734,26 @@ function triggerOf(c: Context, buy: Buy, owner: Address | null): Trigger {
   return "other";
 }
 
+/**
+ * Who made a buy (`MadeBy`): the operator's own keeper first, whoever it paid
+ * and whenever; otherwise `buyMaker`'s answer, with the transaction's sender
+ * where its receipt was read (every batch's is). Null when that cannot say.
+ */
+function madeByOf(c: Context, buy: Buy, t: Timeline): MadeBy | null {
+  if (c.oursBuy(buy)) return "this-keeper";
+  const e = buy.event;
+  return buyMaker({
+    source: e.source,
+    owner: t.owner,
+    rewardTo: e.rewardTo,
+    keeper: e.keeper,
+    sender: c.receipts.get(buy.tx)?.from ?? null,
+    at: c.timeOf(buy.block),
+    dueSince: e.dueSince,
+    communityWindow: t.terms?.communityWindow ?? null,
+  });
+}
+
 /** The planned subsidy a buy's batch carried for it, from the keeper's `batch_sent`; null without keeper logs. */
 function subsidyOf(c: Context, buy: Buy): bigint | null {
   if (!c.hasLogs) return null;
@@ -702,6 +778,8 @@ function buyRows(c: Context): Row[] {
       const due = !terms ? null : e.buyNumber === 1n ? firstDue(c, t, terms.startAt) : previousAt === null ? null : earliestBuyAt(terms, e.buyNumber - 1n, previousAt);
       const fair = terms ? fairOut(e.floorOut, terms.maxSlippageBps) : null;
       const price = c.priceAt(buy.block);
+      // When its community window ended, for a v2 buy: the first second anyone else could be paid for it.
+      const communityEnds = e.dueSince !== null && terms && terms.communityWindow !== null ? e.dueSince + terms.communityWindow : null;
       rows.push({
         tx_hash: buy.tx,
         log_index: buy.logIndex,
@@ -727,9 +805,15 @@ function buyRows(c: Context): Row[] {
         trigger: triggerOf(c, buy, t.owner),
         via_batcher: c.batchers.has(e.keeper) ? e.keeper : null,
         batch_caller: buy.run?.batch.caller ?? null,
-        reward_to: buy.run?.batch.rewardTo ?? null,
+        // A `Bought` that pays `rewardTo` names whom it paid, however it was sent; v1's only its caller, the batcher in a batch.
+        reward_to: SOURCES[e.source].features.executeTakesRewardTo ? e.rewardTo : (buy.run?.batch.rewardTo ?? null),
         vault_gas_used: buy.triggered?.gasUsed ?? null,
         eth_usd: price === null ? null : priceText(price),
+        release: releaseOfId(c.input.deployments, t.at.deployment),
+        due_since: e.dueSince,
+        community_window_ends_at: communityEnds,
+        in_community_window: time !== null && communityEnds !== null ? time < communityEnds : null,
+        made_by: madeByOf(c, buy, t),
       });
     }
   }
@@ -761,7 +845,9 @@ function batchRows(c: Context): Row[] {
   const rows: Row[] = [];
   for (const run of c.runs) {
     const touched = [...run.triggered.map((t) => t.event.vault), ...run.notTriggered.map((e) => e.vault)];
-    if (!touched.some(c.isSelected)) continue;
+    // A batcher bound to no factory calls whatever its caller lists: a batch counts here only when it touched a vault a
+    // listed factory vouches for.
+    if (!touched.some((vault) => c.timelines.has(vault) && c.isSelected(vault))) continue;
     const receipt = c.receipts.get(run.tx) ?? null;
     const block = c.blocks.get(run.block) ?? null;
     const cost = receipt ? receipt.gasUsed * receipt.effectiveGasPrice : null;
@@ -780,7 +866,8 @@ function batchRows(c: Context): Row[] {
       refused: run.notTriggered.length,
       not_tried: run.batch.listed - run.batch.tried,
       earned_wei: run.batch.earned,
-      swept_wei: run.batch.swept,
+      // v1's batcher swept stray WETH; one bound to no factory holds and moves none, so it has no figure here at all.
+      swept_wei: SOURCES[run.batch.source].features.sharedBatcher ? null : run.batch.swept,
       earned_matches_rewards: joined ? run.buys.reduce((sum, b) => sum + b.event.reward, 0n) === run.batch.earned : null,
       gas_used: receipt?.gasUsed ?? null,
       effective_gas_price: receipt?.effectiveGasPrice ?? null,
@@ -789,6 +876,7 @@ function batchRows(c: Context): Row[] {
       cost_wei: cost,
       net_wei: cost === null ? null : run.batch.earned - cost,
       ...keeperSide(c, run.tx),
+      release: releaseOfRun(c, run),
     });
   }
   // A public batch that reverted left no events: the keeper's own log is the only record of it.
@@ -801,6 +889,8 @@ function batchRows(c: Context): Row[] {
     const blockNumber = big(mined["block"]);
     const block = blockNumber === null ? null : (c.blocks.get(blockNumber) ?? null);
     const cost = big(mined["costWei"]);
+    const release = releaseOfId(c.input.deployments, stringField(sent?.["deployment"]));
+    const releaseSource = c.input.deployments.find((d) => d.id === release)?.source ?? null;
     rows.push({
       tx_hash: hash,
       status: "reverted",
@@ -814,7 +904,7 @@ function batchRows(c: Context): Row[] {
       refused: null,
       not_tried: null,
       earned_wei: 0n,
-      swept_wei: 0n,
+      swept_wei: releaseSource !== null && !SOURCES[releaseSource].features.sharedBatcher ? 0n : null,
       earned_matches_rewards: null,
       gas_used: big(mined["gasUsed"]),
       effective_gas_price: big(mined["effectiveGasPrice"]),
@@ -823,6 +913,7 @@ function batchRows(c: Context): Row[] {
       cost_wei: cost,
       net_wei: cost === null ? null : -cost,
       ...keeperSide(c, hash),
+      release,
     });
   }
   // Dollars at the day's price; then the columns in order.
@@ -934,12 +1025,12 @@ function windowRows(c: Context): Row[] {
       if (finishedAt !== null && start > finishedAt) break;
       const buy = bySlot.get(slot);
       if (buy) {
-        rows.push({ vault, slot, window_start: start, window_end: end, class: "bought", by: triggerOf(c, buy, t.owner), last_skip: null });
+        rows.push({ vault, slot, window_start: start, window_end: end, class: "bought", by: triggerOf(c, buy, t.owner), last_skip: null, made_by: madeByOf(c, buy, t) });
         continue;
       }
       if (end > toTime) break;
       const judged = missedClass(c, vault, t, slot, start, end, closedAt);
-      rows.push({ vault, slot, window_start: start, window_end: end, class: judged.cls, by: null, last_skip: judged.lastSkip });
+      rows.push({ vault, slot, window_start: start, window_end: end, class: judged.cls, by: null, last_skip: judged.lastSkip, made_by: null });
       if (judged.cls === "closed") break;
     }
   }
@@ -994,7 +1085,7 @@ function vaultRows(c: Context, windows: readonly Row[]): Row[] {
   const rows: Row[] = [];
   const trapped = c.input.state ? new Set(c.input.state.trapped.map(lower)) : null;
   const notVouched = c.input.state ? new Set(c.input.state.notVouched.map(lower)) : null;
-  const order = new Map(c.input.deployments.map((d, i) => [d.id, i]));
+  const order = new Map<string, number>(c.input.deployments.map((d, i) => [d.id, i]));
   for (const [vault, t] of c.timelines) {
     if (!c.isSelected(vault)) continue;
     const terms = t.terms;
@@ -1029,6 +1120,10 @@ function vaultRows(c: Context, windows: readonly Row[]): Row[] {
       subsidy_wei: c.hasLogs ? t.buys.reduce((sum, b) => sum + (subsidyOf(c, b) ?? 0n), 0n) : null,
       trapped: trapped === null ? null : trapped.has(vault),
       not_vouched: notVouched === null ? null : notVouched.has(vault),
+      release: releaseOfId(c.input.deployments, t.at.deployment),
+      community_window_s: terms?.communityWindow ?? null,
+      window_buys: t.at.windowBuys,
+      turn_buckets: terms?.turnBuckets ?? null,
     });
   }
   return rows.sort(
@@ -1081,6 +1176,7 @@ function ownerRows(c: Context): Row[] {
 
 function dailyRows(c: Context, t: { buys: Row[]; batches: Row[]; windows: Row[]; keeper: Row[] }): Row[] {
   const uptime = new Map(t.keeper.map((k) => [String(k["date"]), k["uptime_pct"] ?? null]));
+  const { fromTime, toTime } = c.input.range;
   return c.dates.map((date) => {
     const buys = t.buys.filter((b) => dateOfIso(b["time"]) === date);
     const batches = t.batches.filter((b) => dateOfIso(b["time"]) === date);
@@ -1101,6 +1197,10 @@ function dailyRows(c: Context, t: { buys: Row[]; batches: Row[]; windows: Row[];
     const volume = sum(buys, "amount_in_wei");
     const price = c.priceOn(date);
     const subsidies = c.hasLogs ? c.buys.filter((b) => c.isSelected(b.vault) && dateAt(c, b.block) === date).map((b) => subsidyOf(c, b) ?? 0n) : null;
+    // The 30 days ending with this day (or the report): a figure only when the range reaches back that far, so that
+    // 30 days in a row of a top share above half (decision 29) can be read straight off the table.
+    const dayEnd = dayStart(date) + DAY - 1n < toTime ? dayStart(date) + DAY - 1n : toTime;
+    const rolling = dayEnd - CONCENTRATION_SECONDS >= fromTime ? concentration(t.buys, dayEnd - CONCENTRATION_SECONDS, dayEnd, c.input.deployments) : null;
     return {
       date,
       buys: buys.length,
@@ -1124,6 +1224,8 @@ function dailyRows(c: Context, t: { buys: Row[]; batches: Row[]; windows: Row[];
       median_oracle_depth_wei: median(buys, "oracle_depth_wei"),
       keeper_uptime_pct: uptime.get(date) ?? null,
       eth_usd: price === null ? null : priceText(price),
+      community_window_buys: windowBuysOf(concentration(buys, dayStart(date), dayEnd, c.input.deployments)),
+      window_top1_share_30d_pct: rolling?.top1?.sharePct ?? null,
     };
   });
 }
@@ -1147,6 +1249,8 @@ function keeperRows(c: Context): Row[] {
       return expected && used !== null && m["status"] === "success" ? [(used * 1000n) / expected] : [];
     });
     const ratio = percentile(ratios, 50);
+    // The day's last heartbeat's runway: what the key's ether covered as the day ended.
+    const runway = on.filter((r) => r.type === "heartbeat" && typeof r["runwayDays"] === "number").at(-1)?.["runwayDays"];
     return {
       date,
       heartbeats: count("heartbeat"),
@@ -1162,6 +1266,10 @@ function keeperRows(c: Context): Row[] {
       cancels: count("batch_cancel_sent"),
       median_inclusion_blocks: percentile(mined.map((m) => big(m["inclusionBlocks"])).filter((v): v is bigint => v !== null), 50),
       model_gas_ratio: ratio === null ? null : thousandths(ratio),
+      sends_window: count("batch_sent", "reason", "window"),
+      proves: count("prove_sent"),
+      runway_days: typeof runway === "number" ? runway : null,
+      low_runway_warnings: count("low_runway"),
     };
   });
 }
@@ -1187,6 +1295,21 @@ function tipRows(c: Context): Row[] {
 
 const lower = (a: string): Address => a.toLowerCase() as Address;
 const cmp = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
+/** A day's community window buys: null while any v2 buy of the day can't be told in or out, never a smaller count. */
+const windowBuysOf = (c: ReturnType<typeof concentration>): number | null => (c.unknownBuys > 0 ? null : c.windowBuys);
+/** A `DEPLOYMENTS` id, as a log names it, as one of the report's releases; null for none, and for an id no release has: unknown, never a guess. */
+const releaseOfId = (deployments: readonly Deployment[], id: string | null): VaultRelease | null => deployments.find((d) => d.id === id)?.id ?? null;
+
+/**
+ * The release whose vaults a batch triggered or tried: one batcher serves
+ * every release from v2 on, so a batch says it only through its vaults. Null
+ * when they belong to more than one release, or none is known.
+ */
+function releaseOfRun(c: Context, run: Run): VaultRelease | null {
+  const vaults = [...run.triggered.map((x) => x.event.vault), ...run.notTriggered.map((x) => x.vault)];
+  const ids = new Set(vaults.map((vault) => c.timelines.get(vault)?.at.deployment ?? null));
+  return ids.size === 1 ? releaseOfId(c.input.deployments, [...ids][0]!) : null;
+}
 /** Smaller first; an unknown (null) after every known value. */
 const cmpBig = (a: bigint | null, b: bigint | null): number => (a === b ? 0 : a === null ? 1 : b === null ? -1 : a < b ? -1 : 1);
 const positive = (v: bigint): bigint => (v > 0n ? v : 0n);

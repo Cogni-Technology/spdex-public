@@ -16,16 +16,16 @@ abstract contract VaultLimits {
     uint256 public constant MAX_FUNDING = 0.5 ether;
     /// The shortest interval, matching the app's own recurring buys.
     uint256 public constant MIN_INTERVAL = 300;
-    /// The longest interval. Bounded so that every window's start fits comfortably in
+    /// The longest interval. Bounded so that every slot's start fits comfortably in
     /// 256 bits and the views can never overflow.
     uint256 public constant MAX_INTERVAL = 366 days;
     /// The loosest price floor a plan may choose: paying 5% more than the oracle's price.
     uint256 public constant MAX_SLIPPAGE_BPS = 500;
     /// A keeper's reward may be at most 0.69% of one buy, the network cost of making the buy
     /// included. It is the whole of what a buy pays anyone for being made, so nobody who
-    /// triggers buys, spDEX's developers included, can ever be paid more than that by a
-    /// vault from this factory. A buy too small for 0.69% of it to cover its gas is one a
-    /// keeper makes at its own cost, or not at all.
+    /// triggers buys, or is named to be paid for one, spDEX's developers included, can ever
+    /// be paid more than that by a vault from this factory. A buy too small for 0.69% of it
+    /// to cover its gas is one a keeper makes at its own cost, or not at all.
     uint256 public constant MAX_REWARD_BPS = 69;
     /// The averaging window of the price floor, in seconds.
     uint256 public constant TWAP_WINDOW = 600;
@@ -45,4 +45,21 @@ abstract contract VaultLimits {
     /// How far from now `startAt` may be, either way. A start years out is a typo, and a
     /// start years back is one too.
     uint256 public constant MAX_START_DRIFT = 366 days;
+    /// The shortest community window a plan may have: a minute, five of mainnet's 12-second
+    /// slots. Every plan has one (a window of zero is not allowed), and one shorter than this
+    /// would give holders first claim in name only: a keeper that saw the buy fall due in one
+    /// block could not count on landing it before the window closed.
+    uint256 public constant MIN_COMMUNITY_WINDOW = 60;
+    /// The longest community window: an hour. The factory also holds a window to a quarter
+    /// of its plan's interval, so that, with the half-interval spacing, every window ends
+    /// inside the slot it started in and leaves the rest of that slot open to anyone. A
+    /// buy nobody eligible makes waits at most this long for the open fallback.
+    uint256 public constant MAX_COMMUNITY_WINDOW = 1 hours;
+    /// The most turns a plan's community window can be shared out in. A plan with turns
+    /// (`turnBuckets`, 2 to this) gives the first half of each window to the eligible holders
+    /// whose address falls in that buy's bucket, so a bot that wants first claim on every buy
+    /// needs an eligible address, and 690 SPX, in every bucket. Zero turns, which every vault
+    /// the app creates has until decision 29 of `docs/V2_UPGRADE.md` calls for them, is the
+    /// race v2 launched with.
+    uint256 public constant MAX_TURN_BUCKETS = 64;
 }

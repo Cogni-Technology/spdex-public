@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { TOKENS, TOPICS, type JsonRpc } from "@spdex/chain";
 import type { Address, Hex } from "@spdex/core";
-import { MAINNET_DEPLOYMENT, factoryAddress } from "@spdex/vault";
-import { VAULT_EVENT_TOPICS } from "../dca/vault.js";
+import { DEPLOYMENTS, MAINNET_DEPLOYMENT, V1_MAINNET_FACTORY, VAULT_EVENT_TOPICS, factoryAddress } from "@spdex/vault";
 import {
+  VAULT_FACTORIES,
   boughtEmitters,
   receiptFragment,
   receiptFromUrl,
@@ -45,9 +45,15 @@ const v3Swap = (pool: string, to: string, spxOut: bigint): ReceiptLog => ({
   topics: [TOPICS.uniV3Swap, topic(ROUTER), topic(to)],
   data: `0x${[10n ** 16n, BigInt.asUintN(256, -spxOut), 1n, 1n, 0n].map(word).join("")}`,
 });
+/** A v1 vault's `Bought`: its caller is who was paid. */
 function bought(vault: string, amountOut: bigint): ReceiptLog {
   const data = [10n ** 16n, amountOut, 10n ** 14n, amountOut, 1n, 10n ** 20n].map(word).join("");
-  return { address: vault, topics: [VAULT_EVENT_TOPICS.Bought, `0x${word(0n)}`, topic(ALICE)], data: `0x${data}` };
+  return { address: vault, topics: [VAULT_EVENT_TOPICS.v1.Bought, `0x${word(0n)}`, topic(ALICE)], data: `0x${data}` };
+}
+/** A v2 vault's `Bought`: it names who was paid (`rewardTo`) and when the buy fell due. */
+function boughtV2(vault: string, amountOut: bigint, rewardTo: string = BOB): ReceiptLog {
+  const data = [10n ** 16n, amountOut, 10n ** 14n, amountOut, 1n, 10n ** 20n, 0x68cb2000n].map(word).join("");
+  return { address: vault, topics: [VAULT_EVENT_TOPICS.v2.Bought, `0x${word(0n)}`, topic(ALICE), topic(rewardTo)], data: `0x${data}` };
 }
 
 describe("receiptFromUrl", () => {
@@ -144,6 +150,15 @@ describe("what the logs say", () => {
     expect(other!.source.kind).toBe("pool");
   });
 
+  it("finds a vault's buy in either release's Bought, which differ in their topics", () => {
+    const V2_VAULT = "0x00000000000000000000000000000000000fa018" as Address;
+    const logs = [transfer(SPX, PAIR, ALICE, 500n), v2Swap(PAIR, ALICE, 500n), bought(VAULT, 300n), boughtV2(V2_VAULT, 200n)];
+    expect(boughtEmitters(logs)).toEqual([VAULT, V2_VAULT]);
+    // Who was paid changes nothing about whose buy it was: the owner's.
+    const [delivery] = spxDeliveries(logs, { spxPools: pairOnly, vaultOwners: new Map([[V2_VAULT, ALICE]]) });
+    expect(delivery).toEqual({ to: ALICE, amount: 500n, source: { kind: "vault", vault: V2_VAULT } });
+  });
+
   it("credits only what a swap paid: a dust buy can't vouch for a large transfer beside it", () => {
     const logs = [transfer(SPX, PAIR, ALICE, 1n), v2Swap(PAIR, ALICE, 1n), transfer(SPX, BOB, ALICE, 10n ** 17n)];
     const deliveries = spxDeliveries(logs, context);
@@ -226,17 +241,17 @@ describe("verifyReceipt", () => {
   const pools = [{ address: PAIR, spxIsToken0: false }];
 
   it("says so when the service doesn't know the transaction", async () => {
-    expect(await verifyReceipt(scripted(null), { hash: HASH, spxPools: pools, factory: FACTORY })).toEqual({ kind: "unknown" });
+    expect(await verifyReceipt(scripted(null), { hash: HASH, spxPools: pools, factories: [FACTORY] })).toEqual({ kind: "unknown" });
   });
 
   it("a failed transaction delivered nothing, whatever its logs", async () => {
-    const outcome = await verifyReceipt(scripted(receipt([transfer(SPX, PAIR, ALICE, 5n)], "0x0")), { hash: HASH, spxPools: pools, factory: FACTORY });
+    const outcome = await verifyReceipt(scripted(receipt([transfer(SPX, PAIR, ALICE, 5n)], "0x0")), { hash: HASH, spxPools: pools, factories: [FACTORY] });
     expect(outcome).toEqual({ kind: "failed", block: 26_000_001n, time: 0x68cb2d53 });
   });
 
   it("no SPX, no delivery; and a transaction with no vault in it asks the factory nothing", async () => {
     const calls: string[] = [];
-    const outcome = await verifyReceipt(scripted(receipt([transfer(WETH, ALICE, BOB, 5n)]), calls), { hash: HASH, spxPools: pools, factory: FACTORY });
+    const outcome = await verifyReceipt(scripted(receipt([transfer(WETH, ALICE, BOB, 5n)]), calls), { hash: HASH, spxPools: pools, factories: [FACTORY] });
     expect(outcome.kind).toBe("no-spx");
     expect(calls).toEqual(["eth_getTransactionReceipt", "eth_getBlockByNumber"]);
   });
@@ -250,7 +265,7 @@ describe("verifyReceipt", () => {
       },
     };
     const logs = [transfer(SPX, PAIR, ALICE, 500n), v2Swap(PAIR, ALICE, 500n), bought(VAULT, 500n)];
-    const outcome = await verifyReceipt(scripted(receipt(logs)), { hash: HASH, spxPools: pools, factory: FACTORY, reader });
+    const outcome = await verifyReceipt(scripted(receipt(logs)), { hash: HASH, spxPools: pools, factories: [FACTORY], reader });
     expect(asked).toHaveLength(1);
     expect(asked[0]!.map((c) => c.to)).toEqual([FACTORY, VAULT]);
     // isVault(address), as viem's toFunctionSelector gives it.
@@ -259,25 +274,63 @@ describe("verifyReceipt", () => {
     expect(outcome).toMatchObject({ kind: "delivered", vaults: "checked", deliveries: [{ to: ALICE, source: { kind: "vault", vault: VAULT } }] });
 
     const refused = { multicall: async () => [`0x${word(0n)}`, `0x${word(ALICE)}`] };
-    const notVouched = await verifyReceipt(scripted(receipt(logs)), { hash: HASH, spxPools: pools, factory: FACTORY, reader: refused });
+    const notVouched = await verifyReceipt(scripted(receipt(logs)), { hash: HASH, spxPools: pools, factories: [FACTORY], reader: refused });
     expect(notVouched).toMatchObject({ kind: "delivered", deliveries: [{ source: { kind: "pool" } }] });
 
     const garbage = { multicall: async () => ["0x", "0x1234"] };
-    const unread = await verifyReceipt(scripted(receipt(logs)), { hash: HASH, spxPools: pools, factory: FACTORY, reader: garbage });
+    const unread = await verifyReceipt(scripted(receipt(logs)), { hash: HASH, spxPools: pools, factories: [FACTORY], reader: garbage });
     expect(unread).toMatchObject({ kind: "delivered", deliveries: [{ source: { kind: "pool" } }] });
+  });
+
+  it("asks every release's factory about each vault, so a v1 vault's buy is still its vault's once v2's factory makes the new ones", async () => {
+    expect(VAULT_FACTORIES).toEqual(DEPLOYMENTS.map((d) => d.factory.toLowerCase()));
+    expect(VAULT_FACTORIES).toEqual([V1_MAINNET_FACTORY, FACTORY]);
+    const V2_VAULT = "0x00000000000000000000000000000000000fa018" as Address;
+    const asked: { to: string; data: string }[][] = [];
+    // v1's factory vouches for the v1 vault, v2's for the v2 vault; neither for the other's.
+    const reader = {
+      async multicall(calls: { to: Address; data: Hex }[]) {
+        asked.push(calls);
+        return [`0x${word(1n)}`, `0x${word(0n)}`, `0x${word(ALICE)}`, `0x${word(0n)}`, `0x${word(1n)}`, `0x${word(BOB)}`];
+      },
+    };
+    const logs = [
+      transfer(SPX, PAIR, ALICE, 500n),
+      v2Swap(PAIR, ALICE, 500n),
+      bought(VAULT, 500n),
+      transfer(SPX, PAIR, BOB, 700n),
+      v2Swap(PAIR, BOB, 700n),
+      boughtV2(V2_VAULT, 700n),
+    ];
+    const outcome = await verifyReceipt(scripted(receipt(logs)), { hash: HASH, spxPools: pools, factories: VAULT_FACTORIES, reader });
+    expect(asked).toHaveLength(1);
+    expect(asked[0]!.map((c) => c.to)).toEqual([V1_MAINNET_FACTORY, FACTORY, VAULT, V1_MAINNET_FACTORY, FACTORY, V2_VAULT]);
+    expect(outcome).toMatchObject({
+      kind: "delivered",
+      vaults: "checked",
+      deliveries: [
+        { to: ALICE, amount: 500n, source: { kind: "vault", vault: VAULT } },
+        { to: BOB, amount: 700n, source: { kind: "vault", vault: V2_VAULT } },
+      ],
+    });
+
+    // Asking only this build's factory, as the view once did, loses the v1 vault.
+    const v2Only = { multicall: async () => [`0x${word(0n)}`, `0x${word(ALICE)}`, `0x${word(1n)}`, `0x${word(BOB)}`] };
+    const narrowed = await verifyReceipt(scripted(receipt(logs)), { hash: HASH, spxPools: pools, factories: [FACTORY], reader: v2Only });
+    expect(narrowed).toMatchObject({ deliveries: [{ to: ALICE, source: { kind: "pool" } }, { to: BOB, source: { kind: "vault" } }] });
   });
 
   it("a failed vault check credits no vault, and says the check didn't happen", async () => {
     const failing = { multicall: async () => Promise.reject(new Error("rate limited")) };
     const logs = [transfer(SPX, PAIR, ALICE, 500n), v2Swap(PAIR, ALICE, 500n), bought(VAULT, 500n)];
-    const outcome = await verifyReceipt(scripted(receipt(logs)), { hash: HASH, spxPools: pools, factory: FACTORY, reader: failing });
+    const outcome = await verifyReceipt(scripted(receipt(logs)), { hash: HASH, spxPools: pools, factories: [FACTORY], reader: failing });
     expect(outcome).toMatchObject({ kind: "delivered", vaults: "unavailable", deliveries: [{ source: { kind: "pool" } }] });
   });
 
   it("with no factory, a vault's Bought is never asked about", async () => {
     const reader = { multicall: async () => Promise.reject(new Error("must not be called")) };
     const logs = [transfer(SPX, PAIR, ALICE, 500n), v2Swap(PAIR, ALICE, 500n), bought(VAULT, 500n)];
-    const outcome = await verifyReceipt(scripted(receipt(logs)), { hash: HASH, spxPools: pools, factory: null, reader });
+    const outcome = await verifyReceipt(scripted(receipt(logs)), { hash: HASH, spxPools: pools, factories: [], reader });
     expect(outcome).toMatchObject({ kind: "delivered", vaults: "none" });
   });
 
@@ -286,11 +339,11 @@ describe("verifyReceipt", () => {
       if (method === "eth_getTransactionReceipt") return receipt([transfer(SPX, BOB, ALICE, 1n)]);
       throw new Error("no");
     };
-    expect(await verifyReceipt(rpc, { hash: HASH, spxPools: pools, factory: null })).toMatchObject({ kind: "delivered", time: null });
+    expect(await verifyReceipt(rpc, { hash: HASH, spxPools: pools, factories: [] })).toMatchObject({ kind: "delivered", time: null });
   });
 
   it("throws when the service can't be asked at all, so the view can offer to try again", async () => {
     const rpc: JsonRpc = async () => Promise.reject(new Error("connection refused"));
-    await expect(verifyReceipt(rpc, { hash: HASH, spxPools: pools, factory: null })).rejects.toThrow("connection refused");
+    await expect(verifyReceipt(rpc, { hash: HASH, spxPools: pools, factories: [] })).rejects.toThrow("connection refused");
   });
 });

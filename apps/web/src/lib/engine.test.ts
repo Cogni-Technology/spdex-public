@@ -11,8 +11,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { addDcaPlan, recommendedConfig, setFeature, DCA_FEATURE_ID } from "@spdex/config";
 import { NATIVE_TOKEN, TOKENS, TOPICS } from "@spdex/chain";
 import { scheduleRequest, vetScheduleDecision, type DcaPlan, type SpdexConfig } from "@spdex/core";
-import type { VaultBatchIntent } from "@spdex/guard";
-import { batcherAddress, encodeExecuteBatch } from "@spdex/vault";
+import type { VaultBatchIntent, VaultProveIntent } from "@spdex/guard";
+import { MAINNET_BATCHER, MAINNET_REGISTRY, encodeExecuteBatch, encodeProve } from "@spdex/vault";
 import { Engine, testSecondOpinion } from "./engine.js";
 
 const PLAN: DcaPlan = {
@@ -221,6 +221,7 @@ describe("Engine.checkVaultBatch", () => {
     chainId: 690069,
     account: ME,
     vaults: [VAULT],
+    claims: [],
     rewardTo: ME,
     minRewards: 330_000n * 10n ** 9n,
     gasLimit: 647_000n,
@@ -228,7 +229,7 @@ describe("Engine.checkVaultBatch", () => {
     ...patch,
   });
 
-  it("builds the one call itself: to the factory's batcher, the batch's own calldata, no value, the exact gas and price", async () => {
+  it("builds the one call itself: to the listed batcher, the batch's own calldata, no value, the exact gas and price", async () => {
     const engine = new Engine(config());
     // Refused by the static layer, so nothing is asked of the network.
     vi.stubGlobal("fetch", async () => {
@@ -237,15 +238,46 @@ describe("Engine.checkVaultBatch", () => {
     const { plan, verdict } = await engine.checkVaultBatch(intent({ rewardTo: "0x00000000000000000000000000000000000000ee" }));
     expect(plan.calls).toEqual([
       {
-        to: batcherAddress(engine.vaultFactory).toLowerCase(),
-        data: encodeExecuteBatch([VAULT], "0x00000000000000000000000000000000000000ee", 330_000n * 10n ** 9n),
+        to: MAINNET_BATCHER,
+        data: encodeExecuteBatch([VAULT], "0x00000000000000000000000000000000000000ee", 330_000n * 10n ** 9n, { batcher: MAINNET_BATCHER }),
         value: 0n,
         gas: 647_000n,
         gasPrice: 10n ** 9n,
       },
     ]);
-    expect(engine.vaultBatcher).toBe(batcherAddress(engine.vaultFactory).toLowerCase());
+    // The batcher bound to no factory, which every release from v2 on shares.
+    expect(engine.vaultBatcher).toBe(MAINNET_BATCHER);
     // The reward goes to the account that sends it, and nobody else.
+    expect(verdict.level).toBe("rejected");
+    expect(verdict.violations.map((v) => v.code)).toContain("VAULT_MALFORMED");
+  });
+});
+
+describe("Engine.checkVaultProof", () => {
+  const ME = "0x00000000000000000000000000000000000000aa" as const;
+  const intent: VaultProveIntent = {
+    version: 1,
+    action: "prove",
+    chainId: 690069,
+    account: ME,
+    holder: "0xb0072e684e532bd1dcc442b5ed22097db205bb8e",
+    blockNumber: 26_000_000n,
+    blockHash: `0x${"ab".repeat(32)}`,
+    // Not a header the registry can read: refused before anything is asked of the network.
+    header: "0x01",
+    accountProof: ["0x01"],
+    storageProof: ["0x02"],
+  };
+
+  it("builds the one call itself: to the registry its factory names, the proof's own calldata, no ether", async () => {
+    const engine = new Engine(config());
+    vi.stubGlobal("fetch", async () => {
+      throw new Error("a refused proof must not reach the network");
+    });
+    const { plan, verdict } = await engine.checkVaultProof(intent);
+    expect(engine.vaultRegistry).toBe(MAINNET_REGISTRY);
+    expect(plan.calls).toEqual([{ to: MAINNET_REGISTRY, data: encodeProve({ ...intent, accountProof: ["0x01"], storageProof: ["0x02"] }), value: 0n }]);
+    expect(plan.intent).toBe(intent);
     expect(verdict.level).toBe("rejected");
     expect(verdict.violations.map((v) => v.code)).toContain("VAULT_MALFORMED");
   });

@@ -11,6 +11,12 @@
  * - **A row belongs to the wallet that sent it:** its first transaction's
  *   receipt `from` (attribution.ts). A vault's buys belong to the vault's
  *   owner, since whoever triggered them sent the transaction.
+ * - **A vault buy's fees follow who was paid and who sent it.** Its buy fee
+ *   is the owner's cost unless it came back to the owner (v2: paid to the
+ *   owner, whoever named them; v1: the owner called), and its network fee is
+ *   the owner's only when the owner called `execute` themselves. Who made it
+ *   is said by `buyMaker`, the rule a vault card and the keeper's report use,
+ *   judged at the buy's block time with the vault's own strict `<`.
  * - **What isn't listed is said.** Buys a plan's record no longer keeps,
  *   swaps past the store's 1,000, vault buys the network service wouldn't
  *   return: each is a sentence in `notes`, never a silent gap.
@@ -18,15 +24,16 @@
 
 import type { Address, DcaPlan, Hex } from "@spdex/core";
 import { TOKENS } from "@spdex/chain";
+import { SOURCES, SOURCE_IDS_NEWEST_FIRST, buyMaker, isListedBatcher, type SourceId } from "@spdex/vault";
 import { RUN_CODES, type DcaLedger } from "../dca/ledger.js";
 import { cardTitle } from "../dca/view.js";
-import type { VaultHistory } from "../dca/vault.js";
+import type { VaultHistory, VaultHistoryEntry } from "../dca/vault.js";
 import { formatCount } from "../money/format.js";
 import { accountOf, blockOf, networkFeeOf, type TxFacts } from "./attribution.js";
 import type { StoredLeg, StoredReceipt } from "./store.js";
 import type { FxSnapshot } from "../money/pricing.js";
 import { fxFromStored, valueAtBlock, valueSeen, type StoredRates } from "./values.js";
-import type { RecordLeg, RecordRow } from "./types.js";
+import type { RecordLeg, RecordRow, VaultBuyFacts } from "./types.js";
 
 /** What is known about one block. */
 export interface BlockFacts {
@@ -55,6 +62,8 @@ export interface VaultBuys {
   tokenOut: Address;
   maxBuys: number;
   buysDone: number;
+  /** The vault's community window, seconds (`VaultTerms.communityWindow`): null for v1, or when it wasn't read. */
+  communityWindow?: bigint | null;
   history?: VaultHistory;
   error?: string;
 }
@@ -234,7 +243,14 @@ function vaultBuyRows(input: BuildInput, lookup: RecordsLookup, built: Built): v
         continue;
       }
       const sold: RecordLeg = { token: TOKENS.WETH.address, amount: entry.amountIn ?? null, measured: entry.amountIn !== undefined };
-      const self = triggeredByOwner(entry.keeper, vault.owner);
+      const sentByOwner = same(entry.keeper, vault.owner);
+      // Who was paid the buy fee: from v2 on the address the call named, in
+      // v1 the caller. Null when such a log's payee wasn't read.
+      const paidBack = paysRewardTo(entry)
+        ? entry.rewardTo === undefined
+          ? null
+          : same(entry.rewardTo, vault.owner)
+        : sentByOwner;
       built.rows.push({
         id: `vault-buy:${input.chainId}:${entry.hash}:${entry.logIndex}`,
         kind: "vault-buy",
@@ -249,17 +265,22 @@ function vaultBuyRows(input: BuildInput, lookup: RecordsLookup, built: Built): v
           amount: entry.amountOut ?? null,
           measured: entry.amountOut !== undefined,
         },
-        // Whoever triggered the buy paid its network fee and was paid its buy
-        // fee. Usually that is a keeper, so the owner paid the fee and no gas.
-        // An owner who triggered it themselves ("Trigger now") paid the gas,
-        // known once the receipt is read, and was paid the buy fee back, so
-        // on net they paid no buy fee.
-        buyFee: self ? 0n : (entry.reward ?? null),
-        networkFee: self ? networkFeeOf([entry.hash], (hash) => lookup.tx(hash)) : 0n,
+        // Usually a keeper made the buy, so the owner paid its buy fee and no
+        // gas. A fee paid back to the owner (Trigger now, or in v2 any call
+        // that named the owner: their own Help run batch, or someone else's
+        // courtesy) cost the owner nothing on net. An owner who called
+        // `execute` themselves paid the gas, known once the receipt is read;
+        // one whose own batch made it paid the batch's gas, which that
+        // batch's "Buy fees earned" row carries, so it isn't counted twice —
+        // and that row leaves this fee out (`feesEarnedFromOthers`), so it
+        // isn't counted as earned either.
+        buyFee: paidBack === null ? null : paidBack ? 0n : (entry.reward ?? null),
+        networkFee: sentByOwner ? networkFeeOf([entry.hash], (hash) => lookup.tx(hash)) : 0n,
         ...valued(sold, undefined, input.chainId, entry.blockNumber, lookup),
         planId: vault.plan.id,
         planLabel: label,
         buyIndex: { n: Math.max(1, index), of: vault.maxBuys },
+        vaultBuy: vaultBuyFacts(entry, vault, time, lookup),
       });
     }
   }
@@ -270,9 +291,53 @@ function vaultBuyRows(input: BuildInput, lookup: RecordsLookup, built: Built): v
   }
 }
 
-/** Whether a vault buy's keeper is the vault's owner: they sent the transaction themselves. */
-const triggeredByOwner = (keeper: string | undefined, owner: string): boolean =>
-  keeper !== undefined && keeper.toLowerCase() === owner.toLowerCase();
+/** Whether two addresses are the same, either unknown being no. */
+const same = (a: string | undefined | null, b: string): boolean => a != null && a.toLowerCase() === b.toLowerCase();
+
+/** The oldest source, which every vault was built from when a log read carried no source. */
+const OLDEST_SOURCE: SourceId = SOURCE_IDS_NEWEST_FIRST[SOURCE_IDS_NEWEST_FIRST.length - 1]!;
+
+/** A buy's source, the layout its `Bought` was read as. Every log read now says which; one without was read when v1 was the only one. */
+const sourceOf = (entry: VaultHistoryEntry): SourceId => entry.source ?? OLDEST_SOURCE;
+
+/** Whether a buy paid the `rewardTo` its trigger named (v2 on), rather than its caller (v1). */
+const paysRewardTo = (entry: VaultHistoryEntry): boolean => SOURCES[sourceOf(entry)].features.executeTakesRewardTo;
+
+/** Whether one of spDEX's batchers called `execute`, for whoever sent it the batch. */
+const viaBatcher = (entry: VaultHistoryEntry) => entry.keeper !== undefined && isListedBatcher(entry.keeper);
+
+/**
+ * What a vault buy's log says about who made it, judged as the vault judged
+ * it: at the buy's block time `at`, inside the community window while
+ * `at < dueSince + communityWindow`, exactly the vault's own check. The
+ * transaction's sender, which tells the owner's own batch from someone
+ * else's courtesy, comes from the history read or from a receipt read here.
+ */
+export function vaultBuyFacts(
+  entry: VaultHistoryEntry,
+  vault: Pick<VaultBuys, "owner" | "communityWindow">,
+  at: number,
+  lookup: Pick<RecordsLookup, "tx">,
+): VaultBuyFacts {
+  const source = sourceOf(entry);
+  const { executeTakesRewardTo, communityWindow } = SOURCES[source].features;
+  const window = entry.communityWindow ?? (vault.communityWindow == null ? null : Number(vault.communityWindow));
+  return {
+    caller: entry.keeper === undefined ? null : (entry.keeper.toLowerCase() as Address),
+    rewardTo: executeTakesRewardTo && entry.rewardTo !== undefined ? (entry.rewardTo.toLowerCase() as Address) : null,
+    dueSince: communityWindow ? (entry.dueSince ?? null) : null,
+    maker: buyMaker({
+      source,
+      owner: vault.owner,
+      rewardTo: entry.rewardTo ?? null,
+      keeper: entry.keeper ?? null,
+      sender: entry.sender ?? lookup.tx(entry.hash)?.from ?? null,
+      at: BigInt(at),
+      dueSince: entry.dueSince == null ? null : BigInt(entry.dueSince),
+      communityWindow: window === null ? null : BigInt(window),
+    }),
+  };
+}
 
 const newestFirst = (a: RecordRow, b: RecordRow) =>
   b.at.unix - a.at.unix || (a.block !== null && b.block !== null && a.block !== b.block ? (b.block > a.block ? 1 : -1) : 0) || a.id.localeCompare(b.id);
@@ -339,8 +404,15 @@ export function pendingReads(input: BuildInput): { hashes: Hex[]; blocks: bigint
     for (const entry of vault.history?.entries ?? []) {
       if (entry.kind !== "bought") continue;
       if (entry.at === null && lookup.block(input.chainId, entry.blockNumber)?.time == null) blocks.add(entry.blockNumber);
+      if (lookup.tx(entry.hash) !== null) continue;
       // A buy the owner triggered themselves: its receipt gives the network fee they paid.
-      if (triggeredByOwner(entry.keeper, vault.owner) && lookup.tx(entry.hash) === null) hashes.add(entry.hash.toLowerCase() as Hex);
+      if (same(entry.keeper, vault.owner)) hashes.add(entry.hash.toLowerCase() as Hex);
+      // A v2 buy paid back to the owner through a batcher, whose sender the
+      // history didn't read: its receipt's `from` tells the owner's own batch
+      // from someone else's.
+      else if (paysRewardTo(entry) && same(entry.rewardTo, vault.owner) && entry.sender == null && viaBatcher(entry)) {
+        hashes.add(entry.hash.toLowerCase() as Hex);
+      }
     }
   }
   return { hashes: [...hashes], blocks: [...blocks] };

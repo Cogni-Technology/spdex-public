@@ -145,6 +145,14 @@ describe("the exits", () => {
     }
   });
 
+  it("say a v2 vault's buy is anyone's only after SPX holders' first claim", () => {
+    // v1's "anyone can make a due buy" is true of a v2 vault only after its community window.
+    expect(KEEPER_TEXT).toBe(
+      "Anyone can make a due vault buy; on a v2 vault, SPX holders have first claim for a while. Run a keeper (docs/KEEPER.md in spDEX's source) to keep yours buying.",
+    );
+    for (const text of every) expect(text).not.toMatch(/\bAPR\b|\bAPY\b|yield|reward/i);
+  });
+
   it("state the list search's cost when the list's length is known, and make no privacy claim", () => {
     expect(listSearchHint(4)).toContain("(about 4 reads)");
     expect(listSearchHint(null)).toContain("(one read for every 200 vaults on the list, plus a few)");

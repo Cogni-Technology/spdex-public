@@ -401,6 +401,9 @@ test.describe("recommended mode", () => {
 
     // A token it holds none of: no network fee to add, and no Max to tap.
     await page.getByTestId("token-in").selectOption("USDC");
+    // As for ETH above: the shortfall is said once the balance is known, and a
+    // click before the new token's balance is read quotes, as it should.
+    await expect(page.getByTestId("balance-in")).toContainText("Balance 0 USDC");
     await page.getByTestId("amount-input").fill("5");
     await page.getByTestId("quote-button").click();
     await expect(page.getByTestId("swap-status")).toHaveText("Couldn't get a price: not enough USDC in your wallet.");

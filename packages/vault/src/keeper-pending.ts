@@ -15,11 +15,13 @@
 
 import type { Address, Hex } from "@spdex/core";
 import type { PreparedFees, PreparedTransaction } from "@spdex/chain";
-import { BATCHER_LIMITS, type Deployment } from "./artifacts.js";
-import { RATIO_ONE, earliestBuyAt, resendIntervalBlocks, windowOf } from "./keeper-plan.js";
-import { blockAt, retire } from "./keeper-read.js";
+import type { Deployment } from "./artifacts.js";
+import { provenBy } from "./index.js";
+import { RATIO_ONE, earliestBuyAt, resendIntervalBlocks, turnEndsAtOf, windowOf } from "./keeper-plan.js";
+import { blockAt, communityWindowOf, holdersFirstUntil, mayBePaidInWindow, retire } from "./keeper-read.js";
 import {
   decodeBatchReceipt,
+  gasPerVaultOf,
   isConfirmed,
   readReceipt,
   receiptOfAny,
@@ -213,6 +215,22 @@ async function finishPending(t: Tick, p: PendingTx, attempt: PendingAttempt, rec
     } else if (attempt.kind === "deploy") {
       const deployment = t.config.deployments.find((d) => d.id === p.deployment);
       if (deployment && receipt.status === 1n) t.emit({ type: "batcher_deployed", deployment: deployment.id, hash: receipt.transactionHash, address: lower(deployment.batcher) });
+    } else if (attempt.kind === "prove") {
+      // The registry's own `Proven` says until when; anyone can emit a log shaped like it, so only the registry's counts.
+      const registry = t.config.deployments.find((d) => d.id === p.deployment)?.registry ?? null;
+      const proven = registry === null ? [] : provenBy(registry, receipt.logs).filter((e) => e.holder === t.rewardTo);
+      t.emit({
+        type: "prove_mined",
+        batchId: p.batchId,
+        hash: receipt.transactionHash,
+        deployment: p.deployment,
+        status: receipt.status === 1n ? "success" : "reverted",
+        costWei,
+        validUntil: receipt.status === 1n ? (proven.at(-1)?.validUntil ?? null) : null,
+      });
+      // A proof that passed its own test-run and reverted anyway: no other for a day of this machine's clock, which the
+      // endpoint that reported it can't move (`maybeProve`).
+      if (receipt.status !== 1n) t.state.proveRevertedAt = BigInt(Math.floor(t.wallClockMs() / 1000));
     }
   }
   t.state.pending = null;
@@ -220,8 +238,22 @@ async function finishPending(t: Tick, p: PendingTx, attempt: PendingAttempt, rec
   await t.persist();
 }
 
+/**
+ * Blocks left before the soonest moment a vault in `p` needs it sent again:
+ * its slot's end, or — for a buy this keeper may take inside its community
+ * window — the window's urgent point, where it stops waiting patiently. So a
+ * patient batch's resend falls due as the window's tail begins (decision 19).
+ */
 function blocksToEarliestWindowEnd(t: Tick, p: PendingTx): bigint {
-  const ends = p.vaults.map((vault) => t.state.vaults[vault]).filter((e): e is VaultEntry => e !== undefined).map((e) => windowOf(e.terms, t.chainTime).windowEnd);
+  const ends = p.vaults
+    .map((vault) => t.state.vaults[vault])
+    .filter((e): e is VaultEntry => e !== undefined)
+    .map((e) => {
+      const slotEnd = windowOf(e.terms, t.chainTime).windowEnd;
+      const community = communityWindowOf(e, t.chainTime);
+      const patient = community !== null && t.chainTime < community.urgentAt && mayBePaidInWindow(t, e);
+      return patient && community.urgentAt < slotEnd ? community.urgentAt : slotEnd;
+    });
   if (ends.length === 0) return BigInt(t.policy.resendAfterBlocks) * 3n;
   const soonest = ends.reduce((a, b) => (b < a ? b : a));
   return soonest > t.chainTime ? (soonest - t.chainTime) / SECONDS_PER_BLOCK : 0n;
@@ -268,7 +300,8 @@ async function processBatchReceipt(
     }
     if (earliestBuyAt(e.terms, e.buysDone, e.lastBuyAt) === null) retire(t, b.vault, "done");
   }
-  for (const r of mined.refused) onChainRefusal(t, r.vault, r.reasonName, r.gasUsed, receipt.transactionHash, lower(deployment.batcher));
+  const cap = gasPerVaultOf(t.config, deployment);
+  for (const r of mined.refused) onChainRefusal(t, r.vault, r.reasonName, r.gasUsed, receipt.transactionHash, lower(deployment.batcher), cap);
   if (mined.status === "reverted") for (const vault of sent.vaults) if (state.vaults[vault]) state.vaults[vault]!.readAt = null;
   if (mined.notTried.length > 0) t.emit({ type: "error", where: "batch", message: `${mined.notTried.length} vault(s) were not tried: the gas limit was too low` });
 
@@ -313,10 +346,16 @@ async function processBatchReceipt(
  * there: read it again. The price or the oracle: a paid refusal, rested for
  * `refusalRetrySeconds`, and for the rest of the window after
  * `maxPaidRefusalsPerWindow`. A revert with no reason that burned at least
- * half the cap: what a trap does, so trapped for a week, on the chain's
- * evidence only. Anything else: rested until the next window.
+ * half the gas the batch gave it (`cap`): what a trap does, so trapped for a
+ * week, on the chain's evidence only. `NotEligible`: this keeper's `rewardTo`
+ * was not eligible when the buy landed, after all (its SPX moved, its proof
+ * lapsed, or the buy landed in the next slot's window), so rested until that
+ * community window ends, when anyone may make it; `NotYourTurn`: eligible, but
+ * the buy landed inside another bucket's turn, so rested until the turn ends;
+ * neither is ever a trap or a paid refusal. Anything else: rested until the
+ * next window.
  */
-function onChainRefusal(t: Tick, vault: Address, name: string | null, gasUsed: bigint, txHash: Hex, batcher: Address): void {
+function onChainRefusal(t: Tick, vault: Address, name: string | null, gasUsed: bigint, txHash: Hex, batcher: Address, cap: bigint): void {
   const e = t.state.vaults[vault];
   if (!e) return;
   const window = windowOf(e.terms, t.chainTime);
@@ -334,9 +373,17 @@ function onChainRefusal(t: Tick, vault: Address, name: string | null, gasUsed: b
       e.restingUntil = count >= t.policy.maxPaidRefusalsPerWindow ? window.windowEnd : t.chainTime + t.policy.refusalRetrySeconds;
       return;
     }
+    case "NotEligible":
+      e.restingUntil = holdersFirstUntil(e, t.chainTime) ?? communityWindowOf(e, t.chainTime)?.endsAt ?? window.windowEnd;
+      return;
+    case "NotYourTurn": {
+      const turnEnds = turnEndsAtOf(e.terms, e.buysDone, e.lastBuyAt, t.chainTime);
+      e.restingUntil = turnEnds !== null && turnEnds > t.chainTime ? turnEnds : (communityWindowOf(e, t.chainTime)?.endsAt ?? window.windowEnd);
+      return;
+    }
     case "EmptyRevert":
-      if (gasUsed * 2n >= BATCHER_LIMITS.EXECUTE_GAS_CAP) {
-        t.state.trapped[vault] = { since: t.chainTime, txHash, batcher, cap: BATCHER_LIMITS.EXECUTE_GAS_CAP, slot: window.slot };
+      if (gasUsed * 2n >= cap) {
+        t.state.trapped[vault] = { since: t.chainTime, txHash, batcher, cap, slot: window.slot };
         t.emit({ type: "trapped", vault, txHash, gasUsed });
         return;
       }

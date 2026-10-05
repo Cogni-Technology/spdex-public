@@ -17,10 +17,16 @@
  * first reminder is the plan's first buy time, with no address in it, and no
  * link, since the dev server's build names no published address
  * (`VITE_SPDEX_APP_URL`) and spDEX never takes one from the address bar.
+ *
+ * A vault plan's buys are records too, read from the vault, and each says who
+ * made it: the owner, someone else who paid the fee back to the owner, a
+ * community keeper inside the buy's community window, or anyone after it.
+ * Each of the four is made here from outside the page, by fresh keys, on a
+ * vault of its own, in the way the vault judges it.
  */
 
 import { readFileSync } from "node:fs";
-import { checksumAddress } from "../packages/vault/src/index.js";
+import { DEFAULT_TURN_BUCKETS, checksumAddress, encodeExecute, type VaultPlan } from "../packages/vault/src/index.js";
 import {
   test,
   expect,
@@ -32,7 +38,13 @@ import {
   swapEthForSpx,
   openTile,
   seedDisclaimer,
+  FORK_CHAIN_ID,
+  NATIVE_ETH,
+  SPX,
 } from "./fixtures.js";
+import { ETHER, HOLDER, chainNow, closeLeftoverVaults, createVaultAs, ensureContracts, freshAccount, keyWallet, sendAs, vaultOnChain } from "./vaults.js";
+
+type Hex = `0x${string}`;
 
 /** 0.01 ETH: one swap, small enough that a reused account never notices. */
 const SWAP = "0.01";
@@ -43,6 +55,11 @@ function machine(amount: bigint, decimals: number): string {
   const fraction = (amount % unit).toString().padStart(decimals, "0").replace(/0+$/, "");
   return `${amount / unit}${fraction === "" ? "" : `.${fraction}`}`;
 }
+
+/** Vaults made for a test and still open are closed after it, from their owners' keys. */
+test.afterEach(async () => {
+  await closeLeftoverVaults();
+});
 
 /** A CSV line's cells. The file quotes only cells that need it, and these don't. */
 function cells(line: string): string[] {
@@ -145,6 +162,93 @@ test.describe("records", () => {
     // rather than repeating it or reading 0.
     expect(at(line, "value_local_at_time")).toBe("");
     expect(at(line, "local_currency")).toBe("");
+  });
+
+  test("a vault plan's buys in Your activity, and in its CSV, say who made each one", async ({ page, context }) => {
+    await ensureContracts();
+    const owner = await freshAccount(ETHER / 10n, { owner: true });
+    const stranger = await freshAccount(ETHER / 100n);
+    await keyWallet(context, owner);
+    // Daily, one 0.002 ETH buy each, all due from the fork's now; one's
+    // community window, a minute long, closed an hour ago.
+    const now = await chainNow();
+    const plan = (startAt: bigint, communityWindow: bigint): VaultPlan => ({
+      marketIndex: 0n,
+      amountPerBuy: 2n * 10n ** 15n,
+      interval: 86_400n,
+      maxBuys: 1n,
+      startAt,
+      keeperReward: (2n * 10n ** 15n * 69n) / 10_000n,
+      maxSlippageBps: 300n,
+      communityWindow,
+      turnBuckets: DEFAULT_TURN_BUCKETS,
+    });
+    const makers: { maker: string; text: string; csv: string; vault: Hex; hash: Hex }[] = [];
+    const made = async (maker: string, text: string, csv: string, startAt: bigint, window: bigint, by: { key: Hex; address: Hex }, rewardTo: Hex) => {
+      const vault = await createVaultAs(owner, plan(startAt, window));
+      const receipt = await sendAs(by, { to: vault, data: encodeExecute(rewardTo) });
+      makers.push({ maker, text, csv, vault, hash: receipt.transactionHash as Hex });
+    };
+    // Its owner's own Trigger now, inside the window.
+    await made("owner", "Made by you", "you", now, 1_800n, owner, owner.address);
+    // Someone else, inside the window, naming the owner to be paid.
+    await made("returned", "Made by someone else; the fee came back to you", "fee-returned-to-you", now, 1_800n, stranger, owner.address);
+    // Someone else, inside the window, paying a proven holder.
+    await made("community", "Made by a community keeper", "community-keeper", now, 1_800n, stranger, HOLDER);
+    // Someone else, after the window, paying themselves.
+    await made("open", "Made after the community window, when anyone could", "anyone-after-window", now - 3_600n, 60n, stranger, stranger.address);
+    for (const { vault } of makers) expect((await vaultOnChain(vault)).buysDone).toBe(1n);
+
+    // The plans, as spDEX would hold them for vaults found on chain and added back.
+    await seedConfig(page, {
+      preset: "custom",
+      dca: {
+        enabled: false,
+        plans: await Promise.all(
+          makers.map(async ({ vault }) => {
+            const { terms } = await vaultOnChain(vault);
+            return {
+              id: `vault-${vault.slice(2, 12)}`,
+              paused: true,
+              chainId: FORK_CHAIN_ID,
+              sell: NATIVE_ETH,
+              buy: SPX,
+              amountPerBuy: terms.amountPerBuy.toString(),
+              intervalSeconds: Number(terms.interval),
+              maxBuys: Number(terms.maxBuys),
+              startAt: Number(terms.startAt),
+              signer: "vault",
+              vault,
+            };
+          }),
+        ),
+      },
+    });
+    await page.goto("/");
+    await openTile(page, "trade");
+    await page.getByTestId("connect-button").click();
+    await openTile(page, "yours");
+    for (const { maker, text, hash } of makers) {
+      const row = page.locator(`[data-testid="activity-row"][data-hash="${hash}"]`);
+      await expect(row).toHaveAttribute("data-kind", "vault-buy", { timeout: 60_000 });
+      await expect(row.getByTestId("activity-maker")).toHaveText(text);
+      await expect(row.getByTestId("activity-maker")).toHaveAttribute("data-maker", maker);
+    }
+
+    // The file says it too, with who sent each buy and whom its fee paid.
+    const [download] = await Promise.all([page.waitForEvent("download"), page.getByTestId("activity-csv").click()]);
+    const lines = readFileSync((await download.path())!, "utf8").split("\r\n");
+    const header = cells(lines[0]!);
+    const at = (line: string[], column: string) => line[header.indexOf(column)];
+    const rows = lines.slice(1).filter((line) => line !== "").map(cells);
+    for (const { csv, hash, maker } of makers) {
+      const mine = rows.filter((line) => at(line, "tx_hash") === hash);
+      expect(mine, `the CSV row of the buy made by ${maker}`).toHaveLength(1);
+      expect(at(mine[0]!, "made_by")).toBe(csv);
+      expect(at(mine[0]!, "caller")).toBe(checksumAddress(maker === "owner" ? owner.address : stranger.address));
+      const paid = maker === "community" ? HOLDER : maker === "open" ? stranger.address : owner.address;
+      expect(at(mine[0]!, "fee_paid_to")).toBe(checksumAddress(paid));
+    }
   });
 
   test("Add to calendar downloads a reminder whose first event is the plan's first buy time", async ({ browser, account }) => {

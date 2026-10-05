@@ -29,17 +29,19 @@ const SHIPPED = (readJson("../../shipped-ids.json") as { ids: Record<string, str
 
 /**
  * The contracts spDEX knows beyond `@spdex/chain`'s own, which no entry may
- * be: the vault factory and batcher, and every contract a shipped venue
- * declares. (The web app refuses the same, and more, at runtime.)
+ * be: every release's factory and registry, every batcher, and every contract
+ * a shipped venue declares. (The web app refuses the same, and more, at
+ * runtime.)
  */
 const KNOWN_ELSEWHERE = new Map<string, string>([
-  ...(readJson("../../../../packages/vault/deployments.json") as { factory: string; batcher: string }[]).flatMap(
-    (deployment) =>
-      [
-        [deployment.factory.toLowerCase(), "the vault factory"],
-        [deployment.batcher.toLowerCase(), "the vault batcher"],
-      ] as const,
-  ),
+  ...((record: { releases: { factory: string; batcher?: string; registry?: string }[]; batchers: { batcher: string }[] }) => [
+    ...record.releases.flatMap((release) => [
+      [release.factory.toLowerCase(), "the vault factory"] as const,
+      ...(release.batcher ? [[release.batcher.toLowerCase(), "the vault batcher"] as const] : []),
+      ...(release.registry ? [[release.registry.toLowerCase(), "the SPX holder registry"] as const] : []),
+    ]),
+    ...record.batchers.map((b) => [b.batcher.toLowerCase(), "the vault batcher"] as const),
+  ])(readJson("../../../../packages/vault/deployments.json") as never),
   ...["venue-uniswap-v2", "venue-uniswap-v3"].flatMap((venue) =>
     (readJson(`../../../${venue}/manifest.json`) as { contracts: string[] }).contracts.map(
       (address) => [address.toLowerCase(), `a contract ${venue} uses`] as const,

@@ -15,7 +15,11 @@ import { DEFAULT_KEEPER_POLICY, MAX_BATCH_GAS_CEILING, type KeeperPolicy } from 
 
 export interface KeeperConfig {
   chainId: number;
-  /** Every release whose vaults this keeper serves; each batch goes to its own factory's batcher. */
+  /**
+   * Every release whose vaults this keeper serves; each batch goes to its
+   * release's batcher (v1's own, or, from v2 on, the one every such release
+   * shares).
+   */
   deployments: readonly Deployment[];
   weth: Address;
   /** Absent: a dry run, which decides and logs and never signs. */
@@ -26,6 +30,20 @@ export interface KeeperConfig {
   vaults: readonly Address[] | null;
   /** The send endpoint is private and revert-protected. */
   privateSend: boolean;
+  /**
+   * Prove `rewardTo`'s SPX to each listed release's registry before its proof
+   * lapses (`SPDEX_KEEPER_PROVE=1`; decision 20). Off, the keeper never signs
+   * a `prove`, whatever else asks it to (`assertKeeperMaySign`).
+   */
+  prove: boolean;
+  /**
+   * The gas a batch gives each vault's `execute` (`SPDEX_KEEPER_GAS_PER_VAULT`),
+   * from `MIN_EXECUTE_GAS` (400,000, the default) to `MAX_EXECUTE_GAS`: the
+   * batcher takes it as an argument, so a fork that reprices a buy past today's
+   * figure needs this raised, not a new batcher. v1's batcher takes none, and
+   * gives each vault its fixed 400,000.
+   */
+  gasPerVault: bigint;
   policy: KeeperPolicy;
 }
 
@@ -42,8 +60,8 @@ export class KeeperConfigError extends Error {
 
 /**
  * A keeper's configuration with every default filled in and checked: the
- * registry's releases, mainnet's WETH, no allowlist, a public send, the default
- * policy with `policy`'s overrides.
+ * registry's releases, mainnet's WETH, no allowlist, a public send, no
+ * proving, the default policy with `policy`'s overrides.
  */
 export function keeperConfig(input: {
   chainId: number;
@@ -53,10 +71,14 @@ export function keeperConfig(input: {
   rewardTo?: Address;
   vaults?: readonly Address[];
   privateSend?: boolean;
+  prove?: boolean;
+  gasPerVault?: bigint;
   policy?: Partial<KeeperPolicy>;
 }): KeeperConfig {
   const policy: KeeperPolicy = { ...DEFAULT_KEEPER_POLICY, ...input.policy };
   checkPolicy(policy, (field) => field);
+  const gasPerVault = input.gasPerVault ?? BATCHER_LIMITS.MIN_EXECUTE_GAS;
+  checkGasPerVault(gasPerVault, "gasPerVault");
   return {
     chainId: input.chainId,
     deployments: input.deployments ?? DEPLOYMENTS,
@@ -65,8 +87,17 @@ export function keeperConfig(input: {
     rewardTo: input.rewardTo ? lower(input.rewardTo) : null,
     vaults: input.vaults ? input.vaults.map(lower) : null,
     privateSend: input.privateSend ?? false,
+    prove: input.prove ?? false,
+    gasPerVault,
     policy,
   };
+}
+
+/** The batcher's own bounds on the gas each vault is given; refused outside them, as the batcher would refuse the batch. */
+function checkGasPerVault(gas: bigint, name: string): void {
+  if (gas < BATCHER_LIMITS.MIN_EXECUTE_GAS || gas > BATCHER_LIMITS.MAX_EXECUTE_GAS) {
+    throw new KeeperConfigError(name, `${name} must be between ${BATCHER_LIMITS.MIN_EXECUTE_GAS} and ${BATCHER_LIMITS.MAX_EXECUTE_GAS}`);
+  }
 }
 
 /** The keeper's own address, or null for a dry run. */
@@ -95,6 +126,7 @@ function checkPolicy(policy: KeeperPolicy, name: (field: keyof KeeperPolicy) => 
   if (policy.urgentTip > policy.maxTip) fail("urgentTip", "must be at most the maximum tip");
   if (policy.confirmations < 1) fail("confirmations", "must be at least 1");
   if (policy.intervalSeconds < 12) fail("intervalSeconds", "must be at least 12");
+  if (!Number.isFinite(policy.minRunwayDays) || policy.minRunwayDays < 0) fail("minRunwayDays", "must be a number of days, 0 or more");
 }
 
 // ─── From the environment ─────────────────────────────────────────────────────
@@ -120,6 +152,10 @@ export interface KeeperEnv {
   /** Exit when no tick completes for this long: five intervals, at least 300. */
   watchdogSeconds: number;
   deployBatcher: boolean;
+  /** `SPDEX_KEEPER_PROVE`: prove `rewardTo` before its proof lapses; off by default. */
+  prove: boolean;
+  /** `SPDEX_KEEPER_GAS_PER_VAULT`: the gas a batch gives each vault, `MIN_EXECUTE_GAS` by default. */
+  gasPerVault: bigint;
   gitSha: string | null;
   policy: KeeperPolicy;
   /** Every URL and key the environment holds, for the log's redactor: never logged, only removed. */
@@ -182,6 +218,24 @@ export function urlFromEnv(env: Env, name: string, readFile?: ReadFile): string 
  * and its `_FILE` form both set is an error; a file's contents are trimmed,
  * since `openssl` and `echo` end them with a newline. Errors name the
  * variable, never its value.
+ *
+ * Two of them are about community keeping (docs/V2_UPGRADE.md):
+ *
+ * - `SPDEX_KEEPER_PROVE` — 1 or 0, default 0. With 1, the hot key proves
+ *   `rewardTo`'s SPX to each listed release's registry, against the
+ *   `finalized` block, once its proof has less than five days left (about
+ *   660,000 gas, once a month). `rewardTo` must have held 690 SPX at that
+ *   block, and be an account; its SPX never moves. With 0, the keeper signs
+ *   no proof, and only logs when the proof will lapse.
+ * - `SPDEX_KEEPER_MIN_RUNWAY_DAYS` — whole days, default 7; 0 never warns.
+ *   Below it the keeper warns `low_runway`: its ether covers fewer days of
+ *   sends at its last week's spend. A keeper paid at a cold `rewardTo` earns
+ *   nothing back into its hot key, and its operator tops it up by hand.
+ *
+ * And one about the batcher: `SPDEX_KEEPER_GAS_PER_VAULT` — whole gas, default
+ * and least 400,000 (`MIN_EXECUTE_GAS`), at most `MAX_EXECUTE_GAS`: the gas a
+ * batch gives each vault's buy. Raised only if a fork reprices what a buy costs
+ * past it; the keeper signs no batch with any other figure.
  */
 export function keeperEnvFrom(env: Env, options: { readFile?: ReadFile } = {}): KeeperEnv {
   // Every name looked at, so that one set and never looked at can be warned about.
@@ -283,6 +337,8 @@ export function keeperEnvFrom(env: Env, options: { readFile?: ReadFile } = {}): 
     confirmations: num(`${P}CONFIRMATIONS`, d.confirmations),
     maxHeadLagSeconds: whole(`${P}MAX_HEAD_LAG_SECONDS`, d.maxHeadLagSeconds),
     minEth: decimal(`${P}MIN_ETH`, d.minEth, 18n),
+    // Whole days: a warning a week ahead, or a few days, is the choice an operator makes; 0 turns it off.
+    minRunwayDays: num(`${P}MIN_RUNWAY_DAYS`, d.minRunwayDays),
     intervalSeconds: num(`${P}INTERVAL_SECONDS`, d.intervalSeconds),
   };
   checkPolicy(policy, (field) => ENV_NAMES[field] ?? field);
@@ -313,6 +369,12 @@ export function keeperEnvFrom(env: Env, options: { readFile?: ReadFile } = {}): 
     heartbeatUrl,
     watchdogSeconds: Math.max(5 * policy.intervalSeconds, 300),
     deployBatcher: flag(`${P}DEPLOY_BATCHER`, false),
+    prove: flag(`${P}PROVE`, false),
+    gasPerVault: (() => {
+      const gas = whole(`${P}GAS_PER_VAULT`, BATCHER_LIMITS.MIN_EXECUTE_GAS);
+      checkGasPerVault(gas, `${P}GAS_PER_VAULT`);
+      return gas;
+    })(),
     gitSha: value(`${P}GIT_SHA`),
     policy,
     secrets: { key: keeperKey, urls: [...urls] },
@@ -328,6 +390,7 @@ const ENV_NAMES: Partial<Record<keyof KeeperPolicy, string>> = {
   deadlineMinSeconds: `${P}DEADLINE_MIN_SECONDS`,
   confirmations: `${P}CONFIRMATIONS`,
   intervalSeconds: `${P}INTERVAL_SECONDS`,
+  minRunwayDays: `${P}MIN_RUNWAY_DAYS`,
 };
 
 /** A decimal string as an integer of `decimals` places ("0.02", 9 → 20,000,000). */

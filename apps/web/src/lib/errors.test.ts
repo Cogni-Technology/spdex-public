@@ -384,13 +384,17 @@ describe("guardSentence", () => {
 
   it("states the unaccounted WETH exactly, and never as 0", () => {
     expect(guardSentence("VAULT_BATCH_UNACCOUNTED", { swept: "1" })).toBe(
-      "The batcher holds 0.000000000000000001 WETH someone sent it, and this batch would pass it to you. " +
+      "This batch would move 0.000000000000000001 WETH out of the vault batcher, which holds and passes on nothing. " +
         "spDEX won't make you the receiver of money it can't account for.",
     );
-    expect(guardSentence("VAULT_BATCH_UNACCOUNTED", { swept: "250000000000000000" })).toContain("holds 0.25 WETH");
-    for (const detail of [undefined, { swept: "" }, { swept: "0" }, { swept: "-5" }, { swept: "1e18" }]) {
+    expect(guardSentence("VAULT_BATCH_UNACCOUNTED", { swept: "250000000000000000" })).toContain("move 0.25 WETH out");
+    // v2's batcher has no sweep: nothing says someone's WETH is waiting there to be passed on.
+    expect(guardSentence("VAULT_BATCH_UNACCOUNTED", { swept: "1" })).not.toMatch(/someone sent|pass it to you/);
+    // Another token than WETH carries no `swept`: said without a figure.
+    const other = { token: "0x00000000000000000000000000000000000000cc", amount: "5" };
+    for (const detail of [undefined, other, { swept: "" }, { swept: "0" }, { swept: "-5" }, { swept: "1e18" }]) {
       const sentence = guardSentence("VAULT_BATCH_UNACCOUNTED", detail);
-      expect(sentence).toContain("The batcher holds WETH someone sent it");
+      expect(sentence).toContain("This batch would move money out of the vault batcher");
       expect(sentence).not.toMatch(/\d/);
     }
   });

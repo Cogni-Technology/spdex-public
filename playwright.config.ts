@@ -171,11 +171,6 @@ export default defineConfig({
       retries: 0,
       use: { ...devices["Desktop Chrome"], launchOptions },
     },
-    // Help run the network: one fresh key makes the due buy of a vault another
-    // fresh key created in the spec, with private sending to the fork, and is
-    // paid its buy fee; every other vault the panel lists is unticked first,
-    // so no vault the spec didn't make is ever triggered. Real transactions,
-    // so the same budget and the same rule on retries.
     // The page's shell: the tiles and their keys, the display dock, the
     // status widget's reads and the disclaimer gate. Nothing is sent, but one
     // spec waits a minute on an idle page to show the widget doesn't poll, so
@@ -186,9 +181,29 @@ export default defineConfig({
       timeout: 120_000,
       use: { ...devices["Desktop Chrome"], launchOptions },
     },
+    // Help run the network: fresh keys make the due buys of vaults another
+    // fresh key created in the spec, with private sending to the fork, and are
+    // paid their buy fees: a wallet with no SPX only the buys past their
+    // community window, a community keeper's one inside it. Every other vault
+    // the panel lists is unticked first, so no vault the spec didn't make is
+    // ever triggered. Real transactions, so the same budget and the same rule
+    // on retries.
     {
       name: "help-run",
       testMatch: /help-run\.spec\.ts/,
+      timeout: 240_000,
+      retries: 0,
+      use: { ...devices["Desktop Chrome"], launchOptions },
+    },
+    // Community keeping, the fold at the foot of Help run: a wallet's standing
+    // with the SPX holder registry, and proofs of real mainnet holders sent to
+    // it, built in the browser or pasted from another service, with the
+    // page's `finalized` pinned to a block the fork can prove. A proof is a
+    // real transaction, so the same budget, and the same rule on retries: a
+    // proof that lands only on a second try is one to investigate.
+    {
+      name: "community",
+      testMatch: /community\.spec\.ts/,
       timeout: 240_000,
       retries: 0,
       use: { ...devices["Desktop Chrome"], launchOptions },
@@ -214,5 +229,17 @@ export default defineConfig({
     timeout: 120_000,
     stdout: "ignore",
     stderr: "pipe",
+    /*
+     * The suite tests a build that names no published address: no app URL
+     * for a card or a calendar file, no source for Verify this build or a
+     * docs link, no feedback link. Those are a release's settings, and a
+     * developer's `.env.local` may well hold them (for a release build, or
+     * the mainnet smoke run), which would turn the specs that say "this build
+     * names none" red for a reason that isn't spDEX's. Set here, in the
+     * server's own environment, they win over every `.env` file (Vite reads
+     * the real environment first). A dev server already running is reused
+     * as it is, with whatever it was started with.
+     */
+    env: { VITE_SPDEX_APP_URL: "", VITE_SPDEX_SOURCE_URL: "", VITE_SPDEX_FEEDBACK_URL: "" },
   },
 });

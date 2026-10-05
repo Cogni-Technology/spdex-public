@@ -30,6 +30,16 @@ interface Vm {
     function getRecordedLogs() external returns (VmLog[] memory);
     function label(address account, string calldata newLabel) external;
     function addr(uint256 privateKey) external pure returns (address);
+    /// Saves the whole EVM state, and puts it back: two calls compared from one moment.
+    function snapshotState() external returns (uint256 snapshotId);
+    function revertToState(uint256 snapshotId) external returns (bool success);
+    /// Every call to `callee` whose calldata starts with `data` reverts with `revertData`, until
+    /// `clearMockedCalls`: how a test makes a contract it cannot change fail.
+    function mockCallRevert(address callee, bytes calldata data, bytes calldata revertData) external;
+    function clearMockedCalls() external;
+    function toString(uint256 value) external pure returns (string memory);
+    /// Marks `target` and its storage cold again, as a new transaction would find them.
+    function cool(address target) external;
 }
 
 /// forge's console: a call to this address with a known signature is printed with `-vv`.

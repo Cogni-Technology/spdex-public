@@ -44,7 +44,7 @@ contract ReentrancyTest is ForkTest {
         token.arm(vault);
 
         vm.prank(keeper);
-        uint256 received = vault.execute();
+        (uint256 received,) = vault.execute(keeper);
 
         assertEq(token.attempts(), 1, "the token tried, from inside the pair's payout");
         assertEq(token.lastRevert(), abi.encodeWithSelector(SpdexDcaVault.Reentrancy.selector), "and was refused");
@@ -67,7 +67,7 @@ contract ReentrancyTest is ForkTest {
 
         vm.prank(keeper);
         vm.expectRevert(abi.encodeWithSelector(SpdexDcaVault.DeliveredShort.selector, delivered, spotOut));
-        vault.execute();
+        vault.execute(keeper);
     }
 
     function test_anOwnerContractCannotReenterWhileBeingPaid() public {
@@ -92,7 +92,9 @@ contract ReentrancyTest is ForkTest {
     function test_aKeeperContractCannotBuyTwiceInOneTransaction() public {
         SpdexDcaVault vault = createFunded(defaultPlan());
         DoubleKeeper doubleKeeper = new DoubleKeeper();
-        doubleKeeper.run(vault);
+        address rewardTo = fresh("double-keeper-reward-to");
+        makeEligible(rewardTo);
+        doubleKeeper.run(vault, rewardTo);
 
         Terms memory t = vault.terms();
         assertEq(
@@ -101,6 +103,6 @@ contract ReentrancyTest is ForkTest {
             "the second call in the same window is refused"
         );
         assertEq(vault.buysDone(), 1, "one buy");
-        assertEq(wethOf(address(doubleKeeper)), t.keeperReward, "one reward");
+        assertEq(wethOf(rewardTo), t.keeperReward, "one reward");
     }
 }

@@ -3,11 +3,14 @@
  * each one's progress, balance and price were when it last looked.
  *
  * Discovery reads the listed factories' own lists (or checks an allowlist
- * against them) and adds each vault they vouch for; the accounting pass reads
- * every watched vault's progress and balance every `accountingSeconds`, and
- * retires what is closed or finished. The reads themselves take an endpoint
- * and the WETH address, never the tick, and a figure one could not get comes
- * back null — unknown, never zero.
+ * against them) and adds each vault they vouch for, of every release alike,
+ * each read with its release's own source's ABI (`decodeTerms`); the accounting pass reads every
+ * watched vault's progress and balance every `accountingSeconds`, and retires
+ * what is closed or finished; and every tick reads, in each release's SPX
+ * holder registry, whether the keeper's `rewardTo` may be paid inside that
+ * release's community windows. The reads themselves take an endpoint and the
+ * WETH address, never the tick, and a figure one could not get comes back
+ * null — unknown, never zero, and never eligible.
  *
  * Nothing here decides whether to send, or signs: `keeper.ts` plans from what
  * this file cached, and `keeper-pending.ts` follows what was sent.
@@ -16,12 +19,34 @@
 import { decodeFunctionResult, encodeFunctionData, parseAbi } from "viem";
 import type { Address, Hex } from "@spdex/core";
 import { CONTRACTS, Multicall3Reader, type JsonRpc } from "@spdex/chain";
-import { FACTORY_ABI, MAINNET_DEPLOYMENT, MAINNET_FACTORY, VAULT_ABI, type Deployment } from "./artifacts.js";
-import { WETH_ABI, decodeOr, decodeVaultProgress, normaliseTerms, vaultProgressCallCount, vaultProgressCalls, type VaultProgress, type VaultTerms } from "./index.js";
-import { earliestBuyAt, windowOf } from "./keeper-plan.js";
+import { FACTORY_ABI, VAULT_ABI, type Deployment } from "./artifacts.js";
+import {
+  WETH_ABI,
+  decodeOr,
+  decodeTerms,
+  decodeVaultProgress,
+  findVaultNonce,
+  onTurn,
+  readHolderStatus,
+  vaultProgressCallCount,
+  vaultProgressCalls,
+  type VaultProgress,
+  type VaultTerms,
+} from "./index.js";
+import { dueSinceAt, earliestBuyAt, turnEndsAtOf, urgentFrom, windowOf } from "./keeper-plan.js";
 import { revertDataOf } from "./keeper-send.js";
 import type { VaultEntry } from "./keeper-state.js";
 import type { Tick } from "./keeper.js";
+
+/**
+ * Clones proven per tick, at most. A proof is a search over the owner's nonces,
+ * at most `MAX_VAULT_NONCE_SEARCH` (4,096) CREATE2 addresses, about a quarter
+ * of a second; an honest owner's count is a handful. The bound is for an
+ * endpoint that lies about the count, which can make the search long and fail,
+ * never succeed: so a tick spends at most a few seconds on it, and a failed
+ * vault rests an hour.
+ */
+const PROOFS_PER_TICK = 10;
 
 /** Vaults read from a factory's list per call. */
 const DISCOVERY_PAGE = 500n;
@@ -34,6 +59,8 @@ const BALANCES_PER_CALL = 200;
 const MULTICALL_GAS = 30_000_000n;
 /** How long an address no listed factory vouches for, or a vault that cannot pay, waits before it is read again. */
 export const RECHECK_SECONDS = 3_600n;
+/** A transaction sent now lands in a later block: about this much later, on Ethereum. */
+const NEXT_BLOCK_SECONDS = 12n;
 
 const PAIR_ABI = parseAbi(["function getReserves() view returns (uint112, uint112, uint32)"]);
 
@@ -117,11 +144,18 @@ export async function discover(t: Tick): Promise<"syncing" | "running"> {
         const read = await readOwnersAndTerms(t.rpc, chunk, []);
         for (const vault of chunk) {
           const r = read.get(vault);
-          if (!r?.owner || !r.terms) {
+          if (!r?.owner || r.termsData === undefined || r.termsData === "0x") {
             progressed = false;
             break;
           }
-          if (!state.vaults[vault] && !state.retired.includes(vault)) addVault(t, vault, deployment.id, known.scannedCount, r.owner, r.terms);
+          // A factory lists only clones of its own implementation, so its vaults answer in its release's source's
+          // shape. One that doesn't is not a vault this keeper can judge: passed over, and said so, never guessed at.
+          const terms = decodeTerms(r.termsData, deployment.source);
+          if (terms === null) {
+            t.emit({ type: "error", where: "discover", message: `${vault} on ${deployment.id}'s list answers terms of another source than ${deployment.source}; it is passed over` });
+          } else if (!state.vaults[vault] && !state.retired.includes(vault)) {
+            addVault(t, vault, deployment.id, known.scannedCount, r.owner, terms);
+          }
           known.scannedCount += 1n;
         }
       }
@@ -153,12 +187,15 @@ async function discoverAllowlisted(t: Tick, allowlist: readonly Address[]): Prom
     for (const vault of chunk) {
       const r = read.get(vault);
       const deployment = r?.vouchedBy ?? null;
-      if (r?.owner && r.terms && deployment) {
+      const listed = t.config.deployments.find((d) => d.id === deployment);
+      // Its terms as its vouching release's source lays them out: a vault of that factory answers in no other shape.
+      const terms = listed ? decodeTerms(r?.termsData, listed.source) : null;
+      if (r?.owner && terms && deployment && listed) {
         delete state.notVouched[vault];
-        addVault(t, vault, deployment, null, r.owner, r.terms);
+        addVault(t, vault, deployment, null, r.owner, terms);
         continue;
       }
-      const detail = !r?.terms ? "not a vault" : "no listed factory vouches for it";
+      const detail = !r?.termsData || r.termsData === "0x" || (listed && !terms) ? "not a vault" : "no listed factory vouches for it";
       if (!state.notVouched[vault]) {
         t.emit({ type: "skip", vault, slot: null, code: "not-vouched", detail });
       }
@@ -174,6 +211,7 @@ function addVault(t: Tick, vault: Address, deployment: string, index: bigint | n
     index,
     owner,
     terms,
+    nonce: null,
     buysDone: 0n,
     lastBuyAt: 0n,
     closed: false,
@@ -185,13 +223,11 @@ function addVault(t: Tick, vault: Address, deployment: string, index: bigint | n
     lastSkip: null,
     watchedSlot: null,
   };
-  // Only this build's factory was made with MAINNET_DEPLOYMENT's markets. Another release's list may differ, so
-  // there the index is left unknown rather than guessed; the report takes it from `VaultCreated` in any case.
-  const factory = t.config.deployments.find((d) => d.id === deployment)?.factory;
-  const marketIndex =
-    factory !== undefined && lower(factory) === lower(MAINNET_FACTORY)
-      ? MAINNET_DEPLOYMENT.markets.findIndex((m) => m.tokenOut === terms.tokenOut && m.pair === terms.pair && m.oraclePool === terms.oraclePool)
-      : -1;
+  // The market list its release records it was deployed with (deployments.json). A factory deployed with another
+  // list is another release, so the index is the one its own list gives; one no market matches is left unknown
+  // rather than guessed, and the report takes it from `VaultCreated` in any case.
+  const markets = t.config.deployments.find((d) => d.id === deployment)?.markets ?? [];
+  const marketIndex = markets.findIndex((m) => lower(m.tokenOut) === terms.tokenOut && lower(m.pair) === terms.pair && lower(m.oraclePool) === terms.oraclePool);
   t.emit({
     type: "vault_found",
     vault,
@@ -206,6 +242,8 @@ function addVault(t: Tick, vault: Address, deployment: string, index: bigint | n
     startAt: terms.startAt,
     keeperReward: terms.keeperReward,
     maxSlippageBps: terms.maxSlippageBps,
+    communityWindow: terms.communityWindow,
+    turnBuckets: terms.turnBuckets,
   });
 }
 
@@ -216,6 +254,87 @@ export function retire(t: Tick, vault: Address, reason: "closed" | "done"): void
   if (!t.state.retired.includes(vault)) t.state.retired.push(vault);
   t.outcomes.delete(vault);
   t.emit({ type: "vault_retired", vault, reason });
+}
+
+// ─── Proving a vault is its factory's ─────────────────────────────────────────
+
+/**
+ * Prove, before any of `vaults` is first sent, that each is its factory's
+ * clone, without believing the endpoint: its CREATE2 address is recomputed from
+ * the factory, the owner and terms it answers, and a nonce below the factory's
+ * `nonces(owner)` (`findVaultNonce`), and it is admitted only when that is its
+ * address. The batcher from v2 on asks no factory whether it is calling a
+ * vault, so this is what stands between an endpoint that lists a hostile
+ * contract in a factory's `vaultsPage`, and answers its simulation as well, and
+ * this key paying that contract up to `gasPerVault` a batch. A lying endpoint
+ * can only make a proof fail — then the vault is skipped (`unproven`) and
+ * rested an hour — never make one pass: an address that matches is the
+ * factory's clone with exactly those terms, on the real chain.
+ *
+ * The owner and terms are read again for the proof, so a read the endpoint got
+ * wrong at discovery does not keep a vault out for good; when the proof holds,
+ * they replace the cached ones. The nonce is kept, and a vault is proven once.
+ * v1's batcher still asks its factory, and its vaults are proven the same way.
+ */
+export async function proveClones(t: Tick, vaults: readonly Address[]): Promise<void> {
+  const todo = vaults.filter((vault) => t.state.vaults[vault]?.nonce === null).slice(0, PROOFS_PER_TICK);
+  if (todo.length === 0) return;
+  const factoryOf = (vault: Address) => {
+    const e = t.state.vaults[vault]!;
+    return t.config.deployments.find((d) => d.id === e.deployment) ?? null;
+  };
+  const calls = todo.flatMap((vault) => {
+    const e = t.state.vaults[vault]!;
+    const factory = lower(factoryOf(vault)?.factory ?? vault);
+    return [
+      { to: vault, data: encodeFunctionData({ abi: VAULT_ABI, functionName: "owner" }) },
+      { to: vault, data: encodeFunctionData({ abi: VAULT_ABI, functionName: "terms" }) },
+      { to: factory, data: encodeFunctionData({ abi: FACTORY_ABI, functionName: "nonces", args: [e.owner] }) },
+    ];
+  });
+  let results: string[];
+  try {
+    results = await reader(t.rpc, 3 * VAULTS_PER_CALL).multicall(calls);
+  } catch {
+    // Nothing read: nothing proven, and nothing sent unproven. The next tick tries again.
+    for (const vault of todo) unproven(t, vault, "its owner, terms and factory nonce could not be read", false);
+    return;
+  }
+  todo.forEach((vault, i) => {
+    const e = t.state.vaults[vault]!;
+    const deployment = factoryOf(vault);
+    const at = (k: number) => results[i * 3 + k];
+    const owner = decodeOr(at(0), (data) => lower(decodeFunctionResult({ abi: VAULT_ABI, functionName: "owner", data })));
+    if (owner !== null && owner !== e.owner) {
+      // The owner read now is not the one cached: the count was asked for the wrong one. Asked again for this one
+      // next tick; nothing about it is believed until then.
+      e.owner = owner;
+      unproven(t, vault, "its owner read now differs from the one cached; its factory nonce is read again", false);
+      return;
+    }
+    const terms = deployment === null ? null : decodeTerms(at(1), deployment.source);
+    const below = decodeOr(at(2), (data) => decodeFunctionResult({ abi: FACTORY_ABI, functionName: "nonces", data }));
+    const nonce =
+      deployment === null || owner === null || terms === null || below === null
+        ? null
+        : findVaultNonce({ factory: lower(deployment.factory), owner, terms, vault, below });
+    if (nonce === null) {
+      unproven(t, vault, `its address is not where ${deployment?.id ?? "its"} factory puts a vault for the owner and terms read`, true);
+      return;
+    }
+    e.owner = owner!;
+    e.terms = terms!;
+    e.nonce = nonce;
+  });
+}
+
+/** A vault not proven its factory's: skipped, and, when the reads answered and did not match, rested an hour. */
+function unproven(t: Tick, vault: Address, detail: string, rest: boolean): void {
+  const e = t.state.vaults[vault];
+  if (!e) return;
+  if (rest) e.restingUntil = t.chainTime + RECHECK_SECONDS;
+  t.result.skipped.push({ vault, code: "unproven", detail });
+  t.outcomes.set(vault, { code: "unproven", detail });
 }
 
 // ─── Accounting ───────────────────────────────────────────────────────────────
@@ -294,14 +413,126 @@ export function currentSlot(t: Pick<Tick, "chainTime">, e: VaultEntry): bigint |
   return earliest === null ? null : windowOf(e.terms, earliest > t.chainTime ? earliest : t.chainTime).slot;
 }
 
+// ─── Eligibility ──────────────────────────────────────────────────────────────
+
+/**
+ * Whether the keeper's `rewardTo` may be paid inside each listed release's
+ * community windows, read every tick from each release's SPX holder registry
+ * (`readHolderStatus`: the registry's own `isEligible`, `validUntil`, the SPX
+ * balance and whether it is an account, at the head), into
+ * `state.eligibility`. Nothing is read without a `rewardTo` — a dry run with
+ * no key and none configured — and then nothing is eligible. A registry with
+ * no code answers not eligible: its vaults fail closed, and their buys open to
+ * anyone when their windows end.
+ */
+export async function readEligibility(t: Tick): Promise<void> {
+  const holder = t.rewardTo;
+  for (const d of t.config.deployments) {
+    if (d.registry === null) continue;
+    const registry = lower(d.registry);
+    if (holder === null) {
+      delete t.state.eligibility[d.id];
+      continue;
+    }
+    const status = await readHolderStatus(t.rpc, holder, { registry, reader: reader(t.rpc, VAULTS_PER_CALL) });
+    t.state.eligibility[d.id] =
+      status.state === "not-deployed"
+        ? { registry, holder, eligible: null, validUntil: null, spx: null, isAccount: null, readAt: t.chainTime }
+        : { registry, holder, eligible: status.eligible, validUntil: status.validUntil, spx: status.balance, isAccount: status.isAccount, readAt: t.chainTime };
+  }
+}
+
+/**
+ * Whether this keeper's `rewardTo` may be paid inside `e`'s community window,
+ * by this tick's read: it is the vault's owner (always allowed, and the fee
+ * comes back to them), or its release's registry answered `isEligible` true
+ * at this head and its proof is still valid in the next block — the earliest
+ * a buy sent now is made, and where the vault asks; a proof that lapses
+ * before then would only buy a `NotEligible`. Anything unknown — no
+ * `rewardTo`, no read this tick, a read that failed — is "no": a keeper never
+ * assumes it is eligible.
+ */
+export function mayBePaidInWindow(t: Pick<Tick, "rewardTo" | "chainTime" | "state">, e: VaultEntry): boolean {
+  if (t.rewardTo === null) return false;
+  if (t.rewardTo === e.owner) return true;
+  const read = t.state.eligibility[e.deployment];
+  return (
+    read !== undefined &&
+    read.holder === t.rewardTo &&
+    read.readAt === t.chainTime &&
+    read.eligible === true &&
+    read.validUntil !== null &&
+    read.validUntil >= t.chainTime + NEXT_BLOCK_SECONDS
+  );
+}
+
+/**
+ * A vault's community window around its next buy, as the vault will judge it
+ * at `now` (`dueSinceAt`): when the buy fell due, the first second it is open
+ * to anyone (`endsAt`), and from when an eligible keeper bids the urgent tip
+ * (`urgentAt`, decision 19). Null for a vault whose source has no window
+ * (v1's), and for one with no buy left.
+ */
+export function communityWindowOf(e: VaultEntry, now: bigint): { dueSince: bigint; endsAt: bigint; urgentAt: bigint } | null {
+  const window = e.terms.communityWindow;
+  if (window === null) return null;
+  const dueSince = dueSinceAt(e.terms, e.buysDone, e.lastBuyAt, now);
+  if (dueSince === null) return null;
+  const endsAt = dueSince + window;
+  return { dueSince, endsAt, urgentAt: urgentFrom(endsAt, window) };
+}
+
+/**
+ * Until when another bucket of holders has first claim on `vault`'s due buy, for
+ * a keeper that may be paid inside its window but whose `rewardTo` is not in the
+ * slot's bucket: the end of its turn (`turnEndsAtOf`), the window's first half,
+ * after which any eligible holder may be paid. Null when the plan has no turns,
+ * the buy is not due or its turn is over, or `rewardTo` is the owner or in the
+ * bucket (`onTurn`) — then nothing about turns holds it back. Recomputed from
+ * the head every tick, never kept.
+ */
+export function turnHeldUntil(t: Pick<Tick, "rewardTo" | "chainTime">, vault: Address, e: VaultEntry): bigint | null {
+  if (t.rewardTo === null) return null;
+  const earliest = earliestBuyAt(e.terms, e.buysDone, e.lastBuyAt);
+  if (earliest === null || t.chainTime < earliest) return null;
+  const turnEndsAt = turnEndsAtOf(e.terms, e.buysDone, e.lastBuyAt, t.chainTime);
+  if (turnEndsAt === null || t.chainTime >= turnEndsAt) return null;
+  const dueSince = dueSinceAt(e.terms, e.buysDone, e.lastBuyAt, t.chainTime);
+  if (dueSince === null) return null;
+  return onTurn({ vault, owner: e.owner, rewardTo: t.rewardTo, terms: e.terms, dueSince, now: t.chainTime }) ? null : turnEndsAt;
+}
+
+/**
+ * Until when SPX holders have first claim on `e`'s due buy, for a keeper
+ * that may not be paid inside its window; null when a buy sent now is open
+ * to anyone (or the vault is v1's, or not due). That is the window's end —
+ * unless the buy's slot ends before a transaction sent now could land: then
+ * it would land in the next slot, as that slot's buy, inside that slot's own
+ * window (decision 10), and the vault would refuse it. So then it is the
+ * next slot's window's end. Recomputed from the head every tick, never kept.
+ */
+export function holdersFirstUntil(e: VaultEntry, now: bigint): bigint | null {
+  const earliest = earliestBuyAt(e.terms, e.buysDone, e.lastBuyAt);
+  const window = communityWindowOf(e, now);
+  if (earliest === null || window === null || now < earliest) return null;
+  if (now < window.endsAt) return window.endsAt;
+  const slotEnd = windowOf(e.terms, now).windowEnd;
+  return now + NEXT_BLOCK_SECONDS >= slotEnd ? slotEnd + e.terms.communityWindow! : null;
+}
+
 // ─── Reads ────────────────────────────────────────────────────────────────────
 
-/** `owner()` and `terms()` of each vault, and, when `vouching` names releases, which of their factories vouches for it. */
+/**
+ * `owner()` and `terms()` of each vault — the terms as the vault answered them,
+ * for the caller to decode with the source of the release that vouches for it
+ * (`decodeTerms`): one selector, an answer of each source's shape — and, when
+ * `vouching` names releases, which of their factories vouches for it.
+ */
 async function readOwnersAndTerms(
   rpc: JsonRpc,
   vaults: readonly Address[],
   vouching: readonly Deployment[],
-): Promise<Map<Address, { owner: Address | null; terms: VaultTerms | null; vouchedBy: string | null }>> {
+): Promise<Map<Address, { owner: Address | null; termsData: string | undefined; vouchedBy: string | null }>> {
   const per = 2 + vouching.length;
   const calls = vaults.flatMap((vault) => [
     { to: vault, data: encodeFunctionData({ abi: VAULT_ABI, functionName: "owner" }) },
@@ -309,13 +540,12 @@ async function readOwnersAndTerms(
     ...vouching.map((d) => ({ to: lower(d.factory), data: encodeFunctionData({ abi: FACTORY_ABI, functionName: "isVault", args: [vault] }) })),
   ]);
   const results = await reader(rpc, per * VAULTS_PER_CALL).multicall(calls);
-  const out = new Map<Address, { owner: Address | null; terms: VaultTerms | null; vouchedBy: string | null }>();
+  const out = new Map<Address, { owner: Address | null; termsData: string | undefined; vouchedBy: string | null }>();
   vaults.forEach((vault, i) => {
     const at = (k: number) => results[i * per + k];
     const owner = decodeOr(at(0), (data) => lower(decodeFunctionResult({ abi: VAULT_ABI, functionName: "owner", data })));
-    const terms = decodeOr(at(1), (data) => normaliseTerms(decodeFunctionResult({ abi: VAULT_ABI, functionName: "terms", data })));
     const vouchedBy = vouching.find((_, k) => decodeOr(at(2 + k), (data) => decodeFunctionResult({ abi: FACTORY_ABI, functionName: "isVault", data })) === true)?.id ?? null;
-    out.set(vault, { owner, terms, vouchedBy });
+    out.set(vault, { owner, termsData: at(1), vouchedBy });
   });
   return out;
 }

@@ -132,7 +132,9 @@ import {
   closeVault as closeVaultOnChain,
   closedAndEmpty,
   createVault as createVaultOnChain,
+  defaultVaultWindow,
   deployVaultFactory as deployFactoryOnChain,
+  factoryCountsOf,
   foundFromPlan,
   fundVault as fundVaultOnChain,
   mergeVaultSearches,
@@ -157,6 +159,7 @@ import {
   vaultSearchNote,
   vaultSearchRetryAt,
   vaultStartAt,
+  vaultStartLead,
   type ChainClock,
   type FoundVault,
   type OwnerVaults,
@@ -257,11 +260,12 @@ export interface NewPlanInput {
   firstBuyNow: boolean;
   /**
    * A vault plan's choices (`signer: "vault"`): the price allowance, the buy
-   * fee when not this release's default (`vaultCostsFor`), and the wei sent
-   * with the creation — the whole budget when left out, so one confirmation
-   * creates and funds it.
+   * fee when not this release's default (`vaultCostsFor`), the community
+   * window when Expert chose one (the plan's default, `defaultVaultWindow`,
+   * otherwise), and the wei sent with the creation — the whole budget when
+   * left out, so one confirmation creates and funds it.
    */
-  vault?: { maxSlippageBps: number; keeperReward?: bigint; fund?: bigint };
+  vault?: { maxSlippageBps: number; keeperReward?: bigint; communityWindow?: number; fund?: bigint };
 }
 
 /** A vault plan's history as last asked for. */
@@ -467,12 +471,15 @@ export interface AutoBuy {
    * creation didn't happen. The card passes the terms it showed
    * (`vaultRetryFor`); none is defaulted silently.
    */
-  createVault(planId: string, options?: { maxSlippageBps?: number; keeperReward?: bigint; fund?: bigint }): Promise<void>;
+  createVault(
+    planId: string,
+    options?: { maxSlippageBps?: number; keeperReward?: bigint; communityWindow?: number; fund?: bigint },
+  ): Promise<void>;
   /** Fund a vault plan's vault; everything its remaining buys still need when `amount` is left out. */
   fundVault(planId: string, amount?: bigint): Promise<void>;
   /** Close a vault plan's vault: everything it holds goes back to its owner. The only stop a vault has. */
   closeVault(planId: string): Promise<void>;
-  /** Make a vault plan's due buy from the connected wallet, which is paid the buy fee (as WETH). */
+  /** Make a vault plan's due buy from the connected wallet, its owner's, which the buy fee (as WETH) comes back to. */
   triggerVault(planId: string): Promise<void>;
   /** Send the vault factory's one-time deployment (activity key `VAULT_FACTORY_ACTIVITY`). */
   deployVaultFactory(): Promise<void>;
@@ -905,7 +912,6 @@ export function useAutoBuy(deps: AutoBuyDeps): AutoBuy {
     async (plan: DcaPlan): Promise<VaultPlanState> => {
       const { engine: current, config: cfg, account: acct } = latest.current;
       if (current === null) return { kind: "loading" };
-      const factory = current.vaultFactory;
       if (plan.vault === undefined && plan.chainId === cfg.chainId && vaultDeployment(cfg.chainId) !== null) {
         const here = creatingHere.current.get(plan.id);
         if (here !== undefined) return { kind: "creating", vault: here.vault, hash: here.hash };
@@ -913,14 +919,14 @@ export function useAutoBuy(deps: AutoBuyDeps): AutoBuy {
         const creation = draft?.creation;
         if (draft !== null && creation !== undefined) {
           try {
-            const outcome = await settleCreation(current.rpc, { plan, creation, factory, nowMs: Date.now() });
+            const outcome = await settleCreation(current.rpc, { plan, creation, nowMs: Date.now() });
             if (outcome.kind === "pending") return { kind: "creating", vault: creation.vault, hash: creation.hash };
             if (outcome.kind === "failed") {
               const { creation: _gone, ...rest } = draft;
               drafts.set(plan.chainId, plan.id, rest);
               creationNotes.current.set(plan.id, outcome.note);
             } else if (recordVault(plan, outcome.vault)) {
-              return readVaultPlan(current.rpc, { plan: { ...plan, vault: outcome.vault }, chainId: cfg.chainId, account: acct, factory });
+              return readVaultPlan(current.rpc, { plan: { ...plan, vault: outcome.vault }, chainId: cfg.chainId, account: acct });
             }
           } catch (error) {
             return {
@@ -932,7 +938,7 @@ export function useAutoBuy(deps: AutoBuyDeps): AutoBuy {
         }
         return { kind: "not-created", note: creationNotes.current.get(plan.id) ?? null };
       }
-      return readVaultPlan(current.rpc, { plan, chainId: cfg.chainId, account: acct, factory });
+      return readVaultPlan(current.rpc, { plan, chainId: cfg.chainId, account: acct });
     },
     [drafts, recordVault],
   );
@@ -1001,7 +1007,7 @@ export function useAutoBuy(deps: AutoBuyDeps): AutoBuy {
       const count = ++strayReads.current.count;
       for (const vault of targets) strayReads.current.latest.set(vault, count);
       const reads = await Promise.all(
-        targets.map((vault) => readFoundVault(current.rpc, { vault, chainId: cfg.chainId, account: acct, factory: current.vaultFactory })),
+        targets.map((vault) => readFoundVault(current.rpc, { vault, chainId: cfg.chainId, account: acct })),
       );
       // A read from another network service describes another chain, or none;
       // one from an Engine rebuilt for another setting is as good as new.
@@ -1062,20 +1068,18 @@ export function useAutoBuy(deps: AutoBuyDeps): AutoBuy {
         ...(reason === "again" ? { failures: 0 } : {}),
       }));
       try {
-        let result = await searchAccountVaults(current.rpc, {
+        let result: OwnerVaults | null = await searchAccountVaults(current.rpc, {
           chainId: cfg.chainId,
           account: acct,
-          factory: current.vaultFactory,
           known: shown,
         });
         // A network service that caps log searches stops the log search
-        // short. The factory's own list reaches every vault on any service
+        // short. The factories' own lists reach every vault on any service
         // that answers `eth_call`, reading each listed vault's owner instead
         // (lib/dca/factoryListSearch.ts). Its failure leaves the log search's
         // answer, whose note says what is missing.
         if (result !== null && !result.complete) {
           const listed = await searchVaultsFromFactoryList(current.rpc, acct, {
-            factory: current.vaultFactory,
             cache: vaultIdentities(current.rpc, cfg.chainId),
           }).catch(() => null);
           if (listed !== null) result = withListSearch(result, listed);
@@ -1085,7 +1089,7 @@ export function useAutoBuy(deps: AutoBuyDeps): AutoBuy {
         updateFound(key, (entry) => {
           if (result === null) return { ...entry, search: { kind: "done" }, last: null, failures: 0, retryAt: null, checkedAt: now };
           const last = mergeVaultSearches(entry.last, result);
-          const proven = provenVaults({ shown, expected: result.expected, factory: current.vaultFactory, account: acct });
+          const proven = provenVaults({ shown, counts: factoryCountsOf(result), account: acct });
           const accounted = withKnown(entry.accounted, [...last.vaults, ...proven]);
           const failures = vaultSearchFailed(last, accounted.length) ? entry.failures + 1 : 0;
           return {
@@ -1198,8 +1202,7 @@ export function useAutoBuy(deps: AutoBuyDeps): AutoBuy {
     if (entry === undefined || entry.last === null) return;
     const proven = provenVaults({
       shown: shownVaults(foundKey, latest.current.config, acct),
-      expected: entry.last.expected,
-      factory: engine.vaultFactory,
+      counts: factoryCountsOf(entry.last),
       account: acct,
     }).filter((vault) => !entry.accounted.includes(vault));
     if (proven.length === 0) return;
@@ -1762,7 +1765,14 @@ export function useAutoBuy(deps: AutoBuyDeps): AutoBuy {
     });
     const owner = lower(deps.sender.account);
     if (!ownerLock.tryAcquire()) throw new Error("Waiting for your swap to finish… Try again when it's done.");
-    const base = { maxSlippageBps: choices.maxSlippageBps, keeperReward: choices.keeperReward.toString(), fund: fund.toString() };
+    const base = {
+      maxSlippageBps: choices.maxSlippageBps,
+      keeperReward: choices.keeperReward.toString(),
+      communityWindow: choices.communityWindow,
+      fund: fund.toString(),
+    };
+    // Where it is sent: a creation is read back from this factory's receipt.
+    const factory = lower(deps.engine.vaultFactory);
     const here: { vault: Address | null; hash: `0x${string}` | null } = { vault: null, hash: null };
     creatingHere.current.set(plan.id, here);
     try {
@@ -1771,7 +1781,10 @@ export function useAutoBuy(deps: AutoBuyDeps): AutoBuy {
           ...deps,
           onPrepared: ({ vault, nonce }) => {
             here.vault = vault;
-            drafts.set(plan.chainId, plan.id, { ...base, creation: { owner, vault, nonce: nonce.toString(), hash: null, at: Date.now() } });
+            drafts.set(plan.chainId, plan.id, {
+              ...base,
+              creation: { owner, vault, factory, nonce: nonce.toString(), hash: null, at: Date.now() },
+            });
             setVaultStates((previous) => ({ ...previous, [plan.id]: { kind: "creating", vault, hash: null } }));
           },
           onSent: (hash) => {
@@ -1841,7 +1854,11 @@ export function useAutoBuy(deps: AutoBuyDeps): AutoBuy {
     if (support.kind !== "available") return { ok: false, error: support.reason };
     const clock = await readChainClock(current.rpc);
     setChainClock(clock);
-    const startAt = vaultStartAt(plan.startAt, Math.floor(Date.now() / 1000), clock.seconds);
+    // The window the form showed, else the plan's default: the same figure
+    // for a Simple plan, since it depends on the interval alone.
+    const communityWindow = options?.communityWindow ?? defaultVaultWindow(plan.intervalSeconds);
+    if (communityWindow === null) return { ok: false, error: "The plan's interval isn't a whole number of seconds." };
+    const startAt = vaultStartAt(plan.startAt, Math.floor(Date.now() / 1000), clock.seconds, communityWindow);
     const vaultPlan: DcaPlan = { ...plan, paused: true, signer: "vault", startAt };
     delete (vaultPlan as { vault?: string }).vault;
     const maxSlippageBps = options?.maxSlippageBps ?? DEFAULT_VAULT_SLIPPAGE_BPS;
@@ -1850,13 +1867,18 @@ export function useAutoBuy(deps: AutoBuyDeps): AutoBuy {
     // The buy fee the form showed, else this release's for the amount: the
     // two are the same figure, since it depends on nothing else.
     const keeperReward = options?.keeperReward ?? buyFee(amountPerBuy).reward;
-    const choices: VaultChoices = { maxSlippageBps, keeperReward };
+    const choices: VaultChoices = { maxSlippageBps, keeperReward, communityWindow };
     const problem = vaultPlanProblems(vaultPlan, choices, clock.seconds)[0];
     if (problem !== undefined) return { ok: false, error: problem };
     const fund = options?.fund ?? BigInt(plan.maxBuys) * (amountPerBuy + keeperReward);
     const added = addDcaPlan(latest.current.config, vaultPlan);
     if (!added.ok) return { ok: false, error: `spDEX couldn't save this plan: ${added.error.replace(/\.$/, "")}.` };
-    drafts.set(vaultPlan.chainId, vaultPlan.id, { maxSlippageBps, keeperReward: keeperReward.toString(), fund: fund.toString() });
+    drafts.set(vaultPlan.chainId, vaultPlan.id, {
+      maxSlippageBps,
+      keeperReward: keeperReward.toString(),
+      communityWindow,
+      fund: fund.toString(),
+    });
     latest.current.applyConfig(added.config);
     setActivity(vaultPlan.id, { busy: "Getting ready…", notice: null });
     void runCreate(vaultPlan, choices, fund)
@@ -1866,7 +1888,7 @@ export function useAutoBuy(deps: AutoBuyDeps): AutoBuy {
   };
 
   const createVault = useCallback(
-    async (planId: string, options: { maxSlippageBps?: number; keeperReward?: bigint; fund?: bigint } = {}) => {
+    async (planId: string, options: { maxSlippageBps?: number; keeperReward?: bigint; communityWindow?: number; fund?: bigint } = {}) => {
       const plan = planById(planId);
       if (!plan || plan.signer !== "vault") return;
       setActivity(planId, { busy: "Getting ready…", notice: null });
@@ -1888,17 +1910,22 @@ export function useAutoBuy(deps: AutoBuyDeps): AutoBuy {
         if (maxSlippageBps === null) throw new Error("Choose a price allowance for the vault first.");
         const keeperReward = options.keeperReward ?? retry.keeperReward;
         if (keeperReward === null) throw new Error("spDEX couldn't work out this plan's buy fee. Try again in a moment.");
+        const communityWindow = options.communityWindow ?? retry.communityWindow;
+        if (communityWindow === null) throw new Error("spDEX couldn't work out this plan's community window.");
         // A start already past moves to now: the first buy is then due at
         // creation, as it would have been, and a retry days later isn't held
-        // to a start the factory might refuse as too far back.
+        // to a start the factory might refuse as too far back. "Now" is held
+        // back as Start holds it (`vaultStartLead`), so the first buy keeps its
+        // community window when the creation is slow to land.
         let toCreate = plan;
-        if (plan.startAt < clock.seconds) {
-          const moved = updateDcaPlan(latest.current.config, plan.id, { startAt: clock.seconds });
+        const earliest = clock.seconds + vaultStartLead(communityWindow);
+        if (plan.startAt < earliest) {
+          const moved = updateDcaPlan(latest.current.config, plan.id, { startAt: earliest });
           if (!moved.ok) throw new Error(moved.error);
           latest.current.applyConfig(moved.config);
-          toCreate = { ...plan, startAt: clock.seconds };
+          toCreate = { ...plan, startAt: earliest };
         }
-        const choices: VaultChoices = { maxSlippageBps, keeperReward };
+        const choices: VaultChoices = { maxSlippageBps, keeperReward, communityWindow };
         const problem = vaultPlanProblems(toCreate, choices, clock.seconds)[0];
         if (problem !== undefined) throw new Error(problem);
         const fund = options.fund ?? BigInt(plan.maxBuys) * (BigInt(plan.amountPerBuy) + keeperReward);
@@ -2042,7 +2069,9 @@ export function useAutoBuy(deps: AutoBuyDeps): AutoBuy {
       setActivity(activityKeyOf, { busy: "Checking the vault's address…", notice: null });
       let proved: boolean;
       try {
-        proved = (await vaultClaim(current.rpc, current.vaultFactory, { address, owner: lower(acct), terms: state.terms })) !== null;
+        proved =
+          (await vaultClaim(current.rpc, { address, owner: lower(acct), terms: state.terms, factory: state.factory, release: state.release })) !==
+          null;
       } catch (error) {
         fail(activityKeyOf, error);
         return;
@@ -2144,6 +2173,8 @@ export function useAutoBuy(deps: AutoBuyDeps): AutoBuy {
           buysDone: state.buysDone,
           startAt: Number(state.terms.startAt),
           chainId: latest.current.config.chainId,
+          owner: state.owner,
+          communityWindow: state.terms.communityWindow,
         });
         if (latest.current.engine === current) {
           setVaultHistory((previous) => ({ ...previous, [planId]: { kind: "ok", history, buysDone: state.buysDone } }));

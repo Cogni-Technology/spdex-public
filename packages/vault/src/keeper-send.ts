@@ -22,25 +22,46 @@
  * ## What the keeper will sign
  *
  * `assertKeeperMaySign` is the keeper's version of the Guard: right before
- * every signature it allows exactly four shapes — a batch to a listed batcher
- * paying the configured `rewardTo`, the deployment of a listed batcher, a
- * zero-value cancel to itself, and an unwrap of its own WETH when it is its
- * own `rewardTo` — and throws for anything else, whatever the code around it
- * meant to do.
+ * every signature it allows exactly five shapes — a batch to a listed batcher
+ * paying the configured `rewardTo`, at the configured gas per vault, the
+ * deployment of a listed batcher, a zero-value cancel to itself, an unwrap of
+ * its own WETH when it is its own `rewardTo`, and, only with
+ * `SPDEX_KEEPER_PROVE=1`, a proof of the configured `rewardTo`'s SPX to a
+ * listed release's registry — and throws for anything else, whatever the code
+ * around it meant to do.
+ *
+ * Which batcher code a release's batcher is, and so its calldata and its
+ * deployment, is the release's data, never its name (`batcherSourceOfDeployment`):
+ * v1's is bound to v1's factory and takes three arguments; from v2 on one
+ * batcher, bound to no factory, serves every release whose vaults take
+ * `rewardTo`, and takes the gas each vault is given as a fourth. A release
+ * built from an existing source needs nothing here.
  */
 
-import { decodeFunctionData } from "viem";
+import { decodeFunctionData, encodeFunctionData } from "viem";
 import type { Address, Hex } from "@spdex/core";
 import { signPrepared, type JsonRpc, type PreparedFees, type PreparedTransaction } from "@spdex/chain";
-import { BATCHER_ABI, DETERMINISTIC_DEPLOYER } from "./artifacts.js";
-import { deployBatcherCall, joinBatchLogs } from "./batcher.js";
+import {
+  BATCHER_ABI,
+  DETERMINISTIC_DEPLOYER,
+  REGISTRY_ABI,
+  SOURCES,
+  V1_BATCHER_ABI,
+  batcherAddress,
+  batcherInitCode,
+  type Deployment,
+  type SourceId,
+} from "./artifacts.js";
+import { joinBatchLogs } from "./batcher.js";
+import { batcherSourceOf } from "./releases.js";
 import type { RawLog } from "./index.js";
 import { keeperAddress, rewardToOf, type KeeperConfig } from "./keeper-config.js";
 import type { MinedBuy, MinedRefusal } from "./keeper-log.js";
 import type { KeeperState, PendingAttempt, PendingTx } from "./keeper-state.js";
 
-export const EXECUTE_BATCH_SELECTOR = "0xf4ccdffc";
 export const WETH_WITHDRAW_SELECTOR = "0x2e1a7d4d";
+/** The SPX holder registry's `prove(address,bytes,bytes[],bytes[])`. */
+export const PROVE_SELECTOR = "0x0c4ce46d";
 /** A cancel is a plain transfer. */
 export const CANCEL_GAS = 21_000n;
 /** WETH's `withdraw`, with room: about 35,000 in practice. */
@@ -48,7 +69,7 @@ export const UNWRAP_GAS = 60_000n;
 
 // ─── What may be signed ───────────────────────────────────────────────────────
 
-/** The keeper was asked to sign something outside the four shapes it may. */
+/** The keeper was asked to sign something outside the five shapes it may. */
 export class KeeperSignRefused extends Error {
   constructor(message: string) {
     super(`refusing to sign: ${message}`);
@@ -57,11 +78,22 @@ export class KeeperSignRefused extends Error {
 }
 
 /**
- * Throw unless `tx` is one of the four transactions a keeper signs: a batch
- * to a listed batcher paying the configured `rewardTo`; a listed batcher's
- * deployment through the deterministic deployer; a zero-value, empty cancel
- * to itself; or `WETH.withdraw` of its own rewards, only when it is its own
- * `rewardTo`. Every one carries no ether.
+ * Throw unless `tx` is one of the five transactions a keeper signs: a batch
+ * to a listed batcher paying the configured `rewardTo` — and, to a batcher
+ * that takes it, giving each vault the configured `gasPerVault`; a listed
+ * batcher's deployment through the deterministic deployer, from its own code,
+ * landing at the address its release lists;
+ * a zero-value, empty cancel to itself; `WETH.withdraw` of its own rewards,
+ * only when it is its own `rewardTo`; or `prove` to a listed release's SPX
+ * holder registry for the configured `rewardTo` and no one else, only when
+ * the operator turned proving on (`config.prove`). Every one carries no ether.
+ *
+ * The fifth shape is as narrow as it is because a hot key that can be talked
+ * into signing anything for a registry is one a bug, or an endpoint that
+ * lies, could spend: a proof moves no money, but its gas is the key's. A
+ * proof for another holder, a call to a registry that is not listed, or any
+ * other function of one, is refused, and so is every proof while proving is
+ * off.
  */
 export function assertKeeperMaySign(tx: PreparedTransaction, config: KeeperConfig): void {
   const keeper = keeperAddress(config);
@@ -72,20 +104,39 @@ export function assertKeeperMaySign(tx: PreparedTransaction, config: KeeperConfi
   const to = lower(tx.to);
   const data = tx.data.toLowerCase() as Hex;
 
-  if (config.deployments.some((d) => lower(d.batcher) === to)) {
-    if (!data.startsWith(EXECUTE_BATCH_SELECTOR)) throw new KeeperSignRefused("only executeBatch may be sent to a batcher");
-    let args: readonly unknown[];
+  const batching = config.deployments.find((d) => lower(d.batcher) === to);
+  if (batching) {
+    const source = batcherSourceOfDeployment(batching);
+    let decoded: { functionName: string; args: readonly unknown[] };
     try {
-      args = decodeFunctionData({ abi: BATCHER_ABI, data }).args ?? [];
+      const call = decodeFunctionData({ abi: SOURCES[source].batcherAbi as typeof BATCHER_ABI, data });
+      decoded = { functionName: call.functionName, args: call.args ?? [] };
     } catch {
-      throw new KeeperSignRefused("the batch's calldata does not decode");
+      throw new KeeperSignRefused("only executeBatch may be sent to a batcher, and the calldata must decode as this batcher's");
     }
+    if (decoded.functionName !== "executeBatch") throw new KeeperSignRefused("only executeBatch may be sent to a batcher");
+    const args = decoded.args;
     if (lower(String(args[1])) !== rewardToOf(config)) throw new KeeperSignRefused("the batch pays a rewardTo other than the configured one");
+    if (SOURCES[source].features.sharedBatcher && args[3] !== config.gasPerVault) {
+      throw new KeeperSignRefused(`the batch gives each vault ${String(args[3])} gas, not the configured ${config.gasPerVault}`);
+    }
     return;
   }
   if (to === DETERMINISTIC_DEPLOYER) {
-    if (config.deployments.some((d) => deployBatcherCall(lower(d.factory)).data.toLowerCase() === data)) return;
+    if (config.deployments.some((d) => batcherDeploymentOf(d, config.weth)?.data === data)) return;
     throw new KeeperSignRefused("only a listed batcher's deployment may be sent to the deployer");
+  }
+  if (config.deployments.some((d) => d.registry !== null && lower(d.registry) === to)) {
+    if (!config.prove) throw new KeeperSignRefused("proving is off: SPDEX_KEEPER_PROVE is not 1");
+    if (!data.startsWith(PROVE_SELECTOR)) throw new KeeperSignRefused("only prove may be sent to a registry");
+    let args: readonly unknown[];
+    try {
+      args = decodeFunctionData({ abi: REGISTRY_ABI, data }).args ?? [];
+    } catch {
+      throw new KeeperSignRefused("the proof's calldata does not decode");
+    }
+    if (lower(String(args[0])) !== rewardToOf(config)) throw new KeeperSignRefused("the proof is for a holder other than the configured rewardTo");
+    return;
   }
   if (to === keeper) {
     if (data === "0x") return;
@@ -96,7 +147,72 @@ export function assertKeeperMaySign(tx: PreparedTransaction, config: KeeperConfi
     if (rewardToOf(config) !== keeper) throw new KeeperSignRefused("rewards go elsewhere, so there is nothing of the keeper's to unwrap");
     return;
   }
-  throw new KeeperSignRefused(`${to} is not a listed batcher, the deployer, WETH or the keeper`);
+  throw new KeeperSignRefused(`${to} is not a listed batcher or registry, the deployer, WETH or the keeper`);
+}
+
+/**
+ * The source a release's batcher was built from, which decides its ABI and its
+ * code: the listed batcher's own (`batcherSourceOf`: v1's frozen code for v1's,
+ * the batcher's entry for each shared one), or, for a batcher spDEX does not
+ * list — a test's, or a fork's — its release's own source. Throws for a release
+ * whose source this build has no row for, which only a hand-edited config can
+ * name: no batcher code is ever guessed for it.
+ */
+export function batcherSourceOfDeployment(d: Pick<Deployment, "id" | "batcher" | "source">): SourceId {
+  const source = batcherSourceOf(lower(d.batcher)) ?? d.source;
+  if (!(source in SOURCES)) throw new Error(`deployment ${d.id} names source ${String(source)}, which this keeper has no code for`);
+  return source;
+}
+
+/**
+ * The gas a batch to `d`'s batcher gives each vault: the keeper's `gasPerVault`
+ * for a batcher bound to no factory, which takes it as an argument; for v1's,
+ * which takes none, the fixed cap it was built with.
+ */
+export function gasPerVaultOf(config: Pick<KeeperConfig, "gasPerVault">, d: Pick<Deployment, "id" | "batcher" | "source">): bigint {
+  const source = SOURCES[batcherSourceOfDeployment(d)];
+  if (source.features.sharedBatcher) return config.gasPerVault;
+  return (source.batcherLimits as Partial<Record<string, bigint>>)["EXECUTE_GAS_CAP"] ?? config.gasPerVault;
+}
+
+/**
+ * `executeBatch`'s calldata for `d`'s batcher, in its own source's shape: with
+ * `gasPerVault` as a fourth argument for a batcher bound to no factory, without
+ * it for v1's.
+ */
+export function encodeBatchFor(
+  d: Pick<Deployment, "id" | "batcher" | "source">,
+  vaults: readonly Address[],
+  rewardTo: Address,
+  minRewards: bigint,
+  gasPerVault: bigint,
+): Hex {
+  const source = SOURCES[batcherSourceOfDeployment(d)];
+  return source.features.sharedBatcher
+    ? encodeFunctionData({ abi: source.batcherAbi as typeof BATCHER_ABI, functionName: "executeBatch", args: [vaults, rewardTo, minRewards, gasPerVault] })
+    : encodeFunctionData({ abi: source.batcherAbi as typeof V1_BATCHER_ABI, functionName: "executeBatch", args: [vaults, rewardTo, minRewards] });
+}
+
+/**
+ * The deterministic deployer's call that deploys `d`'s batcher from its own
+ * code — built for WETH when it is bound to no factory, for its factory when it
+ * is v1's — and where it lands; null when that code does not land at
+ * `d.batcher`, which would put a batcher where no release lists one. Lowercase.
+ */
+export function batcherDeploymentOf(
+  d: Pick<Deployment, "id" | "batcher" | "factory" | "source">,
+  weth: Address,
+): { to: Address; data: Hex; batcher: Address } | null {
+  const source = batcherSourceOfDeployment(d);
+  const s = SOURCES[source];
+  const argument = s.features.sharedBatcher ? lower(weth) : lower(d.factory);
+  if (batcherAddress(argument, source) !== lower(d.batcher)) return null;
+  return {
+    to: DETERMINISTIC_DEPLOYER,
+    // The deterministic deployer's whole interface: 32 bytes of salt, then init code.
+    data: `0x${s.batcherSalt.slice(2)}${batcherInitCode(argument, source).slice(2)}`.toLowerCase() as Hex,
+    batcher: lower(d.batcher),
+  };
 }
 
 // ─── Building and sending ─────────────────────────────────────────────────────
@@ -148,6 +264,7 @@ export function newPendingTx(
     receiptBlock: null,
     missedReceiptChecks: 0,
     consumedSeenAt: null,
+    proveBlock: null,
     attempts: [],
     ...fields,
   };
@@ -270,9 +387,10 @@ export interface BatchMined {
   gasUsed: bigint;
   effectiveGasPrice: bigint;
   costWei: bigint;
-  /** WETH the batch earned: `Batch.earned`. Stray WETH it swept is never revenue. */
+  /** WETH the batch earned: `Batch.earned`. Stray WETH v1's batcher swept is never revenue. */
   earnedWei: bigint;
-  sweptWei: bigint;
+  /** v1's sweep, beside the rewards; null for a batcher bound to no factory, which holds and moves no WETH. */
+  sweptWei: bigint | null;
   netWei: bigint;
   listed: bigint;
   tried: bigint;
@@ -287,12 +405,15 @@ export interface BatchMined {
  * each `NotTriggered`. Only logs from `batcher` count as the batcher's, and
  * only a `Bought` from the vault its `Triggered` names counts as that vault's.
  * A vault listed but in neither was not tried.
+ *
+ * A buy from a source with a community window says who it paid and when it
+ * fell due; with its terms' window (`clockOf`), whether it was made inside it.
  */
 export function decodeBatchReceipt(input: {
   receipt: RpcReceipt;
   batcher: Address;
   vaults: readonly Address[];
-  clockOf: (vault: Address) => { startAt: bigint; interval: bigint } | null;
+  clockOf: (vault: Address) => { startAt: bigint; interval: bigint; communityWindow?: bigint | null } | null;
   blockTime: bigint;
   batchId: string;
   nonce: number;
@@ -311,7 +432,7 @@ export function decodeBatchReceipt(input: {
     costWei,
   };
   if (receipt.status !== 1n) {
-    return { ...base, status: "reverted", earnedWei: 0n, sweptWei: 0n, netWei: -costWei, listed: BigInt(input.vaults.length), tried: 0n, bought: [], refused: [], notTried: [] };
+    return { ...base, status: "reverted", earnedWei: 0n, sweptWei: null, netWei: -costWei, listed: BigInt(input.vaults.length), tried: 0n, bought: [], refused: [], notTried: [] };
   }
   const batcher = lower(input.batcher);
   const runs = joinBatchLogs(receipt.logs, (address) => address === batcher);
@@ -323,6 +444,7 @@ export function decodeBatchReceipt(input: {
       if (b === null) continue;
       const clock = input.clockOf(event.vault);
       const windowStart = clock ? clock.startAt + b.slot * clock.interval : null;
+      const communityWindow = clock?.communityWindow ?? null;
       bought.push({
         vault: event.vault,
         slot: b.slot,
@@ -334,6 +456,9 @@ export function decodeBatchReceipt(input: {
         reward: b.reward,
         gasUsed: event.gasUsed,
         secondsIntoWindow: windowStart === null ? 0n : input.blockTime - windowStart,
+        rewardTo: b.rewardTo,
+        dueSince: b.dueSince,
+        inCommunityWindow: b.dueSince === null || communityWindow === null ? null : input.blockTime < b.dueSince + communityWindow,
       });
     }
     for (const event of run.notTriggered) refused.push({ vault: event.vault, reason: event.reason, reasonName: event.reasonName, gasUsed: event.gasUsed });
@@ -344,7 +469,8 @@ export function decodeBatchReceipt(input: {
     ...base,
     status: "success",
     earnedWei,
-    sweptWei: batch?.swept ?? 0n,
+    // A batcher bound to no factory has no sweep at all: its 0 is structural, so it is "none", not a figure of 0.
+    sweptWei: batch === null || SOURCES[batch.source].features.sharedBatcher ? null : batch.swept,
     netWei: earnedWei - costWei,
     listed: batch?.listed ?? BigInt(input.vaults.length),
     tried: batch?.tried ?? BigInt(seen.size),

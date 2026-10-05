@@ -176,21 +176,23 @@ export const FEATURE_CATALOG: readonly Feature[] = [
     // nobody is there to confirm, and a vault is the one kind this switch
     // cannot stop. The Guard sentence states what the Guard enforces, not
     // what we intend; the vault's, what its contract does. The fee figures
-    // are the vault's constants (`BUY_FEE_MARKUP_BPS`, `BUY_FEE_CEILING_BPS` in
+    // are the vault's constants (`BUY_FEE_SHARE_BPS`, `BUY_FEE_CEILING_BPS` in
     // @spdex/vault), which config does not depend on, so they are written out.
+    // A new vault gives SPX holders first claim on each due buy for its
+    // community window; after it, anyone can be paid for it.
     detail:
       "Buys on a schedule, two ways. Confirm each buy: your wallet asks each time, so buys " +
       "happen only while spDEX is open in a tab and you're there, and the Guard checks each " +
       "one. Or a vault: a contract you create that holds the budget and buys SPX with ETH " +
-      "when anyone triggers a due buy. No one is guaranteed to trigger it. It's unaudited, you " +
+      "when anyone triggers a due buy, SPX holders first. No one is guaranteed to trigger it. It's unaudited, you " +
       "can put at most 0.5 ETH into one, and closing it is the only way to stop it: switching " +
       "Auto-buy off here doesn't. Either way, a missed time is skipped, never doubled up. " +
       "Scheduled buys never tip.",
     cost:
       "Confirm each buy: one network fee a buy, plus a permission when paying with a token. A " +
       "vault: the network fee to create and close it, and a buy fee from its budget — a fixed " +
-      "amount for network fees plus 10% of that, never more than 0.69% of the buy — to whoever " +
-      "triggers each buy.",
+      "amount for network fees plus 0.25% of the buy, never more than 0.69% of the buy — to the " +
+      "keeper that makes each buy.",
     modules: [SCHEDULER_MODULE_ID],
     // Off by default, and it has to be: it spends money on a timer. The
     // preset carries no plans either, so turning this on alone buys nothing.

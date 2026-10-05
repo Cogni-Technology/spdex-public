@@ -19,20 +19,21 @@
  *   payout with no swap behind it (liquidity taken out, fees collected, a
  *   donation skimmed) isn't a purchase, and neither is SPX from anyone else
  *   in the same transaction: a dust swap can't vouch for a large transfer
- *   beside it. When the receiver owns a vault the factory vouches for
+ *   beside it. When the receiver owns a vault its factory vouches for
  *   (`isVault`) that bought in the transaction, the purchase is named as the
- *   vault's. The rest of what they gained is a delivery of its own, named by
+ *   vault's: every release's factory is asked, since a v1 vault's buys go on
+ *   after v2's factory makes the new ones. The rest of what they gained is a delivery of its own, named by
  *   where it came from; a transfer between two people is never presented as
  *   a purchase.
  *
  * It reads the receipt, the block (for its time) and, when the transaction
- * holds a vault's `Bought`, one Multicall3 asking the factory about each such
+ * holds a vault's `Bought`, one Multicall3 asking each factory about each such
  * vault. Nothing else, and only through the viewer's service.
  */
 
 import { TOKENS, TOPICS, type JsonRpc, type Multicall3Reader } from "@spdex/chain";
 import type { Address, Hex } from "@spdex/core";
-import { decodeVaultEvent, readVouchedOwners } from "@spdex/vault";
+import { decodeVaultEvent, DEPLOYMENTS, readVouchedOwners } from "@spdex/vault";
 import { readBlockTime, readReceipt, topicAddress, type ReceiptLog } from "../receipts.js";
 import { TOKEN_LIST, type TokenInfo } from "../tokens.js";
 import { checksumAddress } from "./contract.js";
@@ -106,7 +107,7 @@ export function spxTransfers(logs: readonly ReceiptLog[]): SpxTransfer[] {
 export type SpxSource =
   /** A pool spDEX finds for SPX paid it out in a swap: a purchase. */
   | { kind: "pool"; pool: Address; venue: "Uniswap v2" | "Uniswap v3"; pairedWith: string | null }
-  /** A vault the factory vouches for bought it for its owner, the receiver. */
+  /** A vault its factory vouches for bought it for its owner, the receiver. */
   | { kind: "vault"; vault: Address }
   /** A pool spDEX finds for SPX paid it out with no swap of its own behind it: liquidity, fees or a skim. Never a purchase. */
   | { kind: "pool-payout"; pool: Address }
@@ -137,7 +138,7 @@ export interface SpxPool {
 export interface DeliveryContext {
   /** Pools spDEX discovers for SPX, paired with any token it lists (`spxPoolsOf`), any case. */
   spxPools: readonly SpxPool[];
-  /** Vaults that emitted `Bought` in this transaction and that the factory vouches for, each with its owner. */
+  /** Vaults that emitted `Bought` in this transaction and that a factory vouches for, each with its owner. */
   vaultOwners: ReadonlyMap<Address, Address>;
 }
 
@@ -299,7 +300,14 @@ function pairedWith(pool: Address, logs: readonly ReceiptLog[]): string | null {
   return TOKEN_LIST.find((t) => t.address.toLowerCase() === token)?.symbol ?? null;
 }
 
-/** The vaults whose `Bought` is in these logs, by the address that emitted it. */
+/**
+ * Every release's vault factory, oldest first (`DEPLOYMENTS`): the ones the
+ * receipt view asks. A v1 vault keeps buying for good, and only v1's factory
+ * vouches for it.
+ */
+export const VAULT_FACTORIES: readonly Address[] = DEPLOYMENTS.map((deployment) => lower(deployment.factory));
+
+/** The vaults whose `Bought` is in these logs, of either release, by the address that emitted it. */
 export function boughtEmitters(logs: readonly ReceiptLog[]): Address[] {
   const emitters = new Set<Address>();
   for (const log of logs) {
@@ -342,7 +350,8 @@ export async function verifyReceipt(
   input: {
     hash: Hex;
     spxPools: readonly SpxPool[];
-    factory: Address | null;
+    /** The factories whose word makes a sender a vault (`VAULT_FACTORIES`); none where there are no vaults. */
+    factories: readonly Address[];
     /** Batches the vault questions (`readVouchedOwners`); a Multicall3 reader over `rpc` unless a test stands in for it. */
     reader?: Pick<Multicall3Reader, "multicall">;
   },
@@ -353,12 +362,12 @@ export async function verifyReceipt(
   const time = await readBlockTime(rpc, block).catch(() => null);
   if (receipt.status === "reverted") return { kind: "failed", block, time };
 
-  const emitters = input.factory === null ? [] : boughtEmitters(receipt.logs);
+  const emitters = input.factories.length === 0 ? [] : boughtEmitters(receipt.logs);
   let vaultOwners = new Map<Address, Address>();
   let vaults: "none" | "checked" | "unavailable" = "none";
-  if (input.factory !== null && emitters.length > 0) {
+  if (input.factories.length > 0 && emitters.length > 0) {
     try {
-      vaultOwners = await readVouchedOwners(rpc, input.factory, emitters, input);
+      vaultOwners = await readVouchedOwners(rpc, input.factories, emitters, input);
       vaults = "checked";
     } catch {
       vaults = "unavailable";

@@ -9,8 +9,14 @@
  * the policy lets it bid, a send hook that lets one transaction out a tick,
  * and `maxSends` in the run, and refuses any other, and the keeper's own rule
  * (`assertKeeperMaySign`) that it signs nothing but a batch to a listed
- * batcher. Each transaction is recorded in the budget from its signed bytes
- * before it leaves, and settled at its real cost once mined.
+ * batcher (proving is off: `SPDEX_KEEPER_PROVE` is never set here, and the
+ * holder agent is proven by `3-prove`). Each transaction is recorded in the
+ * budget from its signed bytes before it leaves, and settled at its real cost
+ * once mined.
+ *
+ * The keeper's `rewardTo` is the holder agent, a community keeper, so it
+ * makes v2 buys inside their community window at once; one that weren't
+ * would wait each window out (`holders-first`).
  *
  * On a fork, and only there, a block is mined before each tick: an idle fork
  * makes no blocks, so its time stands still and no later buy would ever fall

@@ -133,14 +133,20 @@ export const CLOSE_VAULT_WAYS: readonly string[] = [
 
 export const CLOSE_VAULT_CAUTION = "spDEX never asks you to do this. Do it only for a vault whose owner() is your address.";
 
-export const KEEPER_TEXT = "Anyone can make a due vault buy. Run a keeper (docs/KEEPER.md in spDEX's source) to keep yours buying.";
+/**
+ * Who may make a due buy: anyone, after SPX holders' first claim on a v2
+ * vault's (its community window). How to make one by hand, `execute(owner)`,
+ * is docs/WALKAWAY.md's: a vault keeps buying without its owner either way.
+ */
+export const KEEPER_TEXT =
+  "Anyone can make a due vault buy; on a v2 vault, SPX holders have first claim for a while. Run a keeper (docs/KEEPER.md in spDEX's source) to keep yours buying.";
 
 export const EXPORT_TEXT = "This browser's storage can be cleared: export your settings and records.";
 
 /** Where `EXPORT_TEXT` points: the settings file, and the records' CSV. */
 export const EXPORT_PLACES: readonly PlaceKey[] = ["settingsFile", "activityCsv"];
 
-/** The hint on "Find my vaults from the factory's list", with its cost when the list's length is known. */
+/** The hint on "Find my vaults from the factories' lists", with its cost when the lists' length is known. */
 export function listSearchHint(reads: number | null): string {
   const cost = reads === null ? "one read for every 200 vaults on the list, plus a few" : `about ${reads} reads`;
   return `For services that limit log searches: reads every vault's owner instead (${cost}). Your service still sees your address.`;

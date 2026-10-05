@@ -32,13 +32,15 @@ import type { Address, Hex } from "@spdex/core";
 import { CONTRACTS, Multicall3Reader, TOKENS, TOPICS, type JsonRpc } from "@spdex/chain";
 import { resolvedEnv } from "../../../scripts/env.mjs";
 import {
+  BATCHERS,
   DEPLOYMENTS,
+  SOURCES,
   VAULT_ABI,
   VAULT_LOGS_FROM_BLOCK,
   decodeBatcherEvent,
   decodeOr,
+  decodeTerms,
   deploymentBlock,
-  normaliseTerms,
   readVaultCount,
   readVaultsPage,
   vaultsCreatedBy,
@@ -321,29 +323,39 @@ async function receiptOf(hash: Hex, block: bigint): Promise<{ receipt: ChainRece
 const WETH_ABI = parseAbi(["function balanceOf(address) view returns (uint256)"]);
 
 /**
- * Each vault's owner, terms, buy count, whether it is closed, and its WETH, as
- * they stood at the last block: one Multicall3 per 30 vaults, each read
- * allowed to fail on its own (a failure is unknown, never zero).
+ * Each vault's owner, terms, buy count, whether it is closed, its WETH and —
+ * a vault whose source has a community window — its count of community window
+ * buys, as they stood at the last block: one Multicall3 per 30 vaults, each
+ * read allowed to fail on its own (a failure is unknown, never zero). Terms are
+ * read with the source of the release whose factory lists the vault
+ * (`decodeTerms`); a v1 vault has no `windowBuys()`, and its call's failure
+ * leaves it null, as it should be.
  */
 async function readVaults(list: { vault: Address; deployment: string; index: bigint | null }[], toBlock: bigint): Promise<VaultAtEnd[]> {
-  const reader = new Multicall3Reader(atBlock(toBlock), { batchSize: 150, gasLimit: 30_000_000n, multicall3: CONTRACTS.multicall3 });
+  const reader = new Multicall3Reader(atBlock(toBlock), { batchSize: 180, gasLimit: 30_000_000n, multicall3: CONTRACTS.multicall3 });
   const calls = list.flatMap(({ vault }) => [
     { to: vault, data: encodeFunctionData({ abi: VAULT_ABI, functionName: "owner" }) },
     { to: vault, data: encodeFunctionData({ abi: VAULT_ABI, functionName: "terms" }) },
     { to: vault, data: encodeFunctionData({ abi: VAULT_ABI, functionName: "buysDone" }) },
     { to: vault, data: encodeFunctionData({ abi: VAULT_ABI, functionName: "closed" }) },
     { to: TOKENS.WETH.address, data: encodeFunctionData({ abi: WETH_ABI, functionName: "balanceOf", args: [vault] }) },
+    { to: vault, data: encodeFunctionData({ abi: VAULT_ABI, functionName: "windowBuys" }) },
   ]);
   const answers = await reader.multicall(calls);
   return list.map((v, i) => {
-    const [owner, terms, buysDone, closed, balance] = answers.slice(i * 5, i * 5 + 5);
+    const [owner, terms, buysDone, closed, balance, windowBuys] = answers.slice(i * 6, i * 6 + 6);
+    const decodedTerms = decodeTerms(terms, deployments.find((d) => d.id === v.deployment)?.source);
     return {
       ...v,
       owner: decodeOr(owner, (data) => lower(decodeFunctionResult({ abi: VAULT_ABI, functionName: "owner", data }))),
-      terms: decodeOr(terms, (data) => normaliseTerms(decodeFunctionResult({ abi: VAULT_ABI, functionName: "terms", data }))),
+      terms: decodedTerms,
       buysDone: decodeOr(buysDone, (data) => BigInt(decodeFunctionResult({ abi: VAULT_ABI, functionName: "buysDone", data }))),
       closed: decodeOr(closed, (data) => decodeFunctionResult({ abi: VAULT_ABI, functionName: "closed", data })),
       balance: decodeOr(balance, (data) => decodeFunctionResult({ abi: WETH_ABI, functionName: "balanceOf", data })),
+      windowBuys:
+        decodedTerms === null || decodedTerms.communityWindow === null
+          ? null
+          : decodeOr(windowBuys, (data) => BigInt(decodeFunctionResult({ abi: VAULT_ABI, functionName: "windowBuys", data }))),
     };
   });
 }
@@ -484,7 +496,13 @@ async function defaultFromBlock(ds: readonly Deployment[]): Promise<bigint> {
 
 // Every vault a listed factory vouches for: its list at the last block, and its creations in the range.
 const factories = deployments.map((d) => lower(d.factory));
-const batchers = deployments.map((d) => lower(d.batcher));
+// Each release's batcher, and, where a release shares one, every shared batcher listed, older ones included.
+const batchers = [
+  ...new Set([
+    ...deployments.map((d) => lower(d.batcher)),
+    ...(deployments.some((d) => SOURCES[d.source].features.sharedBatcher) ? BATCHERS.map((b) => lower(b.batcher)) : []),
+  ]),
+];
 const listed: { vault: Address; deployment: string; index: bigint | null }[] = [];
 for (const d of deployments) {
   const at = atBlock(toBlock);
@@ -536,7 +554,7 @@ const { prices, source: priceSource } = await ethUsd(fromBlock, toBlock);
 const atEnd = chosen.length > 0 ? await readVaults(chosen, toBlock) : [];
 const universe: VaultAtEnd[] = [
   ...atEnd,
-  ...listed.filter((l) => !isSelected(l.vault)).map((l) => ({ ...l, owner: null, terms: null, buysDone: null, closed: null, balance: null })),
+  ...listed.filter((l) => !isSelected(l.vault)).map((l) => ({ ...l, owner: null, terms: null, buysDone: null, closed: null, balance: null, windowBuys: null })),
 ];
 
 // Every block anything happened in, for its time and base fee.
@@ -551,6 +569,7 @@ if ((await header(toBlock)).hash !== last.hash) fail(`block ${toBlock} changed d
 const report = buildReport({
   chainId,
   deployments,
+  batchers,
   range: { fromBlock, toBlock, fromTime: BigInt(first.timestamp), toTime: BigInt(last.timestamp), fromHash: first.hash, toHash: last.hash },
   vaults: universe,
   selected,

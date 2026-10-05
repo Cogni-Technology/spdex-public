@@ -16,6 +16,7 @@
 
 import type { JsonRpc } from "@spdex/chain";
 import {
+  LATEST_RELEASE,
   MAX_PLATFORM_VAULTS,
   platformReadCost,
   readPlatform,
@@ -114,9 +115,9 @@ export const COLLECTIVE_TITLE = "Collective DCA: auto-buy vaults";
 /** The line under the title: what the figures are, in one breath. */
 export const COLLECTIVE_SUBTITLE = "Every spDEX vault, read from chain.";
 
-/** "What's counted?", folded under the figures. */
+/** "What's counted?", folded under the figures. Both releases' factories: v1's vaults and v2's, together. */
 export const COLLECTIVE_CAVEAT =
-  "Only vaults from spDEX's factory. Swaps and confirm-each-buy plans carry no spDEX marker — one would label every user. Addresses aren't people.";
+  "Only vaults from spDEX's factories. Swaps and confirm-each-buy plans carry no spDEX marker — one would label every user. Addresses aren't people.";
 
 /** Where the panel's read stands, as the tile header's summary needs it. */
 export type CollectivePhase =
@@ -158,14 +159,14 @@ export function notOfferedText(chainId: number): string {
 }
 
 export function notDeployedText(chainId: number): string {
-  return `The vault factory isn't deployed on ${networkName(chainId)}, so there's no vault activity to read here.`;
+  return `spDEX's vault factories aren't deployed on ${networkName(chainId)}, so there's no vault activity to read here.`;
 }
 
 /** The refusal, with what the network service said, shortened and without a trailing full stop. */
 export function readFailedText(error: unknown): string {
   const said = (error instanceof Error ? error.message : String(error)).trim().replace(/\s+/g, " ").replace(/\.$/, "");
   const reason = said === "" ? "no reason given" : said.length > 160 ? `${said.slice(0, 159)}…` : said;
-  return `Couldn't read the factory's list (${reason}). Nothing is shown rather than a guess.`;
+  return `Couldn't read a factory's list (${reason}). Nothing is shown rather than a guess.`;
 }
 
 /** "Read at block 26,001,248 through your network service (13 reads). These reads don't name your address." */
@@ -191,12 +192,14 @@ export function partialNotes(summary: ReadSummary): string[] {
 /**
  * The button for the vaults past the cap, saying what it costs, or null when
  * every vault was read. Owners and terms of vaults not read yet can't be in
- * the cache, so the count is a ceiling.
+ * the cache, and each is costed as a vault of the latest release, the dearest
+ * to read (from v2 it adds `windowBuys`), so the count is a ceiling whichever
+ * factory lists them.
  */
 export function readMoreLabel(summary: ReadSummary): string | null {
   if (summary.unread === 0n) return null;
   const next = summary.unread < BigInt(MAX_PLATFORM_VAULTS) ? Number(summary.unread) : MAX_PLATFORM_VAULTS;
-  const cost = platformReadCost(next, 0, 0);
+  const cost = platformReadCost([{ release: LATEST_RELEASE, vaults: next }], 0);
   const which = BigInt(next) === summary.unread ? `the other ${formatCount(summary.unread)} vaults` : `${formatCount(BigInt(next))} more of the other ${formatCount(summary.unread)} vaults`;
   return `Read ${which} (up to ${cost} more reads)`;
 }
@@ -227,8 +230,9 @@ export function collectiveTiles(summary: ReadSummary): CollectiveTile[] {
     { id: "open", label: "Vaults still buying", figure: countFigure(summary.open) },
     { id: "owners", label: "Owner addresses", figure: countFigure(summary.owners), hint: "addresses, not people" },
     { id: "eth", label: "ETH spent on buys", figure: ethFigure(summary.ethSpent) },
-    // Paid in WETH, not ETH: the label names the unit, as "ETH spent on buys" does.
-    { id: "fees", label: "WETH paid in buy fees", figure: unitFigure(summary.fees, 18, "", " WETH"), hint: "to whoever made each buy" },
+    // Paid in WETH, not ETH: the label names the unit, as "ETH spent on buys" does. A v2 buy pays
+    // the wallet its maker names (an owner's Trigger now, the owner), a v1 buy its caller.
+    { id: "fees", label: "WETH paid in buy fees", figure: unitFigure(summary.fees, 18, "", " WETH"), hint: "to whoever made each buy, or a wallet they named" },
   ];
 }
 
@@ -245,7 +249,11 @@ export interface CollectiveRow {
   hint: string;
 }
 
-/** The rows under the grid: the budget still committed, the WETH still held, and any other market. */
+/**
+ * The rows under the grid: the budget still committed, the WETH still held,
+ * the share of v2 buys paid to community keepers inside their window (only
+ * when known), and any other market.
+ */
 export function collectiveRows(summary: ReadSummary): CollectiveRow[] {
   const rows: CollectiveRow[] = [
     { id: "committed", label: "Budget committed", figure: ethFigure(summary.committed, " ETH"), hint: "for buys still to come" },
@@ -256,6 +264,12 @@ export function collectiveRows(summary: ReadSummary): CollectiveRow[] {
       hint: "finished ones not yet closed included, and WETH anyone sent them",
     },
   ];
+  const window = windowShareFigure(summary);
+  if (window !== null) {
+    // The vault counts a buy by whom it paid (`windowBuys`): a community
+    // keeper, inside the window. Who sent it, it doesn't record.
+    rows.push({ id: "window", label: "v2 buys paid to community keepers", figure: window, hint: "inside each buy's community window" });
+  }
   for (const { tokenOut, delivered } of summary.otherDelivered) {
     const token = TOKEN_LIST.find((t) => t.address.toLowerCase() === tokenOut);
     rows.push({
@@ -269,6 +283,23 @@ export function collectiveRows(summary: ReadSummary): CollectiveRow[] {
     });
   }
   return rows;
+}
+
+/**
+ * The share of v2 buys SPX holders made inside their community window
+ * (`communityWindowBuys` of `v2Buys`), as a whole percentage rounded down,
+ * with "37 of 100 v2 buys" a tap away; "none yet" while no v2 buy has been
+ * made, since 0 of 0 is no share at all. Null, and the row left out, while
+ * either figure is only a lower bound: a share of a partial read is not a
+ * bound of anything, and unknown is never shown as zero. Display only.
+ */
+export function windowShareFigure(summary: ReadSummary): FigureText | null {
+  const { v2Buys, communityWindowBuys: holders } = summary;
+  if (v2Buys.atLeast || holders.atLeast) return null;
+  if (v2Buys.value === 0n) return { short: "none yet", exact: null, atLeast: false };
+  const percent = (holders.value * 100n) / v2Buys.value;
+  const short = percent === 0n && holders.value > 0n ? "less than 1%" : `${formatCount(percent)}%`;
+  return { short, exact: `${formatCount(holders.value)} of ${formatCount(v2Buys.value)} v2 buys`, atLeast: false };
 }
 
 function countFigure(k: Known<bigint>): FigureText {

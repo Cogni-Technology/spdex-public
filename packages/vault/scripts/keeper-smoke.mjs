@@ -7,14 +7,19 @@
  *     points at another one).
  *  2. Fresh keys: a funder, two owners, the keeper and a cold `rewardTo`. Only
  *     these are given ether.
- *  3. The factory and the batcher, through the deterministic deployer, if absent.
- *  4. Two daily vaults, $5 and $25 a buy, due at once, each with its buy fee.
+ *  3. v2's SPX holder registry, factory and batcher, through the deterministic
+ *     deployer, in that order, if absent.
+ *  4. Two daily v2 vaults, $5 and $25 a buy, each with its buy fee, started an
+ *     hour ago: due at once, and their first community window (30 minutes)
+ *     already over, so the cold `rewardTo`, which never proved any SPX, may be
+ *     paid for them like anyone.
  *  5. The image is built; `keeper-fork --once` runs with only these vaults allowed.
  *  6. Both vaults bought once; `rewardTo` holds both fees and the batcher
  *     nothing; the JSONL has `start`, `batch_sent` and `batch_mined` (with the
  *     receipt's own hash and both buys); no key or URL is in any log or output;
  *     the heartbeat is fresh and the healthcheck passes inside the container.
- *  7. `report-fork` over the same blocks lists exactly those two buys and that batch.
+ *  7. `report-fork` over the same blocks lists exactly those two buys and that
+ *     batch, each buy this keeper's, made after its community window.
  *  8. The image holds no environment file, key or URL, in its files or its history.
  *  9. A multi-platform build, when the builder has an arm64 platform; otherwise
  *     reported as skipped, never as passed.
@@ -34,12 +39,14 @@ import { decodeFunctionResult, encodeFunctionData, parseAbi } from "viem";
 import { TOKENS, addressOfKey, httpRpc, prepareTransaction, signPrepared } from "@spdex/chain";
 import { resolvedEnv } from "../../../scripts/env.mjs";
 import {
+  DEFAULT_TURN_BUCKETS,
   MAINNET_BATCHER,
   MAINNET_FACTORY,
+  MAINNET_REGISTRY,
   VAULT_ABI,
   buyFee,
-  deployBatcherCall,
-  deployFactoryCall,
+  defaultCommunityWindow,
+  deployReleaseCalls,
   encodeClose,
   encodeCreateVault,
   vaultBudget,
@@ -118,7 +125,8 @@ function forkVolume(extraEnv) {
 // ─── The fork ─────────────────────────────────────────────────────────────────
 
 const hex = (v) => `0x${v.toString(16)}`;
-const chainNow = async () => BigInt((await rpc("eth_getBlockByNumber", ["latest", false])).timestamp);
+/** The time the fork will give its next block: its clock runs on with the wall clock while its head waits. A read. */
+const forkNow = async () => BigInt((await rpc("eth_getBlockByNumber", ["pending", false])).timestamp);
 const hasCode = async (address) => (await rpc("eth_getCode", [address, "latest"])) !== "0x";
 
 async function receiptOf(hash) {
@@ -182,18 +190,30 @@ try {
   const keeper = await freshAccount(ETHER / 10n);
   const cold = await freshAccount();
   keeperKey = keeper.key;
-  for (const [call, at] of [
-    [deployFactoryCall(), MAINNET_FACTORY],
-    [deployBatcherCall(MAINNET_FACTORY), MAINNET_BATCHER],
-  ]) {
-    if (!(await hasCode(at))) await send(funder.key, call.to, call.data);
+  // The factory's constructor asks the registry for code; the batcher, bound to no factory, needs nothing first.
+  for (const call of deployReleaseCalls("v2")) {
+    if (!(await hasCode(call.address))) await send(funder.key, call.to, call.data, call.value);
   }
-  check("factory and batcher are deployed on the fork", (await hasCode(MAINNET_FACTORY)) && (await hasCode(MAINNET_BATCHER)));
+  check(
+    "registry, factory and batcher are deployed on the fork",
+    (await hasCode(MAINNET_REGISTRY)) && (await hasCode(MAINNET_FACTORY)) && (await hasCode(MAINNET_BATCHER)),
+  );
 
   const vaults = [];
-  const startAt = await chainNow();
+  // An hour back: due at once, and the first 30-minute community window over, so a rewardTo nobody proved is paid.
+  const startAt = (await forkNow()) - 3_600n;
   for (const [i, amountPerBuy] of AMOUNTS.entries()) {
-    const plan = { marketIndex: 0n, amountPerBuy, interval: DAY, maxBuys: 3n, startAt, keeperReward: buyFee(amountPerBuy).reward, maxSlippageBps: 300n };
+    const plan = {
+      marketIndex: 0n,
+      amountPerBuy,
+      interval: DAY,
+      maxBuys: 3n,
+      startAt,
+      keeperReward: buyFee(amountPerBuy).reward,
+      maxSlippageBps: 300n,
+      communityWindow: defaultCommunityWindow(DAY),
+      turnBuckets: DEFAULT_TURN_BUCKETS,
+    };
     const receipt = await send(owners[i].key, MAINNET_FACTORY, encodeCreateVault(plan), vaultBudget(plan));
     const [created] = vaultsCreatedBy(MAINNET_FACTORY, receipt.logs);
     if (!created) throw new Error("the factory announced no vault");
@@ -267,6 +287,10 @@ try {
   };
   const buys = rows("buys.csv");
   check("buys.csv has exactly one row per vault", vaults.every((v) => buys.filter((b) => b.vault === v.vault).length === 1) && buys.length === 2);
+  check(
+    "buys.csv says each buy was this keeper's, made after its community window",
+    buys.length === 2 && buys.every((b) => b.release === "v2" && b.made_by === "this-keeper" && b.in_community_window === "false"),
+  );
   const batches = rows("batches.csv");
   check("batches.csv has exactly our batch", batches.length === 1 && batches[0].tx_hash === mined?.hash && batches[0].earned_matches_rewards === "true");
 

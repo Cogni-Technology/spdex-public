@@ -48,9 +48,9 @@ contract MarketsTest is ForkTest {
         expectListingRevert(new Market[](0), abi.encodeWithSelector(SpdexVaultFactory.NoMarkets.selector));
 
         vm.expectRevert(abi.encodeWithSelector(SpdexVaultFactory.NotAUniswapFactory.selector));
-        new SpdexVaultFactory(WETH, stranger, V3_FACTORY, spxMarkets());
+        new SpdexVaultFactory(WETH, stranger, V3_FACTORY, registry, spxMarkets());
         vm.expectRevert(abi.encodeWithSelector(SpdexVaultFactory.NotAUniswapFactory.selector));
-        new SpdexVaultFactory(WETH, V2_FACTORY, stranger, spxMarkets());
+        new SpdexVaultFactory(WETH, V2_FACTORY, stranger, registry, spxMarkets());
     }
 
     function test_aMarketCannotBuyWethOrNothing() public {

@@ -7,14 +7,16 @@
  * "bought" from the pool that paid out; SPX sent to oneself delivers nothing;
  * SPX sent from one key to another is "received from" an account and never
  * "bought"; and a vault's buy, triggered by its owner, is delivered by a
- * vault the factory vouches for, asked through Multicall3 exactly as the view
- * asks.
+ * vault its factory vouches for, asked through Multicall3 exactly as the view
+ * asks: every release's factory, so a v1 vault's buy is still credited to it
+ * once v2's factory makes the new ones.
  *
- * Every key is fresh, and the only vault touched is the one this file
- * creates, closed at the end. The factory is deployed through the
- * deterministic deployer only if the fork doesn't have it yet. The fork's
- * clock is never moved: the vault starts at the chain's own time, so its
- * first buy is due at once. Requires a fork: `pnpm anvil:fork`.
+ * Every key is fresh, and the only vaults touched are the two this file
+ * creates, closed at the end. Each release's contracts are deployed through
+ * the deterministic deployer only if the fork doesn't have them yet. The
+ * fork's clock is never moved: each vault starts at the chain's own time, so
+ * its first buy is due at once, and v2's owner pays its fee back to itself,
+ * which its community window allows. Requires a fork: `pnpm anvil:fork`.
  */
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -23,21 +25,25 @@ import { recommendedConfig } from "@spdex/config";
 import type { Address, Hex, SpdexConfig } from "@spdex/core";
 import {
   MAINNET_FACTORY,
+  V1_MAINNET_FACTORY,
   VAULT_LIMITS,
   buyFee,
-  deployFactoryCall,
+  defaultCommunityWindow,
+  deployReleaseCalls,
   encodeClose,
   encodeCreateVault,
-  encodeExecute,
+  encodeTrigger,
+  v1BuyFee,
   vaultBudget,
   vaultsCreatedBy,
   type RawLog,
   type VaultPlan,
+  type VaultRelease,
 } from "@spdex/vault";
 import { Engine } from "../../src/lib/engine.js";
 import { balanceOf } from "../../src/lib/erc20.js";
 import { NATIVE_ETH, TOKEN_LIST, type TokenInfo } from "../../src/lib/tokens.js";
-import { sourceText, spxPoolsFrom, verifyReceipt, type ReceiptOutcome, type SpxPool } from "../../src/lib/culture/receipt.js";
+import { VAULT_FACTORIES, sourceText, spxPoolsFrom, verifyReceipt, type ReceiptOutcome, type SpxPool } from "../../src/lib/culture/receipt.js";
 
 const FORK_URL = process.env["SPDEX_FORK_URL"] ?? "http://127.0.0.1:8545";
 const CHAIN_ID = Number(process.env["SPDEX_FORK_CHAIN_ID"] ?? "690069");
@@ -79,6 +85,25 @@ async function send(key: Hex, call: { to: Address; data: Hex; value?: bigint }):
 
 const transferSpx = (to: Address, amount: bigint) => ({ to: SPX.address, data: `0xa9059cbb${word(to)}${word(amount)}` as Hex });
 
+/**
+ * v1's `createVault(marketIndex, amountPerBuy, interval, maxBuys, startAt,
+ * keeperReward, maxSlippageBps)`: seven words after its selector (V1_FACTORY_ABI),
+ * written out because this app encodes only v2's. A wrong selector would
+ * revert, and the test would say so.
+ */
+const createVaultV1 = (args: readonly bigint[]): Hex => `0x3f8f7b79${args.map(word).join("")}`;
+
+/** Put `release`'s contracts on the fork, those not there yet, in order; another suite may win the race, and the code is there all the same. */
+async function ensureRelease(release: VaultRelease, deploy: () => Promise<{ key: Hex }>): Promise<void> {
+  let deployer: { key: Hex } | null = null;
+  for (const call of deployReleaseCalls(release)) {
+    if (((await rpc("eth_getCode", [call.address, "latest"])) as string) !== "0x") continue;
+    deployer ??= await deploy();
+    await send(deployer.key, { to: call.to, data: call.data, value: call.value }).catch(() => undefined);
+    expect((await rpc("eth_getCode", [call.address, "latest"])) as string).not.toBe("0x");
+  }
+}
+
 describe("#receipt on the fork: what the chain says a transaction did with SPX", () => {
   const config: SpdexConfig = { ...recommendedConfig(), chainId: CHAIN_ID, rpc: { url: FORK_URL, source: "user" } };
   const engine = new Engine(config);
@@ -87,7 +112,7 @@ describe("#receipt on the fork: what the chain says a transaction did with SPX",
   let friend: { key: Hex; address: Address };
   const vaults: { owner: Hex; vault: Address }[] = [];
 
-  const read = (hash: Hex, factory: Address | null = MAINNET_FACTORY) => verifyReceipt(rpc, { hash, spxPools, factory });
+  const read = (hash: Hex, factories: readonly Address[] = VAULT_FACTORIES) => verifyReceipt(rpc, { hash, spxPools, factories });
   const delivered = (outcome: ReceiptOutcome) => {
     if (outcome.kind !== "delivered") throw new Error(`expected a delivery, got ${outcome.kind}`);
     return outcome;
@@ -186,44 +211,72 @@ describe("#receipt on the fork: what the chain says a transaction did with SPX",
     expect(sourceText(delivery!.source)).not.toMatch(/bought/i);
   });
 
-  it("a vault's buy, triggered by its owner, was delivered by a vault the factory vouches for", async () => {
+  /** A one-buy vault of `release`, due at once, made by a fresh owner; the owner and its address. */
+  async function oneBuyVault(release: VaultRelease): Promise<{ owner: { key: Hex; address: Address }; vault: Address }> {
+    await ensureRelease(release, () => freshAccount(ETHER));
     const owner = await freshAccount(ETHER);
-    if (((await rpc("eth_getCode", [MAINNET_FACTORY, "latest"])) as string) === "0x") {
-      const deployer = await freshAccount(ETHER);
-      const call = deployFactoryCall();
-      // Another suite may deploy it first; losing that race reverts, and the code is there all the same.
-      await send(deployer.key, { to: call.to, data: call.data }).catch(() => undefined);
-    }
-    expect((await rpc("eth_getCode", [MAINNET_FACTORY, "latest"])) as string).not.toBe("0x");
-
     const latest = (await rpc("eth_getBlockByNumber", ["latest", false])) as { timestamp: string };
     const amountPerBuy = ETHER / 100n;
-    const plan: VaultPlan = {
-      marketIndex: 0n,
-      amountPerBuy,
-      interval: VAULT_LIMITS.MIN_INTERVAL,
-      maxBuys: 1n,
-      startAt: BigInt(latest.timestamp),
-      keeperReward: buyFee(amountPerBuy).reward,
-      maxSlippageBps: 300n,
-    };
-    const created = await send(owner.key, { to: MAINNET_FACTORY, data: encodeCreateVault(plan), value: vaultBudget(plan) });
-    const [vault] = vaultsCreatedBy(MAINNET_FACTORY, created.receipt.logs);
-    expect(vault).toBeDefined();
+    const interval = VAULT_LIMITS.MIN_INTERVAL;
+    const factory = release === "v1" ? V1_MAINNET_FACTORY : MAINNET_FACTORY;
+    let created: { receipt: Receipt };
+    if (release === "v1") {
+      const keeperReward = v1BuyFee(amountPerBuy).reward;
+      const args = [0n, amountPerBuy, interval, 1n, BigInt(latest.timestamp), keeperReward, 300n];
+      created = await send(owner.key, { to: factory, data: createVaultV1(args), value: vaultBudget({ maxBuys: 1n, amountPerBuy, keeperReward }) });
+    } else {
+      const plan: VaultPlan = {
+        marketIndex: 0n,
+        amountPerBuy,
+        interval,
+        maxBuys: 1n,
+        startAt: BigInt(latest.timestamp),
+        keeperReward: buyFee(amountPerBuy).reward,
+        maxSlippageBps: 300n,
+        communityWindow: defaultCommunityWindow(interval),
+        turnBuckets: 0n,
+      };
+      created = await send(owner.key, { to: factory, data: encodeCreateVault(plan), value: vaultBudget(plan) });
+    }
+    const [vault] = vaultsCreatedBy(factory, created.receipt.logs);
+    // Laid out as its release's source: v1's, or v2's for the latest.
+    expect(vault).toMatchObject({ source: release, owner: owner.address.toLowerCase() });
     vaults.push({ owner: owner.key, vault: vault!.vault });
+    return { owner, vault: vault!.vault };
+  }
 
-    const before = await balanceOf(rpc, SPX.address, owner.address);
-    const { hash } = await send(owner.key, { to: vault!.vault, data: encodeExecute() });
-    const arrived = (await balanceOf(rpc, SPX.address, owner.address)) - before;
+  /** The owner's own trigger (Trigger now): v2's pays its fee back to the owner, v1's to its caller, the owner. */
+  async function triggerOwn(release: VaultRelease, made: { owner: { key: Hex; address: Address }; vault: Address }): Promise<{ hash: Hex; arrived: bigint }> {
+    const before = await balanceOf(rpc, SPX.address, made.owner.address);
+    const { hash } = await send(made.owner.key, { to: made.vault, data: encodeTrigger({ release, owner: made.owner.address }) });
+    return { hash, arrived: (await balanceOf(rpc, SPX.address, made.owner.address)) - before };
+  }
+
+  it("a v2 vault's buy, triggered by its owner, was delivered by a vault its factory vouches for", async () => {
+    const made = await oneBuyVault("v2");
+    const { hash, arrived } = await triggerOwn("v2", made);
 
     const outcome = delivered(await read(hash));
     expect(outcome.vaults).toBe("checked");
-    expect(outcome.deliveries).toEqual([{ to: owner.address, amount: arrived, source: { kind: "vault", vault: vault!.vault } }]);
+    expect(outcome.deliveries).toEqual([{ to: made.owner.address, amount: arrived, source: { kind: "vault", vault: made.vault } }]);
     expect(sourceText(outcome.deliveries[0]!.source)).toMatch(/^delivered by a vault the factory vouches for/);
 
-    // Without the factory's word, the same buy is only what it also is: the pair's payout.
-    const unvouched = delivered(await read(hash, null));
+    // Without a factory's word, the same buy is only what it also is: the pair's payout.
+    const unvouched = delivered(await read(hash, []));
     expect(unvouched.deliveries[0]!.source.kind).toBe("pool");
+  });
+
+  it("a v1 vault's buy is still its vault's: only v1's factory vouches for it, and the view asks both", async () => {
+    const made = await oneBuyVault("v1");
+    const { hash, arrived } = await triggerOwn("v1", made);
+
+    const outcome = delivered(await read(hash));
+    expect(outcome.vaults).toBe("checked");
+    expect(outcome.deliveries).toEqual([{ to: made.owner.address, amount: arrived, source: { kind: "vault", vault: made.vault } }]);
+
+    // Asked of this build's factory alone, as the view once was, a v1 vault's buy loses its vault.
+    const v2Only = delivered(await read(hash, [MAINNET_FACTORY]));
+    expect(v2Only).toMatchObject({ vaults: "checked", deliveries: [{ to: made.owner.address, amount: arrived, source: { kind: "pool" } }] });
   });
 
   it("a hash the service doesn't know is said to be unknown", async () => {

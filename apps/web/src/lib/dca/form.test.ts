@@ -33,7 +33,7 @@ import {
   type RecurringFields,
 } from "./form.js";
 import { buyFee } from "@spdex/vault";
-import { MIN_VAULT_BUY_WEI, VAULT_GAS, vaultCosts } from "./vault.js";
+import { DEFAULT_VAULT_SLIPPAGE_BPS, MIN_VAULT_BUY_WEI, VAULT_GAS, vaultCosts } from "./vault.js";
 import { NATIVE_ETH } from "../tokens.js";
 import type { MoneyView } from "../money/convert.js";
 
@@ -474,13 +474,14 @@ describe("a vault plan in the form", () => {
     expect(estimate.upTo).toBe(costs.rewardsTotal + VAULT_GAS.createAndFund * 4n * GWEI);
     // The share is of the whole cost, buy fees and creation together, so it
     // leads, before the parts: after the creation fee it read as that fee's.
-    // 122,000 gas at 0.15 gwei is 0.0000183 ETH, and a tenth more 0.00002013 ETH a buy.
-    expect(feesText({ kind: "ok", fees }, estimate)).toBe("Fees ≈ 0.0009807 ETH over the plan, 0.39% of it, at today's fees.");
+    // 126,000 gas at 0.15 gwei is 0.0000189 ETH, and 0.25% of 0.05 ETH
+    // 0.000125 ETH: 0.0001439 ETH a buy. No "tenth" any more.
+    expect(feesText({ kind: "ok", fees }, estimate)).toBe("Fees ≈ 0.0016 ETH over the plan, 0.64% of it, at today's fees.");
     // With the fee warning shown, its title gives the share: said once.
-    expect(feesText({ kind: "ok", fees }, estimate, undefined, { share: false })).toBe("Fees ≈ 0.0009807 ETH over the plan, at today's fees.");
+    expect(feesText({ kind: "ok", fees }, estimate, undefined, { share: false })).toBe("Fees ≈ 0.0016 ETH over the plan, at today's fees.");
     // Its parts, one tap away.
     expect(feesBreakdown(estimate)).toBe(
-      "0.0001007 ETH in buy fees (0.00002013 ETH a buy, 0.05% of each) and about 0.00088 ETH in network fees to create the vault.",
+      "0.0007195 ETH in buy fees (0.0001439 ETH a buy, 0.29% of each) and about 0.00088 ETH in network fees to create the vault.",
     );
   });
 
@@ -503,6 +504,28 @@ describe("a vault plan in the form", () => {
     expect(vaultFormError(at({ amount: "" }))).toBeNull();
   });
 
+  /**
+   * The community window is Expert's to choose, and refused rather than
+   * clamped when the frequency changed under a choice: a quarter of the
+   * interval at most, an hour at most, a minute at least. Simple, and Expert
+   * left at its default, get the plan's default, which always fits.
+   */
+  it("refuses a community window the factory wouldn't take, and takes the plan's default when none is chosen", () => {
+    const at = (overrides: Partial<RecurringFields>) => parseForm(fields(overrides), { expert: true });
+    const hourly = at({ frequency: "1h" });
+    expect(hourly.intervalSeconds).toBe(3_600);
+    expect(vaultFormError(hourly, DEFAULT_VAULT_SLIPPAGE_BPS, undefined, 900)).toBeNull();
+    expect(vaultFormError(hourly, DEFAULT_VAULT_SLIPPAGE_BPS, undefined, 1_800)).toBe(
+      "The community window must be 1 minute to an hour, and no more than a quarter of the time between buys.",
+    );
+    expect(vaultFormError(hourly, DEFAULT_VAULT_SLIPPAGE_BPS, undefined, 59)).toMatch(/^The community window must be/);
+    expect(vaultFormError(hourly, DEFAULT_VAULT_SLIPPAGE_BPS, undefined, null)).toBeNull();
+    expect(vaultFormError(hourly)).toBeNull();
+    // A daily plan: up to an hour, never more.
+    expect(vaultFormError(at({ frequency: "1d" }), DEFAULT_VAULT_SLIPPAGE_BPS, undefined, 3_600)).toBeNull();
+    expect(vaultFormError(at({ frequency: "1d" }), DEFAULT_VAULT_SLIPPAGE_BPS, undefined, 3_601)).toMatch(/^The community window must be/);
+  });
+
   /** Under 145 wei the buy fee is nothing at all; the floor is a round figure well above that. */
   it("refuses a buy too small to pay a buy fee", () => {
     const at = (amount: string) => parseForm(fields({ amount }), { expert: false });
@@ -515,7 +538,7 @@ describe("a vault plan in the form", () => {
   it("warns when the wallet can't cover what creating the vault sends, only from a balance that was read", () => {
     const costs = vaultCosts({ amountPerBuy: 10n ** 16n, maxBuys: 10, fees })!;
     expect(vaultBalanceWarning(costs, 10n ** 17n)).toBe(
-      "Your wallet holds 0.1 ETH. Creating this vault sends 0.1003 ETH — every buy and its buy fee — plus about 0.00088 ETH in network fees.",
+      "Your wallet holds 0.1 ETH. Creating this vault sends 0.1005 ETH — every buy and its buy fee — plus about 0.00088 ETH in network fees.",
     );
     expect(vaultBalanceWarning(costs, 10n ** 18n)).toBeNull();
     expect(vaultBalanceWarning(costs, null)).toBeNull();
@@ -523,7 +546,7 @@ describe("a vault plan in the form", () => {
     // Before fees are read, the budget alone is weighed, and the network fee named without a figure.
     const unread = vaultCosts({ amountPerBuy: 10n ** 16n, maxBuys: 10, fees: null })!;
     expect(vaultBalanceWarning(unread, 10n ** 17n)).toBe(
-      "Your wallet holds 0.1 ETH. Creating this vault sends 0.1003 ETH — every buy and its buy fee — plus its network fee.",
+      "Your wallet holds 0.1 ETH. Creating this vault sends 0.1005 ETH — every buy and its buy fee — plus its network fee.",
     );
     expect(vaultBalanceWarning(unread, costs.budget)).toBeNull();
   });

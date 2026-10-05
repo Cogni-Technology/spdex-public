@@ -7,7 +7,16 @@
  * public batch is copied by bots, which take the fees first) and only when
  * the fees cover the network fee at the price that will be signed
  * (lib/network/batch.ts). In plain words: you pay the network fee, you earn
- * their buy fees.
+ * their buy fees. v2's buys only; one still inside its community window only
+ * to a wallet the SPX holder registry finds eligible. Any other wallet is
+ * told when holders' first claim ends and why it isn't one of them, with no
+ * button for those buys.
+ *
+ * At its foot, Community keeping (CommunityKeeping.tsx), closed: whether
+ * this wallet is a community keeper, and the proof that makes it one. It
+ * shows with or without private sending; a proof needs none. The reminder
+ * before a proof lapses is mounted here, with the panel, so it runs whether
+ * or not either is opened, from this browser's storage alone.
  *
  * Nothing is read until the panel is opened, and nothing about the person's
  * own address until they ask: the vaults are found through Collective DCA's
@@ -29,17 +38,22 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Button, FoldedPanel } from "@spdex/ui";
 import type { JsonRpc } from "@spdex/chain";
 import type { Address, GuardVerdict, Hex, SubmitterConfig } from "@spdex/core";
-import type { VaultBatchTxPlan } from "@spdex/guard";
+import type { VaultBatchTxPlan, VaultClaim } from "@spdex/guard";
 import {
   MAINNET_DEPLOYMENT,
   checksumAddress,
   latestBlock,
+  LATEST_RELEASE,
   readDueCandidates,
+  readHolderStatus,
+  releaseOfFactory,
   type DueCandidate,
+  type HolderStatus,
 } from "@spdex/vault";
 import { guardSentence, uniqueByCode } from "../../lib/errors.js";
 import { secondOpinionRefusalText } from "../../lib/simulation.js";
 import { ethText, shortAddress } from "../../lib/dca/format.js";
+import { deviceTimeOf } from "../../lib/dca/vault.js";
 import type { OwnerWalletLock } from "../../lib/execute.js";
 import type { Pricing } from "../../lib/money/pricing.js";
 import { moneyView, useRatesNeeded } from "../../lib/money/rates.js";
@@ -47,6 +61,7 @@ import { loadPlatform } from "../../lib/network/platform.js";
 import { networkName } from "../../lib/networks.js";
 import {
   CANT_SIGN_PRIVATELY_TEXT,
+  COMMUNITY_KEEPING_TEXT,
   IF_FIRST_TEXT,
   KEEPER_TEXT,
   NONE_DUE_TEXT,
@@ -54,24 +69,34 @@ import {
   TERMS_TEXT,
   batchIntent,
   buttonText,
+  claimsOf,
+  eligibleInNextBlock,
+  feesEarnedFromOthers,
+  holdersFirstText,
   ifFirstRelayText,
   introText,
   needsBalanceText,
+  needsEligibility,
   noneWouldBuyText,
   notCoveredText,
   planHelpRun,
   resultText,
-  unaccountedText,
+  splitByWindow,
+  turnHeldText,
   waitForBatch,
   walletFeeText,
+  walletKeeperText,
   youGetText,
   youPayText,
   type BatchResult,
   type HelpRunPlan,
 } from "../../lib/network/batch.js";
+import { KEEPER_DOCS_LINK_TEXT, keeperDocsUrl } from "../../lib/network/keeping.js";
 import { perfNow } from "../../lib/page.js";
 import { quantity } from "../../lib/receipts.js";
 import { recordBuyFeesEarned } from "../../lib/records/store.js";
+import { useProofLapseNotifications } from "../../lib/reminders/lapse.js";
+import type { BuyDueNotifications } from "../../lib/reminders/notify.js";
 import { walletSender } from "../../lib/senders.js";
 import { PrivateSubmissionUnavailable, privateGasPrice } from "../../lib/submit.js";
 import { isUserRejection, PRIVATE_CONFIRM_TIMEOUT_MS, type Eip1193Provider } from "../../lib/wallet.js";
@@ -80,10 +105,15 @@ import type { TilePanelProps, TileSummary } from "../../lib/tiles.js";
 import { CopyHex, TxRef } from "../dca/common.js";
 import { useOpenedOnce, useTileSummary } from "../dca/tilePanel.js";
 import { FinalityBadge } from "../trust/FinalityBadge.js";
+import { CommunityKeeping, type KeepingEngine } from "./CommunityKeeping.js";
 import "./network.css";
 
-/** What a batch needs from the Engine: its network service, its vault Guard's batcher and factory, and the batch check. */
-export interface HelpRunEngine {
+/**
+ * What a batch needs from the Engine: its network service, its vault Guard's
+ * batcher and factory, and the batch check; and for Community keeping, its
+ * registry and the proof check.
+ */
+export interface HelpRunEngine extends KeepingEngine {
   readonly rpc: JsonRpc;
   readonly vaultFactory: Address;
   readonly vaultBatcher: Address;
@@ -102,16 +132,49 @@ export interface HelpRunNetworkProps extends TilePanelProps {
   ownerLock?: OwnerWalletLock;
   /** For tests; the page's wallet otherwise. */
   provider?: Eip1193Provider;
+  /** The reminder before a proof lapses, mounted by `HelpRunPanel`; its tick shows in Community keeping. */
+  reminder?: BuyDueNotifications;
+}
+
+/**
+ * What a check read, kept for the person's ticks: every due buy, the
+ * wallet's standing when it mattered (null when it didn't, or couldn't be
+ * read), and so which buys are held back for SPX holders.
+ */
+interface CheckedDue {
+  /** The due buys whose vault a claim was found for (`claimsOf`): the only ones a batch may carry. */
+  all: readonly DueCandidate[];
+  /** Each one's claim, by vault: what the batch intent proves it by. */
+  claims: ReadonlyMap<Address, VaultClaim>;
+  holder: HolderStatus | null;
+  /** When it was read, by this device's clock (ms): with the standing's block time, what puts a chain time on this device's clock. */
+  readAtMs: number;
 }
 
 type Phase =
   | { kind: "idle" }
   | { kind: "checking" }
   | { kind: "failed"; text: string }
-  | { kind: "planned"; plan: HelpRunPlan; due: readonly DueCandidate[]; verdict: GuardVerdict | null; ticked: ReadonlySet<string> }
+  | {
+      kind: "planned";
+      plan: HelpRunPlan;
+      /** The due buys this wallet may make: the tick list. */
+      due: readonly DueCandidate[];
+      /**
+       * Due buys inside their window that this wallet can't be paid for: how
+       * many, when the first opens to it, and how many only because the turn
+       * is another group's.
+       */
+      heldBack: { count: number; until: bigint; byTurn: number } | null;
+      checked: CheckedDue;
+      verdict: GuardVerdict | null;
+      ticked: ReadonlySet<string>;
+    }
   | { kind: "sending"; text: string }
   | { kind: "sent"; hash: Hex; result: BatchResult | null; plan: Extract<HelpRunPlan, { kind: "offer" }>; recorded: boolean }
   | { kind: "stopped"; text: string };
+
+type Planned = Extract<Phase, { kind: "planned" }>;
 
 const lower = (value: string) => value.toLowerCase() as Address;
 
@@ -137,12 +200,14 @@ export function HelpRunPanel(props: HelpRunNetworkProps) {
   // then, and with no wallet on this network, nothing.
   const [due, setDue] = useState<TileSummary>({ text: "" });
   useTileSummary(props.onSummary, hidden ? { text: "" } : due);
+  // Here rather than inside: it reminds while spDEX is open, folded or not.
+  const reminder = useProofLapseNotifications(props.chainId, props.account);
   if (inTile) {
     return (
       <div hidden={hidden}>
         <section className="spdex-subpanel" data-testid="help-run-panel">
           <h3 className="spdex-subpanel__title">Help run the network</h3>
-          {opened ? <HelpRunNetwork {...props} onSummary={setDue} /> : null}
+          {opened ? <HelpRunNetwork {...props} onSummary={setDue} reminder={reminder} /> : null}
         </section>
       </div>
     );
@@ -157,14 +222,14 @@ export function HelpRunPanel(props: HelpRunNetworkProps) {
           if (open) setOpened(true);
         }}
       >
-        {opened ? <HelpRunNetwork {...props} /> : null}
+        {opened ? <HelpRunNetwork {...props} reminder={reminder} /> : null}
       </FoldedPanel>
     </div>
   );
 }
 
 export function HelpRunNetwork(props: HelpRunNetworkProps) {
-  const { engine, chainId, account, walletChainOk, submitter, pricing, ownerLock, provider } = props;
+  const { engine, chainId, account, walletChainOk, submitter, pricing, ownerLock, provider, reminder } = props;
   const [batcherThere, setBatcherThere] = useState<boolean | null>(null);
   const [phase, setPhase] = useState<Phase>({ kind: "idle" });
   const asked = useRef(0);
@@ -197,16 +262,35 @@ export function HelpRunNetwork(props: HelpRunNetworkProps) {
 
   if (account === null || !walletChainOk) return null;
 
+  // A proof needs neither the batcher nor private sending: Community keeping
+  // shows whatever Help run itself can offer, closed, reading nothing.
+  const keeping = (
+    <CommunityKeeping
+      engine={engine}
+      chainId={chainId}
+      account={account}
+      submitter={submitter}
+      {...(ownerLock === undefined ? {} : { ownerLock })}
+      {...(reminder === undefined ? {} : { reminder })}
+      {...(provider === undefined ? {} : { provider })}
+    />
+  );
+
   // The panel is open, so it says why it offers nothing rather than showing only its title.
   if (batcherThere !== true) {
-    return batcherThere === null ? (
-      <p className="spdex-field__hint" data-testid="help-run-looking">
-        Looking for the vault batcher on {networkName(chainId)}…
-      </p>
-    ) : (
-      <p className="spdex-network-line" data-testid="help-run-no-batcher">
-        spDEX can't find the vault batcher on {networkName(chainId)}, so there are no vault buys to make from here.
-      </p>
+    return (
+      <>
+        {batcherThere === null ? (
+          <p className="spdex-field__hint" data-testid="help-run-looking">
+            Looking for the vault batcher on {networkName(chainId)}…
+          </p>
+        ) : (
+          <p className="spdex-network-line" data-testid="help-run-no-batcher">
+            spDEX can't find the vault batcher on {networkName(chainId)}, so there are no vault buys to make from here.
+          </p>
+        )}
+        {keeping}
+      </>
     );
   }
 
@@ -219,17 +303,34 @@ export function HelpRunNetwork(props: HelpRunNetworkProps) {
         <p className="spdex-field__hint" data-testid="help-run-public-where">
           <GoTo place="sending">Turn it on</GoTo>
         </p>
+        {keeping}
       </div>
     );
   }
 
-  const check = async (only: ReadonlySet<string> | null, known: readonly DueCandidate[] | null) => {
+  const check = async (only: ReadonlySet<string> | null, known: CheckedDue | null) => {
     const ticket = ++asked.current;
     setPhase({ kind: "checking" });
     try {
       const block = await latestBlock(engine.rpc);
-      const due =
-        known ?? (await readDueCandidates(engine.rpc, await loadPlatform(engine.rpc, chainId), { block, factory: engine.vaultFactory }));
+      const read =
+        known?.all ?? (await readDueCandidates(engine.rpc, await loadPlatform(engine.rpc, chainId), { block, factory: engine.vaultFactory }));
+      // Each vault's claim, which the Guard proves it by: a vault none is found
+      // for is never offered, since the batch would be refused for it.
+      const claims =
+        known?.claims ?? (await claimsOf(engine.rpc, read, { release: releaseOfFactory(engine.vaultFactory) ?? LATEST_RELEASE, block }));
+      const all = read.filter((c) => claims.has(lower(c.vault)));
+      // Whether this wallet may be paid inside a window, at the same block as
+      // the buys: read only when a buy is inside its window.
+      const holder =
+        known !== null
+          ? known.holder
+          : needsEligibility(all)
+            ? await readHolderStatus(engine.rpc, account, { registry: engine.vaultRegistry, block }).catch(() => null)
+            : null;
+      const readAtMs = known?.readAtMs ?? Date.now();
+      const split = splitByWindow(all, eligibleInNextBlock(holder), account);
+      const heldBack = split.until === null ? null : { count: split.heldBack.length, until: split.until, byTurn: split.byTurn };
       // The price the batch is signed at, with a tip a builder will take: the
       // fees it must cover are worked out at this price and no other.
       const [gasPrice, balanceRaw] = await Promise.all([
@@ -238,31 +339,32 @@ export function HelpRunNetwork(props: HelpRunNetworkProps) {
       ]);
       const balance = quantity(balanceRaw);
       if (balance === null) throw new Error("the network service didn't give your balance");
-      const plan = await planHelpRun({ rpc: engine.rpc, account, batcher: engine.vaultBatcher, due, gasPrice, balance, only });
+      const due = split.offered;
+      const plan = await planHelpRun({ rpc: engine.rpc, account, batcher: engine.vaultBatcher, due, gasPrice, balance, only, heldBack });
       let verdict: GuardVerdict | null = null;
-      if (plan.kind === "offer") verdict = (await engine.checkVaultBatch(batchIntent(plan, account, chainId))).verdict;
+      if (plan.kind === "offer") verdict = (await engine.checkVaultBatch(batchIntent(plan, account, chainId, claims))).verdict;
       if (ticket !== asked.current) return;
       const ticked = new Set(plan.kind === "offer" ? plan.vaults.map((v) => lower(v.vault)) : (only ?? []));
-      setPhase({ kind: "planned", plan, due, verdict, ticked });
+      setPhase({ kind: "planned", plan, due, heldBack, checked: { all, claims, holder, readAtMs }, verdict, ticked });
     } catch (error) {
       if (ticket !== asked.current) return;
       setPhase({ kind: "failed", text: `Couldn't check the due buys (${error instanceof Error ? error.message : String(error)}).` });
     }
   };
 
-  const send = async (offer: Extract<HelpRunPlan, { kind: "offer" }>, due: readonly DueCandidate[]) => {
+  const send = async (offer: Extract<HelpRunPlan, { kind: "offer" }>, planned: Planned) => {
     if (ownerLock !== undefined && !ownerLock.tryAcquire()) {
       setPhase({ kind: "stopped", text: "Your wallet is busy with another request. Try again when it finishes." });
       return;
     }
-    const intent = batchIntent(offer, account, chainId);
+    const intent = batchIntent(offer, account, chainId, planned.checked.claims);
     const vaults = intent.vaults;
     try {
       setPhase({ kind: "sending", text: "Running the safety check again…" });
       // Again, now: the offer was checked a moment ago, and the chain moves.
       const { plan, verdict } = await engine.checkVaultBatch(intent);
       if (!verdict.signable || verdict.level !== "verified") {
-        setPhase({ kind: "planned", plan: offer, due, verdict, ticked: new Set(vaults) });
+        setPhase({ ...planned, plan: offer, verdict, ticked: new Set(vaults) });
         return;
       }
       const call = plan.calls[0]!;
@@ -277,7 +379,14 @@ export function HelpRunNetwork(props: HelpRunNetworkProps) {
       });
       const sent = await sender.send({ to: call.to, data: call.data, value: call.value, chainId, gas: call.gas, gasPrice: call.gasPrice });
       setPhase({ kind: "sent", hash: sent.hash, result: null, plan: offer, recorded: false });
-      const settled = await waitForBatch(engine.rpc, { hash: sent.hash, batcher: engine.vaultBatcher, vaults }, { timeoutMs: PRIVATE_CONFIRM_TIMEOUT_MS });
+      // This wallet's own vaults in the batch (a buy past its window is
+      // anyone's, its owner's too): their fees come back to it, not as earnings.
+      const owned = planned.due.filter((c) => lower(c.owner) === lower(account)).map((c) => lower(c.vault));
+      const settled = await waitForBatch(
+        engine.rpc,
+        { hash: sent.hash, batcher: engine.vaultBatcher, vaults, owned },
+        { timeoutMs: PRIVATE_CONFIRM_TIMEOUT_MS },
+      );
       const result = settled?.result ?? null;
       let recorded = false;
       if (settled !== null) {
@@ -286,7 +395,8 @@ export function HelpRunNetwork(props: HelpRunNetworkProps) {
           chainId,
           account,
           receipt: settled.receipt,
-          earned: settled.result.earned,
+          // Other people's fees only: an own vault's buy row counts its fee as paid back.
+          earned: feesEarnedFromOthers(settled.result),
           // The buy fees are paid in the vaults' own WETH, the factory's.
           weth: lower(MAINNET_DEPLOYMENT.weth),
           pricing,
@@ -312,9 +422,10 @@ export function HelpRunNetwork(props: HelpRunNetworkProps) {
         relayUrl={submitter.url}
         pricing={pricing}
         onCheck={() => void check(null, null)}
-        onTicks={(ticked, due) => void check(ticked, due)}
-        onSend={(offer, due) => void send(offer, due)}
+        onTicks={(ticked, checked) => void check(ticked, checked)}
+        onSend={(offer, planned) => void send(offer, planned)}
       />
+      {keeping}
     </div>
   );
 }
@@ -335,8 +446,8 @@ function Body({
   relayUrl: string | null;
   pricing: Pricing | null;
   onCheck: () => void;
-  onTicks: (ticked: ReadonlySet<string>, due: readonly DueCandidate[]) => void;
-  onSend: (offer: Extract<HelpRunPlan, { kind: "offer" }>, due: readonly DueCandidate[]) => void;
+  onTicks: (ticked: ReadonlySet<string>, checked: CheckedDue) => void;
+  onSend: (offer: Extract<HelpRunPlan, { kind: "offer" }>, planned: Planned) => void;
 }) {
   const money = moneyView(pricing, perfNow());
   switch (phase.kind) {
@@ -392,8 +503,8 @@ function Planned({
   money: ReturnType<typeof moneyView>;
   relayUrl: string | null;
   onCheck: () => void;
-  onTicks: (ticked: ReadonlySet<string>, due: readonly DueCandidate[]) => void;
-  onSend: (offer: Extract<HelpRunPlan, { kind: "offer" }>, due: readonly DueCandidate[]) => void;
+  onTicks: (ticked: ReadonlySet<string>, checked: CheckedDue) => void;
+  onSend: (offer: Extract<HelpRunPlan, { kind: "offer" }>, planned: Planned) => void;
 }) {
   const { plan, due, verdict, ticked } = phase;
   const again = (
@@ -405,7 +516,20 @@ function Planned({
   );
   const list =
     due.length > 0 ? (
-      <VaultList due={due} ticked={ticked} onChange={(next) => onTicks(next, due)} />
+      <VaultList due={due} ticked={ticked} onChange={(next) => onTicks(next, phase.checked)} />
+    ) : null;
+  // Due buys this wallet can't be paid for yet, beside the ones it can: said,
+  // never offered, and after the offer, its terms and its button, which read
+  // as one unit.
+  const held =
+    phase.heldBack !== null && plan.kind !== "holders-first" ? (
+      <HoldersFirst
+        until={phase.heldBack.until}
+        alongside={phase.heldBack.count}
+        byTurn={phase.heldBack.byTurn}
+        holder={phase.checked.holder}
+        readAtMs={phase.checked.readAtMs}
+      />
     ) : null;
 
   switch (plan.kind) {
@@ -434,6 +558,7 @@ function Planned({
           )}
           {list}
           {again}
+          {held}
         </>
       );
     case "none-would-buy":
@@ -444,14 +569,20 @@ function Planned({
           </p>
           {list}
           {again}
+          {held}
         </>
       );
-    case "unaccounted":
+    case "holders-first":
+      // Every due buy is inside its window, and this wallet can't be paid there: no batch, and no button.
       return (
         <>
-          <p className="spdex-network-warn" data-testid="help-run-unaccounted">
-            {unaccountedText(plan.swept)}
-          </p>
+          <HoldersFirst
+            until={plan.until}
+            alongside={null}
+            byTurn={phase.heldBack?.byTurn ?? 0}
+            holder={phase.checked.holder}
+            readAtMs={phase.checked.readAtMs}
+          />
           {again}
         </>
       );
@@ -463,6 +594,7 @@ function Planned({
           </p>
           {list}
           {again}
+          {held}
         </>
       );
     case "failed":
@@ -472,6 +604,7 @@ function Planned({
             Couldn't test-run the batch ({plan.reason}).
           </p>
           {again}
+          {held}
         </>
       );
     case "offer": {
@@ -512,7 +645,7 @@ function Planned({
           {verdict !== null && !signable ? <Refusal verdict={verdict} /> : null}
           <div className="spdex-actions">
             {signable ? (
-              <Button testId="help-run-send" onClick={() => onSend(plan, due)}>
+              <Button testId="help-run-send" onClick={() => onSend(plan, phase)}>
                 {buttonText(plan.vaults.length)}
               </Button>
             ) : null}
@@ -520,10 +653,66 @@ function Planned({
               Check again
             </Button>
           </div>
+          {held}
         </>
       );
     }
   }
+}
+
+/**
+ * Due buys inside their community window that this wallet can't be paid
+ * for: when SPX holders' first claim ends (on its own, or after how many are
+ * held back beside an offer), why this wallet isn't one of them — or, for an
+ * eligible wallet, that those buys are another group's turn (`byTurn`) — and
+ * what community keeping is, with a link where the build names its source.
+ * No button: those buys are not offered (decision 23).
+ *
+ * `until` is chain time. It is shown on this device's clock, as the vault
+ * card shows a window's end (`deviceTimeOf`): moved by the gap between the
+ * standing's block time and `readAtMs`, when both are known. A local fork's
+ * clock runs days behind.
+ */
+export function HoldersFirst({
+  until,
+  alongside,
+  byTurn = 0,
+  holder,
+  readAtMs,
+}: {
+  until: bigint;
+  alongside: number | null;
+  byTurn?: number;
+  holder: HolderStatus | null;
+  readAtMs?: number;
+}) {
+  const turns = turnHeldText(byTurn);
+  const docs = keeperDocsUrl();
+  const chainNow = holder?.chainTime ?? null;
+  const shown = chainNow === null || readAtMs === undefined ? until : BigInt(deviceTimeOf(Number(until), Number(chainNow), readAtMs));
+  return (
+    <div data-testid="help-run-holders-first">
+      <p className="spdex-network-line" data-testid="help-run-first-claim">
+        {holdersFirstText(shown, alongside)}
+      </p>
+      <p className="spdex-network-line" data-testid="help-run-standing">
+        {walletKeeperText(holder)}
+      </p>
+      {turns !== null ? (
+        <p className="spdex-network-line" data-testid="help-run-turns">
+          {turns}
+        </p>
+      ) : null}
+      <p className="spdex-network-line spdex-network-line--quiet" data-testid="help-run-keeping">
+        {COMMUNITY_KEEPING_TEXT}{" "}
+        {docs !== null ? (
+          <a href={docs} target="_blank" rel="noreferrer noopener" data-testid="help-run-keeping-docs">
+            {KEEPER_DOCS_LINK_TEXT}
+          </a>
+        ) : null}
+      </p>
+    </div>
+  );
 }
 
 /** The safety check's refusal, sentence by sentence, with each code for anyone who wants it. */

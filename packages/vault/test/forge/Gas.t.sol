@@ -16,6 +16,11 @@ import {SpdexDcaVault} from "../../contracts/SpdexDcaVault.sol";
 // "Busy" means the pool's tick moved within the last ten minutes: `observe` then has to
 // binary-search its 1,800 observations for the one ten minutes back, where on a quiet pool
 // it extends the latest. The difference is about 57,000 gas.
+//
+// Each buy here is made inside its community window by a keeper paying itself, an eligible
+// address: the registry is asked, which a buy after its window or paid to its owner (Trigger
+// now) does not do, so these are the dearer of v2's paths. v1, as deployed, measured
+// 301,163 for the busy first buy, 307,558 estimated (369,070 signed), and 251,481 quiet.
 
 /// Cheatcodes this file needs beyond the shared harness.
 interface VmGas {
@@ -40,15 +45,25 @@ interface IV3PoolObservations {
 contract ExecuteGasTest is ForkTest {
     VmGas internal constant vmg = VmGas(address(uint160(uint256(keccak256("hevm cheat code")))));
 
-    /// `EXECUTE_GAS` in `src/index.ts`: what one buy sent on its own is sized from.
-    uint256 internal constant EXECUTE_GAS = 320_000;
+    /// `EXECUTE_GAS` in `src/index.ts`: what one buy sent on its own is sized from. 320,000
+    /// in v1, over its 301,163; v2's dear case measures 312,543 with the real registry, so
+    /// it rose to keep that headroom.
+    uint256 internal constant EXECUTE_GAS = 330_000;
     /// `KEEPER_GAS_HEADROOM_BPS`: a wallet signs a lone `execute` with its estimate plus 20%.
     uint256 internal constant KEEPER_GAS_HEADROOM_BPS = 12_000;
-    /// `MAX_EXECUTE_GAS_LIMIT`: the gas the batcher gives each vault (`EXECUTE_GAS_CAP`).
+    /// `MAX_EXECUTE_GAS_LIMIT`: the least gas the batcher may give each vault
+    /// (`MIN_EXECUTE_GAS`), and what a keeper gives it.
     uint256 internal constant MAX_EXECUTE_GAS_LIMIT = 400_000;
-    /// What a transaction pays before its first opcode: the 21,000 base, and the calldata —
-    /// `execute()`'s selector, four non-zero bytes at 16 each.
-    uint256 internal constant INTRINSIC = 21_000 + 4 * 16;
+
+    /// What a transaction pays before its first opcode: the 21,000 base, and the calldata,
+    /// `execute(keeper)`'s: 16 a non-zero byte, 4 a zero one.
+    function intrinsic() internal view returns (uint256 cost) {
+        bytes memory data = abi.encodeCall(SpdexDcaVault.execute, (keeper));
+        cost = 21_000;
+        for (uint256 i; i < data.length; i++) {
+            cost += data[i] == 0 ? 4 : 16;
+        }
+    }
 
     SpdexDcaVault internal vault;
     uint256 internal lastTradeAt;
@@ -82,6 +97,7 @@ contract ExecuteGasTest is ForkTest {
     function coolAll() internal {
         vmg.cool(address(vault));
         vmg.cool(factory.implementation());
+        vmg.cool(registry);
         vmg.cool(WETH);
         vmg.cool(SPX);
         vmg.cool(SPX_WETH_PAIR);
@@ -93,8 +109,10 @@ contract ExecuteGasTest is ForkTest {
         coolAll();
         vm.prank(keeper);
         uint256 g = gasleft();
-        vault.execute();
-        return g - gasleft() + INTRINSIC;
+        vault.execute(keeper);
+        // Read first, on its own: `intrinsic()` must not run inside the measurement.
+        uint256 used = g - gasleft();
+        return used + intrinsic();
     }
 
     /// The least gas limit the buy succeeds with — what `eth_estimateGas` would answer —
@@ -107,12 +125,12 @@ contract ExecuteGasTest is ForkTest {
             uint256 snapshot = vmg.snapshotState();
             coolAll();
             vm.prank(keeper);
-            (bool ok,) = address(vault).call{gas: middle}(abi.encodeCall(SpdexDcaVault.execute, ()));
+            (bool ok,) = address(vault).call{gas: middle}(abi.encodeCall(SpdexDcaVault.execute, (keeper)));
             vmg.revertToState(snapshot);
             if (ok) high = middle;
             else low = middle + 1;
         }
-        return low + INTRINSIC;
+        return low + intrinsic();
     }
 
     function poolIsBusy() internal view returns (bool) {
@@ -123,7 +141,7 @@ contract ExecuteGasTest is ForkTest {
 
     /// The dear case `EXECUTE_GAS` has to cover: a first buy (an owner who never held SPX, a
     /// keeper who never held WETH, the vault's counters written from zero) on a pool that
-    /// traded a block ago.
+    /// traded a block ago, inside its community window, so the registry is asked too.
     function test_aFirstBuyOnABusyPoolFitsEXECUTE_GAS() public {
         assertTrue(poolIsBusy(), "the pool traded within the last ten minutes");
         assertEq(spxOf(owner) + wethOf(keeper), 0, "a fresh owner and keeper");

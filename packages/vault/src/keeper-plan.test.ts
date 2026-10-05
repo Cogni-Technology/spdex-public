@@ -7,8 +7,8 @@
 
 import { describe, expect, it } from "vitest";
 import type { Address } from "@spdex/core";
-import { BATCHER_LIMITS } from "./artifacts.js";
-import { BATCH_FIRST_BUY_EXTRA_GAS, BATCH_FIXED_GAS, BATCH_PER_BUY_GAS } from "./fee.js";
+import { BATCHER_LIMITS, V1_BATCHER_LIMITS } from "./artifacts.js";
+import { BATCH_FIRST_BUY_EXTRA_GAS, BATCH_FIXED_GAS, BATCH_PER_BUY_GAS, SOURCE_BUYS, V1_BATCH_PER_BUY_GAS, buyFee, v1BuyFee } from "./fee.js";
 import {
   DEFAULT_KEEPER_POLICY,
   RATIO_ONE,
@@ -18,6 +18,8 @@ import {
   deadlineOf,
   earliestBuyAt,
   economicFeePerGas,
+  minGasPerAttempt,
+  modelBatchGas,
   nextBaseFee,
   percentile,
   replacementFees,
@@ -25,10 +27,20 @@ import {
   selectBatch,
   shouldSend,
   splitRoundRobin,
+  turnEndsAtOf,
   urgentTipAfter,
   windowOf,
   type BatchCandidate,
   type KeeperPolicy,
+} from "./keeper-plan.js";
+import {
+  COMMUNITY_URGENT_SECONDS,
+  COMMUNITY_URGENT_SHORT_BELOW,
+  communityWindowEndsAt,
+  dueSinceAt,
+  inCommunityWindow,
+  slotStartAt,
+  urgentFrom,
 } from "./keeper-plan.js";
 
 const GWEI = 10n ** 9n;
@@ -134,6 +146,21 @@ describe("waiting for a cheap block", () => {
     expect(shouldSend({ ...quiet, urgent: true }, 99n, policy({ sendWhen: "deadline" }))).toBe("deadline");
     expect(shouldSend(quiet, 99n, policy({ sendWhen: "now" }))).toBe("now");
   });
+
+  it("sends a buy inside a community window it may be paid in as soon as it is due, but a standby keeper only in the window's tail", () => {
+    const inWindow = { urgent: false, shortInterval: false, target: 10n, inCommunityWindow: true };
+    // Not a cheap block, and sent anyway: the window is when a holder is paid ahead of everyone else.
+    expect(shouldSend(inWindow, 99n, P)).toBe("window");
+    expect(shouldSend({ ...inWindow, shortInterval: true }, 99n, P)).toBe("window");
+    expect(shouldSend({ ...inWindow, urgent: true }, 99n, P)).toBe("deadline");
+    expect(shouldSend(inWindow, 0n, policy({ sendWhen: "deadline" }))).toBeNull();
+    expect(shouldSend({ ...inWindow, urgent: true }, 99n, policy({ sendWhen: "deadline" }))).toBe("deadline");
+    expect(shouldSend(inWindow, 99n, policy({ sendWhen: "now" }))).toBe("now");
+  });
+
+  it("warns, by default, a week before the key's ether runs out", () => {
+    expect(DEFAULT_KEEPER_POLICY.minRunwayDays).toBe(7);
+  });
 });
 
 describe("selectBatch", () => {
@@ -187,6 +214,25 @@ describe("selectBatch", () => {
   it("prices a first buy's extra gas", () => {
     const [later, first] = [select([candidate(1)]).vaults[0]!, select([candidate(1, { firstBuy: true })]).vaults[0]!];
     expect(first.costWei - later.costWei).toBe(BATCH_FIRST_BUY_EXTRA_GAS * F);
+  });
+
+  it("costs a v1 vault's buy at v1's measured gas, and this build's at its own, by source: the ratio could never bring an overstated model down", () => {
+    const [v1, v2, latest] = [
+      select([candidate(1, { release: "v1" })]).vaults[0]!,
+      select([candidate(1, { release: "v2" })]).vaults[0]!,
+      select([candidate(1)]).vaults[0]!,
+    ];
+    expect(V1_BATCH_PER_BUY_GAS).toBe(106_000n);
+    expect(v1.costWei).toBe(V1_BATCH_PER_BUY_GAS * F);
+    expect(v2.costWei).toBe(BATCH_PER_BUY_GAS * F);
+    expect(latest.costWei).toBe(BATCH_PER_BUY_GAS * F);
+    expect(modelBatchGas([{ firstBuy: false, release: "v1" }, { firstBuy: true, release: "v1" }])).toBe(BATCH_FIXED_GAS + 2n * V1_BATCH_PER_BUY_GAS + BATCH_FIRST_BUY_EXTRA_GAS);
+    expect(modelBatchGas([{ firstBuy: false, release: "v2" }, { firstBuy: false }])).toBe(BATCH_FIXED_GAS + 2n * BATCH_PER_BUY_GAS);
+    // One row per source: a release built from a source shares its row.
+    expect(SOURCE_BUYS.v1.perBuyGas).toBe(V1_BATCH_PER_BUY_GAS);
+    expect(SOURCE_BUYS.v2.perBuyGas).toBe(BATCH_PER_BUY_GAS);
+    expect(SOURCE_BUYS.v1.proposedFee(10n ** 16n)).toEqual(v1BuyFee(10n ** 16n));
+    expect(SOURCE_BUYS.v2.proposedFee(10n ** 16n)).toEqual(buyFee(10n ** 16n));
   });
 
   it("scales gas by the calibration ratio", () => {
@@ -304,6 +350,21 @@ describe("selectBatch", () => {
     it("says no subsidy is on offer, rather than a cap, when the others can't carry it", () => {
       expect(select([small(1)]).skipped).toEqual([{ vault: addr(1), code: "economics", detail: "no-subsidy" }]);
     });
+
+    it("judges a v1 vault by the fee v1 proposed when it was made, which v2's dearer rule would refuse", () => {
+      // At 1 gwei no fee here covers its own gas; the subsidy serves only a vault paying what spDEX proposed.
+      const dear = { feePerGas: GWEI, policy: { ...P, maxLossPerBuy: ETHER / 1_000n, maxLossPerVaultPerDay: ETHER / 1_000n, maxSubsidyPerOwnerPerDay: ETHER / 1_000n } };
+      const v1Fee = v1BuyFee(ETHER / 100n).reward;
+      expect(v1Fee < buyFee(ETHER / 100n).reward).toBe(true);
+      const asV1 = select([candidate(1, { reward: v1Fee, release: "v1" })], dear);
+      expect(asV1.vaults.map((v) => v.vault)).toEqual([addr(1)]);
+      expect(asV1.vaults[0]!.subsidyWei > 0n).toBe(true);
+      // The same fee on this build's vault is below the fee this build proposes: it pays its own way or waits.
+      for (const release of [undefined, "v2" as const]) {
+        const asV2 = select([candidate(1, { reward: v1Fee, ...(release ? { release } : {}) })], dear);
+        expect(asV2.skipped).toEqual([{ vault: addr(1), code: "economics", detail: "not-subsidised" }]);
+      }
+    });
   });
 
   it("opens the breaker's price: the margin applied twice", () => {
@@ -347,8 +408,17 @@ describe("selectBatch", () => {
 });
 
 describe("gas limits and splitting", () => {
+  it("leaves the batcher what an attempt needs: the gas after the 63/64 rule and its overhead, 460,000 at the least, as v1's fixed figure", () => {
+    expect(minGasPerAttempt()).toBe(460_000n);
+    expect(minGasPerAttempt(BATCHER_LIMITS.MIN_EXECUTE_GAS)).toBe(V1_BATCHER_LIMITS.MIN_GAS_PER_ATTEMPT);
+    // ⌈1,000,000 × 64/63⌉ + 53,650.
+    expect(minGasPerAttempt(1_000_000n)).toBe(1_000_000n + 15_874n + 53_650n);
+    expect(minGasPerAttempt(1_000_000n)).toBe(1_000_000n + (1_000_000n + 62n) / 63n + BATCHER_LIMITS.ATTEMPT_OVERHEAD);
+  });
+
   it("gives every vault its figure and the last one a whole attempt's tail", () => {
-    expect(batchGasLimit([])).toBe(60_000n + BATCHER_LIMITS.MIN_GAS_PER_ATTEMPT);
+    expect(batchGasLimit([])).toBe(60_000n + minGasPerAttempt());
+    expect(batchGasLimit([], 1_000_000n)).toBe(60_000n + minGasPerAttempt(1_000_000n));
     // Ten later buys: 60k + 1.27M + 460k.
     expect(batchGasLimit(Array.from({ length: 10 }, () => ({ firstBuy: false })))).toBe(1_790_000n);
     expect(batchGasLimit([{ firstBuy: true }, { firstBuy: false }])).toBe(60_000n + 178_000n + 127_000n + 460_000n);
@@ -418,5 +488,132 @@ describe("fees", () => {
     expect(resendIntervalBlocks(10n, P)).toBe(3);
     expect(resendIntervalBlocks(1n, P)).toBe(2);
     expect(resendIntervalBlocks(1_000n, P)).toBe(10);
+  });
+});
+
+// ─── The community window ─────────────────────────────────────────────────────
+
+/**
+ * The vault's own window arithmetic, to the second, at the edges
+ * `test/forge/Window.t.sol` pins on the contract: a first buy due at its
+ * start, the first buy after a missed slot, the next buy after the spacing
+ * rule, a first window over before the vault existed, and the bounds. A
+ * mistake here is a keeper that sends into `NotEligible`, or holds back a buy
+ * that was already open.
+ */
+describe("the community window", () => {
+  // The forge suite's default plan: hourly, a 15-minute window, ten buys.
+  const T = 1_790_000_000n;
+  const hourly = { startAt: T, interval: 3_600n, maxBuys: 10n, communityWindow: 900n };
+  const at = (terms: typeof hourly, buysDone: bigint, lastBuyAt: bigint, now: bigint) => ({
+    dueSince: dueSinceAt(terms, buysDone, lastBuyAt, now),
+    endsAt: communityWindowEndsAt(terms, buysDone, lastBuyAt, now),
+    inWindow: inCommunityWindow(terms, buysDone, lastBuyAt, now),
+  });
+
+  it("starts each slot at the vault's rounding, and the first at startAt", () => {
+    expect(slotStartAt(hourly, T - 1n)).toBe(T);
+    expect(slotStartAt(hourly, T)).toBe(T);
+    expect(slotStartAt(hourly, T + 3_599n)).toBe(T);
+    expect(slotStartAt(hourly, T + 3_600n)).toBe(T + 3_600n);
+    expect(slotStartAt(hourly, T + 2n * 3_600n + 600n)).toBe(T + 7_200n);
+  });
+
+  it("gives a first buy its window from startAt: refused to the last second, open from its end", () => {
+    // Before the start the vault reports when it will fall due, as status() does.
+    expect(at(hourly, 0n, 0n, T - 100n)).toEqual({ dueSince: T, endsAt: T + 900n, inWindow: false });
+    expect(at(hourly, 0n, 0n, T)).toEqual({ dueSince: T, endsAt: T + 900n, inWindow: true });
+    expect(at(hourly, 0n, 0n, T + 899n)).toEqual({ dueSince: T, endsAt: T + 900n, inWindow: true });
+    expect(at(hourly, 0n, 0n, T + 900n)).toEqual({ dueSince: T, endsAt: T + 900n, inWindow: false });
+  });
+
+  it("measures the first buy after a missed slot from that slot's start, not from when the clock first allowed it", () => {
+    // Slot 0 bought at its start; slot 1 passes unbought; it is 600 s into slot 2.
+    const slot2 = T + 7_200n;
+    expect(earliestBuyAt(hourly, 1n, T)).toBe(T + 3_600n);
+    expect(at(hourly, 1n, T, slot2 + 600n)).toEqual({ dueSince: slot2, endsAt: slot2 + 900n, inWindow: true });
+    expect(at(hourly, 1n, T, slot2 + 899n).inWindow).toBe(true);
+    expect(at(hourly, 1n, T, slot2 + 900n).inWindow).toBe(false);
+    // Earlier, in slot 1, the same buy was due from slot 1's start.
+    expect(at(hourly, 1n, T, T + 3_700n)).toEqual({ dueSince: T + 3_600n, endsAt: T + 4_500n, inWindow: true });
+    // A plan whose first slots went unbought: due from the current slot's start.
+    const late = { ...hourly, startAt: T - 2n * 3_600n - 100n };
+    expect(at(late, 0n, 0n, T)).toEqual({ dueSince: late.startAt + 7_200n, endsAt: late.startAt + 8_100n, inWindow: true });
+  });
+
+  it("measures the next buy after the spacing rule from half an interval after the last, and ends it inside its slot", () => {
+    // Bought in slot 0's last second: the next falls due half an interval on, inside slot 1.
+    const last = T + 3_599n;
+    const spaced = last + 1_800n;
+    expect(at(hourly, 1n, last, T + 3_600n)).toEqual({ dueSince: spaced, endsAt: spaced + 900n, inWindow: false });
+    expect(at(hourly, 1n, last, spaced - 1n).inWindow).toBe(false);
+    expect(at(hourly, 1n, last, spaced)).toEqual({ dueSince: spaced, endsAt: spaced + 900n, inWindow: true });
+    expect(at(hourly, 1n, last, spaced + 899n).inWindow).toBe(true);
+    expect(at(hourly, 1n, last, spaced + 900n).inWindow).toBe(false);
+    expect(spaced + 900n < T + 7_200n).toBe(true);
+  });
+
+  it("says a first window that ended before the vault existed is over: its buy is open at once", () => {
+    // A 5-minute plan whose window is 75 s, built at the head's time and included 80 s later.
+    const fiveMinutes = { startAt: T, interval: 300n, maxBuys: 3n, communityWindow: 75n };
+    expect(at(fiveMinutes, 0n, 0n, T + 80n)).toEqual({ dueSince: T, endsAt: T + 75n, inWindow: false });
+    // With startAt 120 s ahead, as the app sets it, the first buy has its window.
+    const ahead = { ...fiveMinutes, startAt: T + 200n };
+    expect(at(ahead, 0n, 0n, T + 80n)).toEqual({ dueSince: T + 200n, endsAt: T + 275n, inWindow: false });
+    expect(at(ahead, 0n, 0n, T + 200n).inWindow).toBe(true);
+  });
+
+  it("ends every window inside the slot it started in, with at least a quarter of the slot left open to anyone", () => {
+    for (const interval of [300n, 301n, 303n, 304n, 3_600n, 86_400n, 366n * 86_400n]) {
+      const quarter = interval / 4n;
+      for (const communityWindow of [60n, quarter < 3_600n ? quarter : 3_600n]) {
+        const terms = { startAt: T, interval, maxBuys: 1_000n, communityWindow };
+        // The last buy at a slot's first and last seconds and in between, and buys missed.
+        for (const lastBuyAt of [0n, T, T + 1n, T + interval / 2n, T + interval - 1n]) {
+          const buysDone = lastBuyAt === 0n ? 0n : 1n;
+          for (const now of [T + interval, T + interval + interval / 3n, T + 2n * interval - 1n, T + 5n * interval + 7n]) {
+            const due = dueSinceAt(terms, buysDone, lastBuyAt, now)!;
+            const endsAt = communityWindowEndsAt(terms, buysDone, lastBuyAt, now)!;
+            const slotEnd = slotStartAt(terms, due) + interval;
+            expect(endsAt <= slotEnd - quarter, `${interval} ${communityWindow} ${lastBuyAt} ${now}`).toBe(true);
+          }
+        }
+      }
+    }
+  });
+
+  it("ends a plan's turn half a window after the buy fell due, and has none without turns", () => {
+    const turned = { ...hourly, turnBuckets: 4n };
+    expect(turnEndsAtOf(turned, 0n, 0n, T)).toBe(T + 450n);
+    expect(turnEndsAtOf(turned, 0n, 0n, T - 100n)).toBe(T + 450n);
+    // The first buy after a missed slot: from that slot's start.
+    expect(turnEndsAtOf(turned, 1n, T, T + 7_800n)).toBe(T + 7_200n + 450n);
+    // A 60-second window's turn is its first 30 seconds.
+    expect(turnEndsAtOf({ ...turned, interval: 300n, communityWindow: 60n }, 0n, 0n, T)).toBe(T + 30n);
+    expect(turnEndsAtOf({ ...hourly, turnBuckets: 0n }, 0n, 0n, T)).toBeNull();
+    expect(turnEndsAtOf({ ...hourly, communityWindow: null, turnBuckets: null }, 0n, 0n, T)).toBeNull();
+    expect(turnEndsAtOf(turned, 10n, T + 9n * 3_600n, T + 10n * 3_600n)).toBeNull();
+  });
+
+  it("has no window for a v1 vault, and none once every buy is made", () => {
+    const v1 = { ...hourly, communityWindow: null };
+    expect(dueSinceAt(v1, 0n, 0n, T + 10n)).toBe(T);
+    expect(communityWindowEndsAt(v1, 0n, 0n, T + 10n)).toBeNull();
+    expect(inCommunityWindow(v1, 0n, 0n, T + 10n)).toBe(false);
+    expect(at(hourly, 10n, T + 9n * 3_600n, T + 10n * 3_600n)).toEqual({ dueSince: null, endsAt: null, inWindow: false });
+  });
+
+  it("turns urgent for the last two minutes of a window, or the last quarter of one under eight minutes", () => {
+    expect(COMMUNITY_URGENT_SECONDS).toBe(120n);
+    expect(COMMUNITY_URGENT_SHORT_BELOW).toBe(480n);
+    const endsAt = T + 1_800n;
+    expect(urgentFrom(endsAt, 1_800n)).toBe(endsAt - 120n);
+    expect(urgentFrom(endsAt, 3_600n)).toBe(endsAt - 120n);
+    expect(urgentFrom(endsAt, 480n)).toBe(endsAt - 120n);
+    expect(urgentFrom(endsAt, 479n)).toBe(endsAt - 119n);
+    expect(urgentFrom(endsAt, 420n)).toBe(endsAt - 105n);
+    // A 5-minute plan's 75 s window: the last 18 s; the shortest window, 60 s: the last 15.
+    expect(urgentFrom(endsAt, 75n)).toBe(endsAt - 18n);
+    expect(urgentFrom(endsAt, 60n)).toBe(endsAt - 15n);
   });
 });

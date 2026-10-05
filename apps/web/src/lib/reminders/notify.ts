@@ -1,6 +1,8 @@
 /**
  * "Notify me when a buy is due": a notification from the open spDEX tab when
- * a plan's buy falls due while the person is looking at something else.
+ * a plan's buy falls due while the person is looking at something else. The
+ * same path, with its own words and its own tick, reminds a community keeper
+ * that its SPX proof lapses soon (`PROOF_LAPSE_MESSAGE`, lib/reminders/lapse.ts).
  *
  * Only while spDEX is open in a tab. A reminder that reaches a closed browser
  * needs Web Push, and Web Push needs an application server and a push
@@ -32,6 +34,22 @@ export const BUY_DUE_BODY = "Confirm it in the open spDEX tab.";
 /** One notification at a time: a second due buy replaces the first rather than stacking. */
 export const BUY_DUE_TAG = "spdex-buy-due";
 
+/** What one kind of notification says: a title, a line, and the tag that keeps one of its kind at a time. Nothing to fetch. */
+export interface NotifyMessage {
+  title: string;
+  body: string;
+  tag: string;
+}
+
+export const BUY_DUE_MESSAGE: NotifyMessage = { title: BUY_DUE_TITLE, body: BUY_DUE_BODY, tag: BUY_DUE_TAG };
+
+/** A community keeper's proof lapses within five days (decision 25 of docs/V2_UPGRADE.md). Its own tag: it never replaces a due buy's. */
+export const PROOF_LAPSE_MESSAGE: NotifyMessage = {
+  title: "spDEX: your SPX proof lapses soon",
+  body: "Prove it again in Community keeping, under Help run the network.",
+  tag: "spdex-proof-lapse",
+};
+
 export const NOTIFY_LABEL = "Notify me when a buy is due (while spDEX is open in a tab)";
 export const NOTIFY_UNSUPPORTED = "This browser can't show notifications from a web page. The tab title still shows ● Buy due.";
 export const NOTIFY_BLOCKED =
@@ -57,7 +75,7 @@ export interface NotifierEnv {
   document: { readonly visibilityState: string };
   /** Brings the tab forward when the notification is clicked. */
   focus?: () => void;
-  /** Then shows the due buy: on the page, the Auto-buys tile opened at it (`onBuyDueClick`). */
+  /** Then shows what it is about: on the page, the Auto-buys tile opened at the due buy (`onBuyDueClick`). */
   show?: () => void;
 }
 
@@ -73,7 +91,13 @@ export interface BuyDueNotifier {
   update(due: boolean): void;
 }
 
-export function createBuyDueNotifier(env: NotifierEnv): BuyDueNotifier {
+/**
+ * A notifier for the page's "buy due", or for any other moment that turns
+ * true while the tab is hidden, saying `message` (a due buy's, by default).
+ * Every notification spDEX shows is made here, by one constructor, so one
+ * check covers what each can ask the browser to fetch: nothing.
+ */
+export function createBuyDueNotifier(env: NotifierEnv, message: NotifyMessage = BUY_DUE_MESSAGE): BuyDueNotifier {
   let broken = false;
   let wasDue = false;
   let shown: ShownNotification | null = null;
@@ -90,7 +114,7 @@ export function createBuyDueNotifier(env: NotifierEnv): BuyDueNotifier {
     try {
       // Constructed under its own name, so the no-requests scan
       // (no-requests.test.ts) sees a notification here and checks its options.
-      const notification = new env.Notification(BUY_DUE_TITLE, { body: BUY_DUE_BODY, tag: BUY_DUE_TAG });
+      const notification = new env.Notification(message.title, { body: message.body, tag: message.tag });
       notification.onclick = () => {
         env.focus?.();
         env.show?.();
@@ -157,15 +181,41 @@ export function showBuyDue(): void {
   buyDueClick?.();
 }
 
-function pageEnv(): NotifierEnv {
+/**
+ * The same for a proof-lapse reminder: the page opens Community keeping, or
+ * with no handler set, the tab only comes forward.
+ */
+let proofLapseClick: (() => void) | null = null;
+
+export function onProofLapseClick(handler: () => void): () => void {
+  proofLapseClick = handler;
+  return () => {
+    if (proofLapseClick === handler) proofLapseClick = null;
+  };
+}
+
+export function showProofLapse(): void {
+  proofLapseClick?.();
+}
+
+function pageEnv(show: () => void): NotifierEnv {
   const N = (globalThis as { Notification?: NotificationApi }).Notification;
   return {
     ...(N === undefined ? {} : { Notification: N }),
     document: typeof document === "undefined" ? { visibilityState: "visible" } : document,
     focus: () => globalThis.focus?.(),
-    show: showBuyDue,
+    show,
   };
 }
+
+/** One kind of notification the page offers: its words, the tick that turns it on, and what a click shows. */
+export interface NotificationKind {
+  message: NotifyMessage;
+  pref: Pref<boolean>;
+  show: () => void;
+}
+
+export const BUY_DUE_KIND: NotificationKind = { message: BUY_DUE_MESSAGE, pref: NOTIFY_PREF, show: showBuyDue };
 
 export interface BuyDueNotifications {
   supported: boolean;
@@ -182,8 +232,18 @@ export interface BuyDueNotifications {
  * the checkbox shows. Mounted once, where the plans are listed.
  */
 export function useBuyDueNotifications(buyDue: boolean, env?: NotifierEnv): BuyDueNotifications {
-  const notifier = useMemo(() => createBuyDueNotifier(env ?? pageEnv()), [env]);
-  const [store] = useState(() => createPrefStore(NOTIFY_PREF));
+  return useNotifications(buyDue, BUY_DUE_KIND, env);
+}
+
+/**
+ * Notifications of one `kind`, fed whether its moment has come (`due`), and
+ * the state its checkbox shows. Each kind has its own tick; the browser's
+ * permission is the page's, asked when a box is ticked. `kind` is a module
+ * constant: a new one makes a new notifier.
+ */
+export function useNotifications(due: boolean, kind: NotificationKind, env?: NotifierEnv): BuyDueNotifications {
+  const notifier = useMemo(() => createBuyDueNotifier(env ?? pageEnv(kind.show), kind.message), [env, kind]);
+  const [store] = useState(() => createPrefStore(kind.pref));
   const pref = usePref(store);
   const [permission, setPermission] = useState(() => notifier.permission());
   const enabled = pref && permission === "granted";
@@ -191,10 +251,10 @@ export function useBuyDueNotifications(buyDue: boolean, env?: NotifierEnv): BuyD
   feed.current = notifier;
 
   useEffect(() => {
-    feed.current.update(enabled && buyDue);
+    feed.current.update(enabled && due);
     // A notification that failed to show says the browser can't, after all.
     if (!notifier.supported()) setPermission("unsupported");
-  }, [enabled, buyDue, notifier]);
+  }, [enabled, due, notifier]);
 
   const setEnabled = useCallback(
     async (on: boolean) => {

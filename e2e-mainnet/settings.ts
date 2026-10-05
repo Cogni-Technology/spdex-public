@@ -113,16 +113,38 @@ export interface SmokeRun {
   mode: "fork" | "mainnet";
   /** The relay Help run the network posts to, or null when there is none to use. */
   relayUrl: string | null;
-  /** How many vaults the factory had listed when the run started: this run's are listed after them. */
-  startVaultCount: string;
+  /**
+   * How many vaults each factory (v1's and v2's, by address) had listed when
+   * the run started: this run's are listed after them. A factory with no code
+   * counts 0.
+   */
+  startVaultCounts: Record<string, string>;
   /** The agents' addresses, and on a fork their throwaway keys (a mainnet run decrypts its keystores in each worker). */
   agents: Record<AgentName, { address: `0x${string}`; key?: `0x${string}` }>;
   /** Each agent's ether when the run started, for the summary. */
   startBalances: Record<AgentName, string>;
+  /**
+   * A fork run only, and null on mainnet: a real account that held at least
+   * 690 SPX at the fork's `finalized` block, which `3-prove` proves through
+   * Prove another address to rehearse the registry's one transaction. The
+   * holder agent itself can't be proven on a fork: its SPX was written there,
+   * never held at a real block. Null when none was found.
+   */
+  rehearsalHolder: `0x${string}` | null;
 }
 
 export const AGENT_NAMES = ["owner", "helper", "keeper"] as const;
 export type AgentName = (typeof AGENT_NAMES)[number];
+
+/**
+ * The holder agent: the helper, which holds 690 SPX for good and is proven in
+ * the SPX holder registry (`3-prove`), so that it may be paid inside a v2
+ * vault's community window. It is Help run's connected wallet and the
+ * keeper specs' `rewardTo`. Its SPX comes from the wallets' owner, sent once
+ * by hand (docs/MAINNET-SMOKE.md), and never leaves it: the suite never buys
+ * SPX for it, and wallet.ts refuses anything that could move it (decision 33).
+ */
+export const HOLDER: AgentName = "helper";
 
 export const RUN_ENV = "SPDEX_SMOKE_RUN_JSON";
 

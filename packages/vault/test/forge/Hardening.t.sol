@@ -191,14 +191,14 @@ contract HardeningTest is ForkTest {
 
         vm.prank(keeper);
         vm.expectPartialRevert(ORACLE_TOO_THIN);
-        vault.execute();
+        vault.execute(keeper);
         assertEq(vault.buysDone(), 0, "nothing bought against an empty pool");
 
         // A month on it is still refused, and the owner's way out is `close`.
         vm.warp(block.timestamp + 30 days);
         vm.prank(keeper);
         vm.expectPartialRevert(ORACLE_TOO_THIN);
-        vault.execute();
+        vault.execute(keeper);
     }
 
     // ─── The oracle pool must keep a history one trade cannot rewrite ────────────
@@ -220,7 +220,7 @@ contract HardeningTest is ForkTest {
         SpdexDcaVault vault = createFundedOn(listing(token, pair, pool), defaultPlan());
         IV3PoolLiquidity(pool).mint(address(this), -60, 60, 1_000, "");
         vm.prank(keeper);
-        vault.execute();
+        vault.execute(keeper);
         assertEq(vault.buysDone(), 1, "bought");
     }
 
@@ -255,7 +255,7 @@ contract HardeningTest is ForkTest {
         uint256 frontRun = largestPushInsideTheFloor(vault, floorOut);
         pushV2(frontRun);
         vm.prank(keeper);
-        uint256 received = vault.execute();
+        (uint256 received,) = vault.execute(keeper);
         console.log("sandwiched buy as bps of the honest one", (received * 10_000) / honestOut);
         assertGe(received * 10_000, honestOut * 9_650, "a sandwich costs the owner at most the plan's 3%");
     }
@@ -328,7 +328,7 @@ contract HardeningTest is ForkTest {
         assertTrue(ok, "created and funded at once");
         SpdexDcaVault vault = SpdexDcaVault(payable(abi.decode(reason, (address))));
         assertEq(wethOf(address(vault)), budget, "the budget, held as WETH");
-        (bool due,,,, bool funded) = vault.status();
+        (bool due,,,, bool funded,,,,) = vault.status();
         assertTrue(due && funded, "and due straight away");
     }
 
@@ -364,7 +364,7 @@ contract HardeningTest is ForkTest {
 
         vm.prank(keeper);
         vm.expectRevert(abi.encodeWithSelector(DELIVERED_SHORT, spotOut - spotOut / 100, spotOut));
-        vault.execute();
+        vault.execute(keeper);
     }
 
     // ─── Spacing ─────────────────────────────────────────────────────────────────
@@ -377,20 +377,20 @@ contract HardeningTest is ForkTest {
         SpdexDcaVault vault = createFunded(t);
         vm.warp(t.startAt + t.interval - 1);
         vm.prank(keeper);
-        vault.execute();
+        vault.execute(keeper);
 
         uint256 spaced = t.startAt + t.interval - 1 + t.interval / 2;
         vm.warp(t.startAt + t.interval);
-        (bool due, uint256 nextBuyAt,,,) = vault.status();
+        (bool due, uint256 nextBuyAt,,,,,,,) = vault.status();
         assertTrue(!due, "a new window, but too soon after the last buy");
         assertEq(nextBuyAt, spaced, "due half an interval after it");
         vm.prank(keeper);
         vm.expectRevert(abi.encodeWithSelector(TOO_SOON, spaced));
-        vault.execute();
+        vault.execute(keeper);
 
         vm.warp(spaced);
         vm.prank(keeper);
-        vault.execute();
+        vault.execute(keeper);
         assertEq(vault.buysDone(), 2, "the second buy, still in window 1");
     }
 }

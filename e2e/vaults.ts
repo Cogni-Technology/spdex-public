@@ -1,8 +1,9 @@
 /**
  * What the vault specs share: fresh accounts, a wallet that signs with one,
- * the Recurring form filled in for a vault, the batcher a keeper sends
- * through, and the clean-up that leaves no funded vault behind on the shared
- * fork.
+ * the Recurring form filled in for a vault, every release's contracts with the
+ * SPX holder registry and a proven holder (packages/testing/src/vaultFork.ts),
+ * vaults made outside the page on any release's factory, and the clean-up
+ * that leaves no funded vault behind on the shared fork.
  *
  * ## Fresh keys, never anvil's accounts
  *
@@ -32,29 +33,73 @@
 import { expect, type BrowserContext, type Locator, type Page, type Route } from "@playwright/test";
 import { addressOfKey, generateSpendingKey, prepareTransaction, signPrepared } from "../packages/chain/src/index.js";
 import { headlessWalletScript } from "../packages/testing/src/wallet.js";
+import { localClock } from "../apps/web/src/lib/steps.js";
+import { FORK_HOLDER, encodeV1CreateVault, ensureHolderProven, ensureReleasesOnFork, forkChainTime } from "../packages/testing/src/vaultFork.js";
 import {
+  DEPLOYMENTS,
   MAINNET_BATCHER,
   MAINNET_DEPLOYMENT,
-  deployBatcherCall,
-  deployFactoryCall,
+  MAINNET_REGISTRY,
+  V1_MAINNET_BATCHER,
+  V1_MAINNET_FACTORY,
   encodeClose,
+  encodeCreateVault,
   factoryAddress,
   readVault,
+  vaultBudget,
   vaultsCreatedBy,
   type RawLog,
+  type VaultPlan,
   type VaultState,
 } from "../packages/vault/src/index.js";
 import { FORK_CHAIN_ID, FORK_URL, forkRpc } from "./fixtures.js";
 
 type Hex = `0x${string}`;
 
-/** The factory the app offers on the fork: mainnet's, whose address commits to its code and market list. */
+/**
+ * The factory the app creates vaults on: v2's, whose address commits to its
+ * code, its market list and the registry it asks.
+ */
 export const FACTORY = factoryAddress(MAINNET_DEPLOYMENT).toLowerCase() as Hex;
 
-/** The batcher bound to that factory, through which a keeper makes many vaults' buys in one transaction. */
+/**
+ * The batcher a keeper makes many vaults' buys through in one transaction:
+ * bound to no factory, it serves every release from v2 on (`BATCHERS`' newest).
+ */
 export const BATCHER = MAINNET_BATCHER.toLowerCase() as Hex;
 
+/**
+ * v1's factory and its own batcher, built from v1's frozen source: the app
+ * still lists, funds, triggers and closes v1 vaults, and creates none.
+ */
+export const V1_FACTORY = V1_MAINNET_FACTORY.toLowerCase() as Hex;
+export const V1_BATCHER = V1_MAINNET_BATCHER.toLowerCase() as Hex;
+
+/** The SPX holder registry v2's vaults ask about whoever they pay inside a buy's community window. */
+export const REGISTRY = MAINNET_REGISTRY.toLowerCase() as Hex;
+
+/**
+ * The eligible address a keeper or a batch pays inside a buy's community
+ * window: a real mainnet SPX holder, proven on the fork from a proof recorded
+ * from mainnet (packages/testing/src/vaultFork.ts). Nothing ever signs for it
+ * and nothing sends it SPX, so its WETH is measured as a delta: every run
+ * pays it.
+ */
+export const HOLDER = FORK_HOLDER;
+
 export const ETHER = 10n ** 18n;
+
+/**
+ * `shown` ("14:32") is this device's clock at some second from `from` to `to`
+ * (unix seconds), written as the app writes a time of day (`localClock`):
+ * hours and minutes, 24-hour, in this device's time zone, which the browser
+ * shares with the test.
+ */
+export function expectClockWithin(shown: string, from: number, to: number): void {
+  const minutes = new Set<string>();
+  for (let t = from - (from % 60); t <= to; t += 60) minutes.add(localClock(t));
+  expect([...minutes], `"${shown}" as a time from ${new Date(from * 1000).toISOString()} to ${new Date(to * 1000).toISOString()}`).toContain(shown);
+}
 
 /** "0.00125" ETH → wei, exactly: the figures a sentence on the page states. */
 export function parseEther(text: string): bigint {
@@ -223,6 +268,7 @@ export async function keyWallet(context: BrowserContext, account: Account): Prom
 // ── Reading what happened ────────────────────────────────────────────────
 
 interface Receipt {
+  transactionHash: string;
   status: string;
   blockNumber: string;
   gasUsed: string;
@@ -238,11 +284,24 @@ export async function receiptOf(hash: string): Promise<Receipt> {
   return receipt;
 }
 
-/** The vault, read from the chain as the app and the keeper read it. Throws when nothing there answers like one. */
+/**
+ * The vault, read from the chain as the app and the keeper read it, vouched
+ * for by whichever release's factory made it. Throws when nothing there
+ * answers like one.
+ */
 export async function vaultOnChain(vault: string): Promise<VaultState> {
-  const state = await readVault(forkRpc, vault.toLowerCase() as Hex, { factory: FACTORY });
+  const state = await readVault(forkRpc, vault.toLowerCase() as Hex);
   if (state === null) throw new Error(`${vault} does not answer like a vault`);
   return state;
+}
+
+/**
+ * The fork's time as its next block will carry it. The idle head's time lags
+ * it by however long nothing was sent, so a vault started at the head's time
+ * may find its first community window already over when its creation lands.
+ */
+export function chainNow(): Promise<bigint> {
+  return forkChainTime(forkRpc);
 }
 
 // ── The form ─────────────────────────────────────────────────────────────
@@ -294,6 +353,13 @@ export async function fillVaultForm(page: Page, amount: string, count: number): 
   await expect(page.getByTestId("dca-form-buy")).toHaveValue("SPX");
   await expect(page.getByTestId("dca-form-sell")).toBeDisabled();
   await expect(page.getByTestId("dca-form-vault-slippage-200")).toHaveAttribute("aria-pressed", "true");
+  // Who may earn its fee, and for how long, in the one line everyone sees: a
+  // daily plan's window is the default 30 minutes. Choosing another is
+  // Expert's alone (expert.spec.ts), so Simple shows no control for it.
+  await expect(page.getByTestId("dca-form-vault-window-line")).toHaveText(
+    "SPX holders can earn this plan's fee for its first 30 minutes after each buy falls due; then anyone can.",
+  );
+  await expect(page.getByTestId("dca-form-vault-window")).toHaveCount(0);
 
   const start = page.getByTestId("dca-form-start");
   await expect(start).toHaveText("Create and fund vault");
@@ -326,35 +392,20 @@ export async function fillVaultForm(page: Page, amount: string, count: number): 
 // ── Sending outside the page ─────────────────────────────────────────────
 
 /**
- * Make sure the batcher is on the fork, deploying it through the
- * deterministic deployer from a fresh key if it is not, as `pnpm keeper
- * --deploy-batcher` would. The keeper never deploys it itself, and the app
- * neither deploys nor needs it. Its constructor reads its factory, so the
- * factory is deployed first when the fork has neither. Anyone may deploy
- * either, and both land at addresses their code fixes: a deployment that
- * loses a race to another run reverts, and the code is there all the same.
+ * Make sure every release is on the fork — v2's registry, factory and the
+ * batcher bound to no factory (built for WETH, shared by every release from v2
+ * on), and v1's factory and its own batcher from its frozen source — and that
+ * `HOLDER` is proven there, deploying and proving from fresh keys whatever
+ * isn't yet (packages/testing/src/vaultFork.ts). The keeper never deploys a
+ * batcher itself, and the app deploys no release on its own; on the pinned
+ * block none exists, since v1 reached mainnet after it. Anyone may
+ * deploy them, and each lands at the address its code fixes: a deployment
+ * that loses a race to another run reverts, and the code is there all the
+ * same.
  */
-export async function ensureBatcher(): Promise<void> {
-  const hasCode = async (address: Hex) => ((await forkRpc("eth_getCode", [address, "latest"])) as string) !== "0x";
-  if ((await hasCode(FACTORY)) && (await hasCode(BATCHER))) return;
-  const deployer = await freshAccount(ETHER);
-  for (const [call, at] of [
-    [deployFactoryCall(), FACTORY],
-    [deployBatcherCall(FACTORY), BATCHER],
-  ] as const) {
-    if (await hasCode(at)) continue;
-    const prepared = await prepareTransaction(forkRpc, {
-      from: deployer.address,
-      to: call.to,
-      data: call.data,
-      value: call.value,
-      chainId: FORK_CHAIN_ID,
-    });
-    const signed = await signPrepared(deployer.key, prepared);
-    await forkRpc("eth_sendRawTransaction", [signed.raw]);
-    await expect.poll(() => forkRpc("eth_getTransactionReceipt", [signed.hash]), { timeout: 60_000 }).not.toBeNull();
-    expect(await hasCode(at), `nothing at ${at} after deploying it`).toBe(true);
-  }
+export async function ensureContracts(): Promise<void> {
+  await ensureReleasesOnFork(forkRpc, FORK_CHAIN_ID);
+  await ensureHolderProven(forkRpc, FORK_CHAIN_ID);
 }
 
 /**
@@ -376,6 +427,30 @@ export async function sendAs(account: Account, call: { to: Hex; data: Hex; value
   return receiptOf(signed.hash);
 }
 
+/**
+ * Create and fund a v2 vault from `owner`'s key, outside any page, on v2's
+ * factory: what another app or a script of the owner's own would do. Returns
+ * its address, from the factory's own `VaultCreated`.
+ */
+export async function createVaultAs(owner: Account, plan: VaultPlan): Promise<Hex> {
+  const receipt = await sendAs(owner, { to: FACTORY, data: encodeCreateVault(plan), value: vaultBudget(plan) });
+  const created = vaultsCreatedBy(FACTORY, receipt.logs).filter((event) => event.owner === owner.address);
+  expect(created, "the vault the factory created").toHaveLength(1);
+  return created[0]!.vault.toLowerCase() as Hex;
+}
+
+/**
+ * Create and fund a v1 vault from `owner`'s key, on v1's factory, with v1's
+ * seven-argument `createVault`: a vault made before v2 shipped, which the app
+ * still shows, funds, triggers and closes, and Help run never offers.
+ */
+export async function createV1VaultAs(owner: Account, plan: Omit<VaultPlan, "communityWindow" | "turnBuckets">): Promise<Hex> {
+  const receipt = await sendAs(owner, { to: V1_FACTORY, data: encodeV1CreateVault(plan), value: vaultBudget(plan) });
+  const created = vaultsCreatedBy(V1_FACTORY, receipt.logs).filter((event) => event.owner === owner.address);
+  expect(created, "the vault v1's factory created").toHaveLength(1);
+  return created[0]!.vault.toLowerCase() as Hex;
+}
+
 // ── Leaving nothing behind ───────────────────────────────────────────────
 
 /**
@@ -383,28 +458,22 @@ export async function sendAs(account: Account, call: { to: Hex; data: Hex; value
  * key, so that nothing funded is left on the shared fork for a keeper — a
  * developer's `pnpm keeper`, or the next run's — to trigger. It covers a test
  * that had no reason to close its vault and one that stopped half way, and it
- * looks from the owner's creation block with the factory's own `VaultCreated`
- * logs, so a vault the page never got to show is found too.
+ * looks from the owner's creation block with every release's factory's own
+ * `VaultCreated` logs, so a vault the page never got to show is found too,
+ * v1's included.
  */
 export async function closeLeftoverVaults(): Promise<void> {
   const waiting = owners.splice(0);
   for (const owner of waiting) {
-    const logs = (await forkRpc("eth_getLogs", [
-      { address: FACTORY, fromBlock: `0x${owner.fromBlock.toString(16)}`, toBlock: "latest" },
-    ])) as RawLog[];
-    for (const created of vaultsCreatedBy(FACTORY, logs).filter((event) => event.owner === owner.address)) {
-      const state = await vaultOnChain(created.vault);
-      if (state.closed) continue;
-      const prepared = await prepareTransaction(forkRpc, {
-        from: owner.address,
-        to: created.vault,
-        data: encodeClose(),
-        value: 0n,
-        chainId: FORK_CHAIN_ID,
-      });
-      const signed = await signPrepared(owner.key, prepared);
-      await forkRpc("eth_sendRawTransaction", [signed.raw]);
-      await expect.poll(() => forkRpc("eth_getTransactionReceipt", [signed.hash]), { timeout: 60_000 }).not.toBeNull();
+    for (const factory of DEPLOYMENTS.map((d) => d.factory.toLowerCase() as Hex)) {
+      const logs = (await forkRpc("eth_getLogs", [
+        { address: factory, fromBlock: `0x${owner.fromBlock.toString(16)}`, toBlock: "latest" },
+      ])) as RawLog[];
+      for (const created of vaultsCreatedBy(factory, logs).filter((event) => event.owner === owner.address)) {
+        const state = await vaultOnChain(created.vault);
+        if (state.closed) continue;
+        await sendAs(owner, { to: created.vault, data: encodeClose() });
+      }
     }
   }
 }

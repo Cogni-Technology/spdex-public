@@ -419,16 +419,22 @@ function secondOpinionDisagrees(detail: Readonly<Record<string, string>> | undef
   }
 }
 
-/** "The batcher holds 0.0001 WETH someone sent it, …", exact to the wei, or without a figure when none was given. */
+/**
+ * "This batch would move 0.0001 WETH out of the vault batcher, …", exact to
+ * the wei, or without a figure when none was given (or the token isn't WETH:
+ * the Guard gives `swept` for WETH alone). v2's batcher holds and passes on
+ * nothing, since each vault pays the account directly, so whatever leaves it
+ * is money nobody can say whose it is.
+ */
 function batchUnaccounted(detail: Readonly<Record<string, string>> | undefined): string {
   const swept = detail?.["swept"];
   // Strictly digits: a missing or garbled figure is left out, never shown as 0.
   const amount =
     typeof swept === "string" && /^\d+$/.test(swept) && BigInt(swept) > 0n
       ? `${formatAmount(BigInt(swept), 18, { maxFraction: 18 })} WETH`
-      : "WETH";
+      : "money";
   return (
-    `The batcher holds ${amount} someone sent it, and this batch would pass it to you. ` +
+    `This batch would move ${amount} out of the vault batcher, which holds and passes on nothing. ` +
     "spDEX won't make you the receiver of money it can't account for."
   );
 }

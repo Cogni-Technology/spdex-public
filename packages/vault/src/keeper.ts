@@ -5,27 +5,56 @@
  * ## Anyone can run this, and nobody has to trust whoever does
  *
  * A vault enforces its own plan. Whoever calls `execute` picks only the
- * moment, inside a window that is already due; the amount, the token, the
- * recipient and the price floor are the vault's, and a call that breaks any of
+ * moment, inside a window that is already due, and — in a v2 vault — who is
+ * paid the caller's own fee; the amount, the token, the recipient of what is
+ * bought and the price floor are the vault's, and a call that breaks any of
  * them reverts. The batcher (`batcher.ts`) is one more such caller: it runs
- * each due vault with a fixed gas cap, passes every fee on to the address its
- * caller names in the same transaction, and keeps nothing. So a keeper needs
- * no permission from owners, and they need no trust in it — it can make a buy
- * happen or not happen, never happen differently. None of it is promised: a
- * plan runs while somebody runs a keeper, and a window nobody triggers is
- * skipped.
+ * each due vault with a gas cap and keeps nothing — from v2 on it has each
+ * vault pay the `rewardTo` its caller names, and gives each the gas its caller
+ * names (`gasPerVault`); v1's passes every fee on to it in the same
+ * transaction, at a fixed cap. So a keeper needs no permission from owners, and they
+ * need no trust in it — it can make a buy happen or not happen, never happen
+ * differently. None of it is promised: a plan runs while somebody runs a
+ * keeper, and a window nobody triggers is skipped.
+ *
+ * ## Every release, and the community window
+ *
+ * Every listed release's vaults are served, each batch to its release's
+ * batcher — v1's own, or the one every later release shares — and each judged
+ * by what its source can do (`SOURCES[source].features`), never by its name:
+ * v1's as they always were, v2's with their community window (docs/
+ * V2_UPGRADE.md). For the first minutes after such a buy falls due, its fee
+ * may be paid only to the vault's owner or to an address the SPX holder
+ * registry finds eligible. So every tick reads whether this keeper's
+ * `rewardTo` is eligible (`readEligibility`). An ineligible keeper leaves
+ * those buys to holders and comes back when the window ends (`holders-first`);
+ * an eligible one takes them as soon as they are due, at the patient tip, and
+ * never bids up against other holders inside the window — only in its last
+ * two minutes (its last quarter, for a window under eight), when the window's
+ * end is a deadline after which anyone may take the buy, does it switch to
+ * the urgent tip (decision 19). A plan with turns gives the window's first
+ * half to the holders in one bucket (`turnBuckets`); an eligible keeper whose
+ * `rewardTo` is in another waits for the turn's end (`other-turn`), as an
+ * ineligible one waits for the window's. With `SPDEX_KEEPER_PROVE=1` it also proves
+ * its `rewardTo`'s SPX before the proof lapses; either way it logs when the
+ * proof will lapse. Its runway — days of sends its ether covers — is in every
+ * heartbeat, with a warning below `minRunwayDays`: a keeper paid at a cold
+ * `rewardTo` earns nothing back into its hot key.
  *
  * ## What a keeper does have to distrust
  *
  * A token's own code runs inside every buy, in a transaction the keeper pays
  * for, and a clone made by hand can name any token. So the keeper triggers
  * only vaults a listed factory vouches for — found in the factory's own list,
- * which the same call that set `isVault` wrote — and the batcher checks
- * `isVault` again on chain. Each attempt is capped at `EXECUTE_GAS_CAP`, every
- * batch is simulated at the fee it will pay, and a vault whose buy burned its
- * gas on chain is left alone for a week. Most failures are honest, though —
- * another keeper got there first, the price moved — and are never held
- * against a vault for longer than a window.
+ * which the same call that set `isVault` wrote — and, since the batcher from
+ * v2 on asks no factory and the endpoint that answers the list could lie,
+ * proves each one its factory's clone before it is first sent: its CREATE2
+ * address recomputed from the factory, its owner and terms, and a nonce below
+ * the factory's count (`proveClones`). Each attempt is capped at the gas the
+ * batch gives a vault (`gasPerVault`), every batch is simulated at the fee it
+ * will pay, and a vault whose buy burned its gas on chain is left alone for a
+ * week. Most failures are honest, though — another keeper got there first,
+ * the price moved — and are never held against a vault for longer than a window.
  *
  * ## One tick
  *
@@ -46,21 +75,33 @@
  * reaches it.
  */
 
-import { encodeFunctionData, parseTransaction } from "viem";
+import { decodeFunctionData, encodeFunctionData, parseTransaction } from "viem";
 import type { Address, Hex } from "@spdex/core";
-import type { JsonRpc, PreparedFees } from "@spdex/chain";
-import { BATCHER_LIMITS, VAULT_LIMITS, type Deployment } from "./artifacts.js";
+import { HeaderHashMismatchError, parseHeaderRlp, type JsonRpc, type PreparedFees } from "@spdex/chain";
+import { REGISTRY_ABI, VAULT_LIMITS, type Deployment } from "./artifacts.js";
 import {
   decodeBatchRevert,
   decodeExecuteBatchResult,
-  deployBatcherCall,
-  encodeExecuteBatch,
   reasonName,
   type BatchSimulation,
 } from "./batcher.js";
-import { WETH_ABI, type VaultProgress } from "./index.js";
+import {
+  HoldingBelowMinimumError,
+  MIN_SPX,
+  PROOF_LAPSE_WARNING_SECONDS,
+  PROOF_TTL,
+  WETH_ABI,
+  buildHolderProof,
+  decodeVaultError,
+  describeRegistryError,
+  proveCall,
+  proveGasLimit,
+  type HolderProof,
+  type VaultRelease,
+  type VaultProgress,
+} from "./index.js";
 import { keeperAddress, rewardToOf, type KeeperConfig } from "./keeper-config.js";
-import { stampRecord, type KeeperLogBody, type KeeperLogRecord, type SentVault, type WaitReason } from "./keeper-log.js";
+import { stampRecord, type KeeperLogBody, type KeeperLogRecord, type ProveSkipReason, type SentVault, type WaitReason } from "./keeper-log.js";
 import {
   SECONDS_PER_BLOCK,
   awaitReceipt,
@@ -86,6 +127,7 @@ import {
   selectBatch,
   shouldSend,
   splitRoundRobin,
+  turnEndsAtOf,
   windowOf,
   type BatchCandidate,
   type BatchSelection,
@@ -93,9 +135,36 @@ import {
   type KeeperPolicy,
   type SendReason,
 } from "./keeper-plan.js";
-import { RECHECK_SECONDS, accountingRead, applyRead, currentSlot, discover, readHead, readReserves, readVaults, type Head } from "./keeper-read.js";
-import { CANCEL_GAS, UNWRAP_GAS, buildTransaction, newPendingTx, nextNonceFor, revertDataOf, type BatchMined } from "./keeper-send.js";
-import type { KeeperState, PendingTx, SkipCode, VaultEntry } from "./keeper-state.js";
+import {
+  RECHECK_SECONDS,
+  accountingRead,
+  applyRead,
+  communityWindowOf,
+  currentSlot,
+  discover,
+  holdersFirstUntil,
+  mayBePaidInWindow,
+  proveClones,
+  readEligibility,
+  readHead,
+  readReserves,
+  readVaults,
+  turnHeldUntil,
+  type Head,
+} from "./keeper-read.js";
+import {
+  CANCEL_GAS,
+  UNWRAP_GAS,
+  batcherDeploymentOf,
+  buildTransaction,
+  encodeBatchFor,
+  gasPerVaultOf,
+  newPendingTx,
+  nextNonceFor,
+  revertDataOf,
+  type BatchMined,
+} from "./keeper-send.js";
+import type { Eligibility, KeeperState, PendingAttempt, PendingTx, SkipCode, VaultEntry } from "./keeper-state.js";
 
 export * from "./keeper-plan.js";
 export * from "./keeper-config.js";
@@ -110,8 +179,44 @@ const WEEK = 7n * DAY;
 /** A transaction in flight longer than this needs the operator's attention. */
 const STUCK_PENDING_BLOCKS = 50n;
 const MIN_TICK_SECONDS = 12;
-/** A dry run with nowhere to send rewards still needs a `rewardTo` the batcher accepts, for its simulation only. */
+/**
+ * A dry run with nowhere to send rewards still needs a `rewardTo` the batcher
+ * accepts, for its simulation only. It is never eligible, and nothing is
+ * read of it, so a dry run without a `rewardTo` leaves every buy inside its
+ * community window to holders and simulates only those open to anyone.
+ */
 const DRY_RUN_REWARD_TO: Address = "0x0000000000000000000000000000000000000001";
+/**
+ * A `prove` still unmined this many blocks after the block it proves is
+ * withdrawn: the registry checks a block's hash only while it is one of the
+ * last 8,191, and the next try builds a proof from a newer block.
+ */
+const PROVE_STALE_BLOCKS = 7_000n;
+/**
+ * How often the keeper may pay for a proof, by the wall clock, whatever its
+ * endpoint says. The endpoint answers every figure a proof depends on — the
+ * record's `validUntil`, the holding, the test-run, the receipt, and the
+ * chain's time — so one that lies could, by any of those alone, have a key
+ * that sends publicly pay about 650,000 gas a proof (each reverting
+ * `NotNewer` on the real chain) every tick. Only this machine's own clock is
+ * out of its reach, so the bounds are kept on it (`KeeperState.proveSentAt`,
+ * `proveRevertedAt`, `proveTriedAt`):
+ *
+ * - at most one proof sent each `PROVE_SPACING_SECONDS` (a day), whatever the
+ *   endpoint later says of it. An honest proof lasts 30 days and is renewed
+ *   from five days before it lapses, so a day costs an honest keeper nothing;
+ * - none for `PROVE_REVERT_BACKOFF_SECONDS` (a day) after one is reported
+ *   reverted, which `attention: prove_reverted` says;
+ * - at most one try (reads, never a signature) an accounting period.
+ *
+ * So the most a lying endpoint can make the key pay for proofs is one proof's
+ * worst price a day (`PROVE_GAS_CAP` × `maxFeePerGas`, 0.00225 ETH at the
+ * default cap). A head dated ahead of the wall clock is refused besides, as
+ * a lagging one is (`maxHeadLagSeconds`).
+ */
+const PROVE_SPACING_SECONDS = DAY;
+/** After a proof of `rewardTo` this keeper sent is reported reverted, none is sent for this long, by the wall clock. */
+const PROVE_REVERT_BACKOFF_SECONDS = DAY;
 const ZERO: Address = "0x0000000000000000000000000000000000000000";
 
 // ─── The tick's interface ─────────────────────────────────────────────────────
@@ -125,7 +230,7 @@ export interface KeeperTickInput {
   log?: (record: KeeperLogRecord) => void;
   /** Awaited before every broadcast and after every change to the transaction in flight. */
   persist?: (state: KeeperState) => Promise<void>;
-  /** The `ts` field and the head-lag check only; never a decision about a vault. */
+  /** The `ts` field, the head-time check and the bounds on proving only; never a decision about a vault. */
   wallClockMs?: () => number;
   sleep?: (ms: number) => Promise<void>;
   /** How long to wait for a sent transaction's receipt within this tick; default 0 (look again next tick). */
@@ -143,8 +248,19 @@ export interface KeeperHealth {
   lastBatchHash: Hex | null;
   lastBatchAt: bigint | null;
   balanceWei: bigint | null;
+  /**
+   * Days of sends the key's ether covers at its spend over the time that
+   * spend covers, at most the last week; null before it has spent anything,
+   * while it has kept its spend for less than a day, or unread.
+   */
   runwayDays: number | null;
   attention: string[];
+  /** Whether `rewardTo` may be paid inside the latest release's community windows, by this tick's read; null when unknown. */
+  eligible: boolean | null;
+  /** Until when its proof is valid, chain time (0: never proved); null when unknown. */
+  proofValidUntil: bigint | null;
+  /** Days until it lapses, to a tenth, negative once lapsed; null when unknown or never proved. */
+  proofDaysLeft: number | null;
 }
 
 export interface KeeperTickResult {
@@ -206,16 +322,22 @@ export async function keeperTick(rpc: JsonRpc, input: KeeperTickInput): Promise<
   const t = await tickContext(rpc, input);
   const { state, keeper, head } = t;
 
-  // 1. A stale or backwards head: say so, and do nothing on it.
-  const lag = BigInt(Math.floor(t.wallClockMs() / 1000)) - head.timestamp;
+  // 1. A stale, future or backwards head: say so, and do nothing on it. A real head is dated at most seconds before the
+  // wall clock; one dated further ahead than the lag allowed is an endpoint, or this machine's clock, that is wrong.
+  const lag = wallSeconds(t) - head.timestamp;
   t.result.health.headLagSeconds = lag;
-  if ((t.policy.maxHeadLagSeconds > 0n && lag > t.policy.maxHeadLagSeconds) || (state.maxHeadSeen !== null && head.number < state.maxHeadSeen)) {
+  const max = t.policy.maxHeadLagSeconds;
+  if ((max > 0n && (lag > max || -lag > max)) || (state.maxHeadSeen !== null && head.number < state.maxHeadSeen)) {
     t.stale = true;
     wait(t, "stale-head", 0, null, null);
     return finish(t);
   }
   state.maxHeadSeen = head.number;
   await sampleFees(t);
+  // Whether `rewardTo` may be paid inside each release's community windows, at this head; and, whatever the
+  // answer, when its proof lapses, in the log.
+  await readEligibility(t);
+  logEligibility(t);
 
   // 2. The transaction in flight, and any that were abandoned but may still land.
   if (keeper !== null) {
@@ -234,9 +356,10 @@ export async function keeperTick(rpc: JsonRpc, input: KeeperTickInput): Promise<
     await batchStep(t);
   }
 
-  // 9. Windows that ended without a buy.
+  // 9. Windows that ended without a buy; then, one at a time, an unwrap or a proof.
   checkMissedWindows(t);
   if (keeper !== null && !state.pending) await maybeUnwrap(t);
+  if (keeper !== null && !state.pending) await maybeProve(t);
   return finish(t);
 }
 
@@ -252,6 +375,8 @@ export async function settleInFlight(rpc: JsonRpc, input: KeeperTickInput): Prom
   const t = await tickContext(rpc, input);
   const p = t.state.pending;
   if (t.keeper === null || !p) return false;
+  // A rebuild judges community windows by eligibility at this head, as a tick's does.
+  await readEligibility(t);
   if ((await settlePending(t, p)) === "resend-due") await resend(t, p);
   if (t.state.pending && t.waitForReceiptMs > 0) await awaitReceipt(t);
   reconcileSkips(t);
@@ -266,6 +391,8 @@ async function tickContext(rpc: JsonRpc, input: KeeperTickInput): Promise<Tick> 
   if (keeper !== null && state.keeper !== keeper) throw new Error("the state belongs to another keeper");
 
   const head = await readHead(rpc);
+  // From this tick on, every transaction mined is in `spend`: what runway is measured over.
+  state.spendSince ??= head.timestamp;
   const legacy = head.baseFee === null;
   const next = legacy ? BigInt((await rpc("eth_gasPrice", [])) as string) : nextBaseFee({ baseFee: head.baseFee!, gasUsed: head.gasUsed, gasLimit: head.gasLimit });
   const wallClockMs = input.wallClockMs ?? (() => Date.now());
@@ -310,7 +437,21 @@ async function tickContext(rpc: JsonRpc, input: KeeperTickInput): Promise<Tick> 
 }
 
 function emptyHealth(): KeeperHealth {
-  return { ok: true, headLagSeconds: 0n, active: 0, due: 0, pending: null, lastBatchHash: null, lastBatchAt: null, balanceWei: null, runwayDays: null, attention: [] };
+  return {
+    ok: true,
+    headLagSeconds: 0n,
+    active: 0,
+    due: 0,
+    pending: null,
+    lastBatchHash: null,
+    lastBatchAt: null,
+    balanceWei: null,
+    runwayDays: null,
+    attention: [],
+    eligible: null,
+    proofValidUntil: null,
+    proofDaysLeft: null,
+  };
 }
 
 /**
@@ -350,11 +491,31 @@ interface Due {
   entry: VaultEntry;
   earliest: bigint;
   window: BuyWindow;
+  /** The slot's deadline: from here the buy is sent whatever the fee — once outside any community window. */
   deadline: bigint;
+  /**
+   * In the urgent tail of a community window this keeper may be paid in; or,
+   * outside one, past the slot's deadline. Inside the window the slot's
+   * deadline counts for nothing: an operator's `deadlineShareBps` above a
+   * quarter can put it inside the window, and the window's own urgent point
+   * comes before the slot ends anyway.
+   */
   urgent: boolean;
+  /** In the urgent tail of a community window this keeper may be paid in (decision 19). */
+  windowUrgent: boolean;
+  /**
+   * Whether this buy is bid at the urgent tip: in a window's urgent tail, or
+   * past its slot's deadline unless the plan is short (its deadline is minutes
+   * off anyway). The tail is urgent whatever the plan, since after it anyone
+   * may take the buy: the 5-minute plan's 75-second window has an 18-second
+   * tail.
+   */
+  hurried: boolean;
   shortInterval: boolean;
   target: bigint | null;
   reason: SendReason | null;
+  /** The community window the buy is inside, when this keeper may be paid there; null for v1, after the window, or not due. */
+  community: { dueSince: bigint; endsAt: bigint; urgentAt: bigint } | null;
 }
 
 type Pricing = (urgent: boolean) => { fees: PreparedFees; tip: bigint } | "fees-above-max" | "resend-blocked";
@@ -368,6 +529,8 @@ interface SendPlan {
   reason: SendReason;
   urgent: boolean;
   quotes: Map<Address, VaultProgress["quote"]>;
+  /** Each vault's community window's end, when it is sent inside one. */
+  communityEnds: Map<Address, bigint>;
 }
 
 type Plan = SendPlan | { kind: "wait"; reason: WaitReason | "resend-blocked" | null; candidates: number; target: bigint | null; nextDeadline: bigint | null };
@@ -441,6 +604,7 @@ async function batchStep(t: Tick): Promise<void> {
         floorOut: quote?.floorOut ?? null,
         depth: quote?.oracleDepth ?? null,
         secondsToDeadline: v.deadline - t.chainTime,
+        communityWindowEndsAt: plan.communityEnds.get(v.vault) ?? null,
       };
     }),
   });
@@ -465,7 +629,7 @@ function batchFields(plan: SendPlan): Partial<PendingTx> {
   };
 }
 
-/** A batch's transaction, by hand: its own release's batcher, its own gas limit, paying `rewardTo`. */
+/** A batch's transaction, by hand: its release's batcher, its own gas limit, paying `rewardTo`, at the configured gas per vault. */
 function batchTx(t: Tick, plan: SendPlan, nonce: number): ReturnType<typeof buildTransaction> {
   const vaults = plan.selection.vaults.map((v) => v.vault);
   return buildTransaction({
@@ -473,7 +637,7 @@ function batchTx(t: Tick, plan: SendPlan, nonce: number): ReturnType<typeof buil
     chainId: t.config.chainId,
     nonce,
     to: lower(plan.deployment.batcher),
-    data: encodeExecuteBatch(vaults, t.rewardTo!, plan.selection.minRewards),
+    data: encodeBatchFor(plan.deployment, vaults, t.rewardTo!, plan.selection.minRewards, gasPerVaultOf(t.config, plan.deployment)),
     gas: plan.gasLimit,
     fees: plan.fees,
   });
@@ -499,80 +663,123 @@ async function planBatch(t: Tick, options: { rebuildOf: PendingTx | null; pricin
   const lowestTarget = minOrNull(dues.map((d) => d.target));
   const nextDeadline = minOrNull(dues.map((d) => d.deadline));
   const waitFor = (reason: Extract<Plan, { kind: "wait" }>["reason"], candidates: number): Plan => ({ kind: "wait", reason, candidates, target: lowestTarget, nextDeadline });
+  // Nothing else to send, and due buys left to SPX holders until their windows end: the keeper waits for those ends.
+  const nothingFor = (candidates: number): Plan => {
+    const heldBack = [...t.outcomes.values()].filter((o) => o !== "ok" && o.code === "holders-first").length;
+    return candidates > 0 ? waitFor("not-cheap", candidates) : waitFor(heldBack > 0 ? "holders-first" : null, heldBack);
+  };
   if (t.debug) t.emit({ type: "tick", nextBaseFeeWei: t.next, lowestTargetWei: lowestTarget, active: Object.keys(state.vaults).length, clockDue: clockDue.length, candidates: dues.length });
   // Until the reads below, the vaults due by the clock are the best count there is.
   t.result.health.due = dues.length;
   const triggered = rebuild !== null || dues.some((d) => d.reason !== null) || (policy.sendWhen === "now" && unread.length > 0);
-  if (!triggered) return waitFor(dues.length > 0 ? "not-cheap" : null, dues.length);
+  if (!triggered) return nothingFor(dues.length);
 
-  // 6: read what is about to be sent: progress, balance and price.
+  // 6: read what is about to be sent: progress, balance and price; and prove each vault never sent before is its
+  // factory's clone, whatever the endpoint says (`proveClones`).
   const reads = await readVaults(t.rpc, t.config.weth, clockDue, true);
+  await proveClones(t, clockDue);
   const candidates: (BatchCandidate & { due: Due })[] = [];
   const quotes = new Map<Address, VaultProgress["quote"]>();
   for (const vault of clockDue) {
     const read = reads.get(vault);
     if (!read || !applyRead(t, vault, read)) continue;
+    if (t.state.vaults[vault]?.nonce === null) {
+      // Never sent before it is proven: `proveClones` said why, or reaches it on a later tick.
+      if (!t.outcomes.has(vault)) noteSkip(t, vault, "unproven", "not yet proven its factory's clone; proven before it is first sent");
+      continue;
+    }
     quotes.set(vault, read.quote);
     const due = dueOf(t, vault);
     if (due === null || t.chainTime < due.earliest) {
       t.outcomes.set(vault, "ok");
       continue;
     }
+    // The read may show what the cache did not: a new slot, and its window.
+    if (holdersFirst(t, vault, due.entry)) continue;
     const candidate = candidateOf(t, due, read);
     if (candidate) candidates.push(candidate);
   }
   t.result.health.due = candidates.length;
 
-  // A standby keeper sends only what is about to miss its window.
-  const eligible = policy.sendWhen === "deadline" ? candidates.filter((c) => c.urgent) : candidates;
-  const reasons = eligible.map((c) => c.due.reason).filter((r): r is SendReason => r !== null);
-  if (eligible.length === 0 || (rebuild === null && reasons.length === 0)) return waitFor(eligible.length > 0 ? "not-cheap" : null, eligible.length);
+  // A standby keeper sends only what is about to miss its window, or its community window.
+  const sendable = policy.sendWhen === "deadline" ? candidates.filter((c) => c.urgent) : candidates;
+  const reasons = sendable.map((c) => c.due.reason).filter((r): r is SendReason => r !== null);
+  if (sendable.length === 0 || (rebuild === null && reasons.length === 0)) return nothingFor(sendable.length);
 
-  // Each batch goes to its own release's batcher: the one with the most urgent need first.
-  const byDeployment = new Map<string, typeof eligible>();
-  for (const c of eligible) byDeployment.set(c.due.entry.deployment, [...(byDeployment.get(c.due.entry.deployment) ?? []), c]);
+  // Each batch goes to its release's batcher, one release a batch: the one with the most urgent need first. (Releases
+  // sharing a batcher are still sent one a batch: the transaction in flight names one release.)
+  const byDeployment = new Map<string, typeof sendable>();
+  for (const c of sendable) byDeployment.set(c.due.entry.deployment, [...(byDeployment.get(c.due.entry.deployment) ?? []), c]);
   const [deploymentId, group] = [...byDeployment.entries()].sort(([, a], [, b]) => Number(b.some((c) => c.urgent)) - Number(a.some((c) => c.urgent)) || b.length - a.length)[0]!;
   const deployment = t.config.deployments.find((d) => d.id === deploymentId)!;
 
-  const urgent = group.some((c) => c.urgent && !c.due.shortInterval);
-  const priced = options.pricing(urgent);
-  if (priced === "fees-above-max" || priced === "resend-blocked") return waitFor(priced, group.length);
-  // The most pressing reason any vault gives; a rebuild that none gives keeps its first send's.
-  const reason: SendReason = (["deadline", "now", "short-interval"] as const).find((r) => reasons.includes(r)) ?? reasons[0] ?? rebuild?.reason ?? "deadline";
+  // A batch is bid at the urgent tip when any buy in it is hurried (`Due.hurried`); a buy inside a community window,
+  // before its tail, is not, and is never bid up against other holders (decision 19). So the two never share a
+  // transaction: a hurried buy would lend its tip to the patient one, at the first send and at every resend. The
+  // hurried go first, with whatever else is due outside a window; the patient wait for the next transaction, unless
+  // the hurried can't pay their way alone, when the patient go instead. With nothing hurried, one batch carries all,
+  // and waits patiently as one (`waitsPatiently`).
+  const patient = group.filter((c) => c.due.community !== null && !c.due.hurried);
+  const pools = group.some((c) => c.due.hurried) && patient.length > 0 ? [group.filter((c) => !patient.includes(c)), patient] : [group];
 
   const reserves = t.config.privateSend ? new Map<Address, bigint | null>() : await readReserves(t.rpc, t.config.weth, group.map((c) => c.due.entry.terms));
-  const feePerGas = economicFeePerGas(t.next, priced.tip, policy, state.breakerOpen);
-  const select = (pool: readonly BatchCandidate[]) =>
-    selectBatch({
-      candidates: pool,
-      feePerGas,
-      ratioPpm: state.gasModel.ratioPpm,
-      privateSend: t.config.privateSend,
-      pairReserves: reserves,
-      ownerSubsidised24h: subsidisedBy(t, "owner"),
-      dailyLossLeft: dailyLossLeft(t),
-      policy,
-    });
-
-  let selection = select(group);
-  noteSelectionSkips(t, selection);
-  if (selection.vaults.length === 0) return waitFor("economics", group.length);
-  // Too big for one transaction: the first of the fewest chunks that fit, each paying its own way.
-  const chunks = splitRoundRobin([...selection.vaults].sort((a, b) => (a.marginWei > b.marginWei ? -1 : a.marginWei < b.marginWei ? 1 : 0)), policy);
-  if (chunks.length > 1) {
-    selection = select(chunks[0]!);
-    if (selection.vaults.length === 0) return waitFor("economics", group.length);
+  const selectingAt = (tip: bigint) => {
+    const feePerGas = economicFeePerGas(t.next, tip, policy, state.breakerOpen);
+    return (candidates: readonly BatchCandidate[]) =>
+      selectBatch({
+        candidates,
+        feePerGas,
+        ratioPpm: state.gasModel.ratioPpm,
+        privateSend: t.config.privateSend,
+        pairReserves: reserves,
+        ownerSubsidised24h: subsidisedBy(t, "owner"),
+        dailyLossLeft: dailyLossLeft(t),
+        policy,
+      });
+  };
+  let chosen: { pool: typeof group; selection: BatchSelection; urgent: boolean; priced: { fees: PreparedFees; tip: bigint } } | null = null;
+  let blocked: "fees-above-max" | "resend-blocked" | null = null;
+  for (const pool of pools) {
+    const urgent = pool.some((c) => c.due.hurried);
+    const priced = options.pricing(urgent);
+    if (priced === "fees-above-max" || priced === "resend-blocked") {
+      // The urgent tip above the cap need not hold back what goes at the patient one.
+      blocked ??= priced;
+      continue;
+    }
+    const select = selectingAt(priced.tip);
+    let selection = select(pool);
+    noteSelectionSkips(t, selection);
+    if (selection.vaults.length === 0) continue;
+    // Too big for one transaction: the first of the fewest chunks that fit, each paying its own way.
+    const chunks = splitRoundRobin([...selection.vaults].sort((a, b) => (a.marginWei > b.marginWei ? -1 : a.marginWei < b.marginWei ? 1 : 0)), policy);
+    if (chunks.length > 1) {
+      selection = select(chunks[0]!);
+      if (selection.vaults.length === 0) continue;
+    }
+    chosen = { pool, selection, urgent, priced };
+    break;
   }
+  if (chosen === null) return waitFor(blocked ?? "economics", group.length);
+  const { urgent, priced } = chosen;
+  let { selection } = chosen;
+  // The most pressing reason any vault it carries gives; a rebuild that none gives keeps its first send's.
+  const poolReasons = chosen.pool.map((c) => c.due.reason).filter((r): r is SendReason => r !== null);
+  const reason: SendReason =
+    (["deadline", "now", "window", "short-interval"] as const).find((r) => poolReasons.includes(r)) ?? poolReasons[0] ?? rebuild?.reason ?? "deadline";
+  const communityEnds = new Map(chosen.pool.flatMap((c) => (c.due.community === null ? [] : [[c.vault, c.due.community.endsAt] as const])));
+  const select = selectingAt(priced.tip);
 
   // 8: simulate at the fee it will pay, at most twice.
+  const gasPerVault = gasPerVaultOf(t.config, deployment);
   for (let round = 1; round <= 2; round++) {
-    const gasLimit = batchGasLimit(selection.vaults);
+    const gasLimit = batchGasLimit(selection.vaults, gasPerVault);
     const simulation = await simulate(t, deployment, selection, gasLimit, priced.fees);
     if (simulation === null) return waitFor(null, group.length);
     const refusedHere = simulation.outcomes.filter((o) => !o.bought);
     if (simulation.kind === "ok" && refusedHere.length === 0) {
       for (const v of selection.vaults) t.outcomes.set(v.vault, "ok");
-      return { kind: "send", deployment, selection, gasLimit, fees: priced.fees, reason, urgent, quotes };
+      return { kind: "send", deployment, selection, gasLimit, fees: priced.fees, reason, urgent, quotes, communityEnds };
     }
     for (const outcome of refusedHere) simulatedRefusal(t, outcome.vault, outcome.reason ?? "0x", outcome.reasonName);
     const refusedSet = new Set(refusedHere.map((o) => o.vault));
@@ -584,7 +791,7 @@ async function planBatch(t: Tick, options: { rebuildOf: PendingTx | null; pricin
     if (round === 2) {
       // The second simulation still refused some: they are dropped, and the rest goes without a third.
       for (const v of selection.vaults) t.outcomes.set(v.vault, "ok");
-      return { kind: "send", deployment, selection, gasLimit: batchGasLimit(selection.vaults), fees: priced.fees, reason, urgent, quotes };
+      return { kind: "send", deployment, selection, gasLimit: batchGasLimit(selection.vaults, gasPerVault), fees: priced.fees, reason, urgent, quotes, communityEnds };
     }
   }
   return waitFor(null, 0);
@@ -592,7 +799,8 @@ async function planBatch(t: Tick, options: { rebuildOf: PendingTx | null; pricin
 
 /**
  * Which vaults the cache says are due by the clock, with no RPC: not resting,
- * not trapped, not waiting to be rechecked, funded as last read. A vault never
+ * not trapped, not waiting to be rechecked, funded as last read, and not
+ * inside a community window this keeper may not be paid in. A vault never
  * read is included, to be read. Retired vaults are gone from the cache.
  */
 function clockFilter(t: Tick): Address[] {
@@ -602,7 +810,8 @@ function clockFilter(t: Tick): Address[] {
     const trap = state.trapped[vault];
     if (trap) {
       const deployment = t.config.deployments.find((d) => d.id === e.deployment);
-      const moved = deployment !== undefined && (lower(deployment.batcher) !== trap.batcher || BATCHER_LIMITS.EXECUTE_GAS_CAP !== trap.cap);
+      // Another batcher, or another gas per vault, and the trap no longer says what this keeper's batch would do.
+      const moved = deployment !== undefined && (lower(deployment.batcher) !== trap.batcher || gasPerVaultOf(t.config, deployment) !== trap.cap);
       if (moved || t.chainTime >= trap.since + t.policy.trapSeconds) {
         delete state.trapped[vault];
         t.emit({ type: "untrapped", vault, why: moved ? "new-batcher" : "expired" });
@@ -635,12 +844,41 @@ function clockFilter(t: Tick): Address[] {
       noteSkip(t, vault, "unfunded", "it holds less than its next buy and its buy fee");
       continue;
     }
+    if (holdersFirst(t, vault, e)) continue;
     due.push(vault);
   }
   return due;
 }
 
-/** A read vault's window, deadline and send reason; null when it has not been read or has no buys left. */
+/**
+ * A due buy inside a community window this keeper's `rewardTo` may not be
+ * paid in — not eligible, or eligibility unknown — is left to SPX holders: a
+ * `holders-first` skip, until the window ends, when anyone may make it. One it
+ * may be paid in, but inside another bucket's turn (`turnHeldUntil`), is left
+ * to that bucket's holders: an `other-turn` skip, until the turn ends, when any
+ * eligible holder may make it. The tick after is planned for that moment
+ * (`finish`). True when it is.
+ */
+function holdersFirst(t: Tick, vault: Address, e: VaultEntry): boolean {
+  if (mayBePaidInWindow(t, e)) {
+    const turnEnds = turnHeldUntil(t, vault, e);
+    if (turnEnds === null) return false;
+    noteSkip(t, vault, "other-turn", `holders in another bucket have first claim until ${turnEnds} (chain time)`);
+    return true;
+  }
+  const until = holdersFirstUntil(e, t.chainTime);
+  if (until === null) return false;
+  noteSkip(t, vault, "holders-first", `SPX holders have first claim until ${until} (chain time)`);
+  return true;
+}
+
+/**
+ * A read vault's window, deadline and send reason; null when it has not been
+ * read or has no buys left. A due v2 buy inside a community window this
+ * keeper may be paid in goes as soon as it is due ("window"), at the patient
+ * tip until the window's urgent tail, and urgently in it — whatever its slot's
+ * deadline says, which only counts once the window is over.
+ */
 function dueOf(t: Tick, vault: Address): Due | null {
   const e = t.state.vaults[vault];
   if (!e || e.readAt === null) return null;
@@ -648,12 +886,16 @@ function dueOf(t: Tick, vault: Address): Due | null {
   if (earliest === null) return null;
   const window = windowOf(e.terms, earliest > t.chainTime ? earliest : t.chainTime);
   const deadline = deadlineOf(e.terms, window, t.policy);
-  const urgent = t.chainTime >= deadline;
   const shortInterval = e.terms.interval < t.policy.shortIntervalSeconds;
+  const open = communityWindowOf(e, t.chainTime);
+  const community = open !== null && t.chainTime >= earliest && t.chainTime < open.endsAt && mayBePaidInWindow(t, e) ? open : null;
+  const windowUrgent = community !== null && t.chainTime >= community.urgentAt;
+  const urgent = community !== null ? windowUrgent : t.chainTime >= deadline;
+  const hurried = windowUrgent || (urgent && !shortInterval);
   const from = window.windowStart > earliest ? window.windowStart : earliest;
   const target = cheapTarget({ samples: t.state.feeSamples, chainTime: t.chainTime, from, deadline, interval: e.terms.interval }, t.policy);
-  const reason = t.chainTime >= earliest ? shouldSend({ urgent, shortInterval, target }, t.next, t.policy) : null;
-  return { vault, entry: e, earliest, window, deadline, urgent, shortInterval, target, reason };
+  const reason = t.chainTime >= earliest ? shouldSend({ urgent, shortInterval, target, inCommunityWindow: community !== null }, t.next, t.policy) : null;
+  return { vault, entry: e, earliest, window, deadline, urgent, windowUrgent, hurried, shortInterval, target, reason, community };
 }
 
 /**
@@ -696,8 +938,11 @@ function candidateOf(t: Tick, due: Due, read: VaultProgress): (BatchCandidate & 
     reward: e.terms.keeperReward,
     firstBuy: e.buysDone === 0n,
     urgent: due.urgent,
-    deadline: due.deadline,
+    // Inside a community window, its end is the deadline that counts: after it, anyone may take the buy.
+    deadline: due.community !== null ? due.community.endsAt : due.deadline,
     subsidised24h: subsidisedBy(t, "vault").get(due.vault) ?? 0n,
+    // Its release, by the factory that vouches for it: what its gas and its proposed fee are judged by.
+    release: e.deployment as VaultRelease,
     due,
   };
 }
@@ -714,7 +959,7 @@ async function simulate(t: Tick, deployment: Deployment, selection: BatchSelecti
   const call = {
     from: t.keeper ?? ZERO,
     to: lower(deployment.batcher),
-    data: encodeExecuteBatch(vaults, rewardTo, selection.minRewards),
+    data: encodeBatchFor(deployment, vaults, rewardTo, selection.minRewards, gasPerVaultOf(t.config, deployment)),
     gas: hex(gasLimit),
     // A dry run has no balance to bid with, and simulates without fees.
     ...(t.keeper === null ? {} : feeFields(fees)),
@@ -740,9 +985,12 @@ async function simulate(t: Tick, deployment: Deployment, selection: BatchSelecti
  * What a vault's refusal in a simulation means:
  * someone else bought it or it ended, so read it again; the price or oracle,
  * so skip this tick; it cannot pay, so look again in an hour; its factory does
- * not vouch for it after all; or something that should not happen to a listed
- * vault, so rest it for the window. A simulation never traps: an endpoint
- * that strips revert data is an honest cause.
+ * not vouch for it after all; `rewardTo` is not eligible after all, so its
+ * release's eligibility counts as unknown for the rest of the tick (every
+ * tick reads it again) and the buy is left to holders until its community
+ * window ends; or something that should not happen to a listed vault, so
+ * rest it for the window. A simulation never traps: an endpoint that strips
+ * revert data is an honest cause.
  */
 function simulatedRefusal(t: Tick, vault: Address, reason: Hex, name: string | null): void {
   const e = t.state.vaults[vault];
@@ -775,6 +1023,20 @@ function simulatedRefusal(t: Tick, vault: Address, reason: Hex, name: string | n
     case "NotTried":
       t.emit({ type: "error", where: "simulate", message: `${vault} was not tried: the gas limit was too low` });
       return;
+    case "NotEligible": {
+      const read = t.state.eligibility[e.deployment];
+      if (read) read.eligible = null;
+      e.restingUntil = holdersFirstUntil(e, t.chainTime) ?? communityWindowOf(e, t.chainTime)?.endsAt ?? windowOf(e.terms, t.chainTime).windowEnd;
+      return;
+    }
+    case "NotYourTurn": {
+      // Eligible, but another bucket's turn: back when the turn ends, when any eligible holder may be paid; or, when
+      // this keeper reckoned the turn over and the vault did not, when its window ends.
+      const turnEnds = turnEndsAtOf(e.terms, e.buysDone, e.lastBuyAt, t.chainTime);
+      e.restingUntil =
+        turnEnds !== null && turnEnds > t.chainTime ? turnEnds : (communityWindowOf(e, t.chainTime)?.endsAt ?? windowOf(e.terms, t.chainTime).windowEnd);
+      return;
+    }
     default:
       e.restingUntil = windowOf(e.terms, t.chainTime).windowEnd;
   }
@@ -821,16 +1083,63 @@ function reconcileSkips(t: Tick): void {
 
 /**
  * Rebuild the transaction in flight at its nonce, once `settlePending` says
- * its resend interval has passed: an unwrap, a deployment or a cancel is the
- * same transaction bid higher; a batch is reselected from fresh reads, and
- * one no longer worth sending is cancelled in the public pool or left to
- * expire through a private relay.
+ * its resend interval has passed: an unwrap, a deployment, a proof or a
+ * cancel is the same transaction bid higher (a proof that can no longer do
+ * anything is withdrawn instead, `proofWithdrawal`); a batch is reselected
+ * from fresh reads, and one no longer worth sending is cancelled in the
+ * public pool or left to expire through a private relay.
+ *
+ * A batch sent patiently, carrying a buy inside its community window and
+ * nothing hurried, is left as it is — broadcast again every tick, never bid
+ * up against other holders — until a buy in it is hurried: its window's
+ * urgent point, or, for a buy riding along outside any window, its slot's
+ * deadline (decision 19; `waitsPatiently`). A holder that bids higher may
+ * still win; that is the race the window runs, and a lost one through a
+ * private relay costs nothing. So that a lost race does not hold the
+ * keeper's one transaction in flight until then, each resend reads the
+ * batch's own vaults (no prices): a buy another keeper made ends the wait,
+ * and the batch is rebuilt without it, or withdrawn, as any other.
  */
 async function resend(t: Tick, p: PendingTx): Promise<void> {
   const last = p.attempts.at(-1)!;
   const replace = (urgent: boolean) => replacementFees(last.fees, { next: t.next, urgent, resends: p.resends + 1 }, t.policy);
 
-  // An unwrap, a deployment or a cancel: the same transaction, bid higher.
+  if (p.purpose === "batch" && last.kind === "batch" && !p.urgent && waitsPatiently(t, p)) {
+    const reads = await readVaults(t.rpc, t.config.weth, p.vaults, false);
+    for (const vault of p.vaults) {
+      const read = reads.get(vault);
+      if (read) applyRead(t, vault, read);
+    }
+    if (waitsPatiently(t, p)) return;
+  }
+
+  // A proof that can no longer do what it was sent for is withdrawn, never bid up: its block about to leave the
+  // registry's reach (built again from a newer block next time), a proof as new already recorded — someone else's
+  // of the same holder, which a revert-protected relay would never include, holding every batch behind it for
+  // hours — or proving turned off since it was sent, which the keeper may no longer sign.
+  if (p.purpose === "prove" && last.kind === "prove") {
+    const why = proofWithdrawal(t, p, last);
+    if (why !== null) {
+      if (why.skip !== null) {
+        t.state.lastProveSkip = `${p.deployment}:${why.skip}`;
+        t.emit({ type: "prove_skipped", deployment: p.deployment ?? "", holder: why.holder, reason: why.skip, detail: why.detail });
+      }
+      if (t.config.privateSend) {
+        p.stoppedResending = true;
+        await t.persist();
+        return;
+      }
+      const fees = replace(false);
+      if (fees === null) return t.emit({ type: "resend_blocked", batchId: p.batchId, nonce: p.nonce, why: "fee-cap" });
+      const tx = buildTransaction({ from: t.keeper!, chainId: t.config.chainId, nonce: p.nonce, to: t.keeper!, data: "0x", gas: CANCEL_GAS, fees });
+      const { attempt } = await send(t, p, tx, "cancel");
+      p.resends += 1;
+      t.emit({ type: "batch_cancel_sent", batchId: p.batchId, nonce: p.nonce, hash: attempt.hash });
+      return;
+    }
+  }
+
+  // An unwrap, a deployment, a proof or a cancel: the same transaction, bid higher.
   if (p.purpose !== "batch" || last.kind === "cancel") {
     const fees = replace(false);
     if (fees === null) return t.emit({ type: "resend_blocked", batchId: p.batchId, nonce: p.nonce, why: "fee-cap" });
@@ -872,6 +1181,74 @@ async function resend(t: Tick, p: PendingTx): Promise<void> {
   const { attempt } = await send(t, p, tx, "cancel");
   p.resends += 1;
   t.emit({ type: "batch_cancel_sent", batchId: p.batchId, nonce: p.nonce, hash: attempt.hash });
+}
+
+/**
+ * Why a proof in flight is to be withdrawn rather than sent again, bid
+ * higher; null when it may still do what it was sent for. Judged at this
+ * head, from this tick's read of the registry (`readEligibility`), with no
+ * request of its own:
+ *
+ * - its block is about to leave the 8,191 the registry can check
+ *   (`PROVE_STALE_BLOCKS`);
+ * - the registry already records `rewardTo` as proven at least as long as
+ *   this proof would (`not-newer`): it would revert `NotNewer`, which a
+ *   private relay never includes, and the keeper's one transaction in flight
+ *   would wait out the 7,000 blocks behind it;
+ * - the keeper may no longer sign it again (`assertKeeperMaySign`): proving
+ *   is off (`off`), or `rewardTo` is another address since a restart
+ *   (`other-holder`). Refusing to sign is right; failing every tick over it
+ *   until the proof lands or goes stale is not.
+ *
+ * `skip` is the `prove_skipped` reason it is logged with, if any. Through a
+ * private relay "withdrawn" means not sent again, and left to expire.
+ */
+function proofWithdrawal(t: Tick, p: PendingTx, last: PendingAttempt): { skip: ProveSkipReason | null; holder: Address; detail: string } | null {
+  const sent = proofSent(last.raw);
+  const holder = sent?.holder ?? t.rewardTo ?? ZERO;
+  if (!t.config.prove) return { skip: "off", holder, detail: "proving was turned off while a proof was in flight: it is not sent again" };
+  if (sent === null || sent.holder !== t.rewardTo) {
+    return { skip: "other-holder", holder, detail: `the proof in flight is not of rewardTo, ${t.rewardTo}, now: it is not sent again` };
+  }
+  if (p.proveBlock !== null && t.block - p.proveBlock >= PROVE_STALE_BLOCKS) return { skip: null, holder, detail: "" };
+  const read = p.deployment === null ? undefined : t.state.eligibility[p.deployment];
+  if (read !== undefined && read.readAt === t.chainTime && read.holder === holder && read.validUntil !== null && sent.until !== null && read.validUntil >= sent.until) {
+    return { skip: "not-newer", holder, detail: `a proof valid until ${read.validUntil} is already recorded; this one, until ${sent.until}, would revert` };
+  }
+  return null;
+}
+
+/**
+ * Whose proof a signed `prove` carries, and until when it would make them
+ * eligible (its header's time and 30 days; null when the header can't be
+ * read); null when it is not a `prove` at all.
+ */
+function proofSent(raw: Hex): { holder: Address; until: bigint | null } | null {
+  try {
+    const { functionName, args } = decodeFunctionData({ abi: REGISTRY_ABI, data: parseTransaction(raw).data ?? "0x" });
+    if (functionName !== "prove") return null;
+    const header = parseHeaderRlp(String(args[1]));
+    return { holder: lower(String(args[0])), until: header === null ? null : header.timestamp + PROOF_TTL };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Whether a batch in flight waits as it was sent: it carries a buy inside a
+ * community window this keeper may be paid in, every buy it carries is still
+ * due, and none is hurried — none in its window's urgent tail, none past its
+ * slot's deadline (`Due.hurried`). A buy open to anyone that rides with a
+ * patient one waits with it, unbid, until something in the batch is hurried:
+ * replacing the batch at all would bid the patient buy up too, 12.5% a
+ * resend. By the cache: `resend` reads the batch's own vaults first, so a buy
+ * another keeper made ends the wait.
+ */
+function waitsPatiently(t: Tick, p: PendingTx): boolean {
+  if (p.vaults.length === 0) return false;
+  const dues = p.vaults.map((vault) => dueOf(t, vault));
+  if (dues.some((due) => due === null || t.chainTime < due.earliest || due.hurried)) return false;
+  return dues.some((due) => due!.community !== null);
 }
 
 // ─── Windows ──────────────────────────────────────────────────────────────────
@@ -935,6 +1312,174 @@ async function maybeUnwrap(t: Tick): Promise<void> {
   t.emit({ type: "unwrap_sent", batchId: pending.batchId, hash: attempt.hash, amountWei: t.keeperWeth });
 }
 
+// ─── The SPX holder registry ──────────────────────────────────────────────────
+
+/**
+ * An `eligibility` record for each release with a registry, from this tick's
+ * read: when anything in it changes, and once a day of chain time besides —
+ * so the log says when `rewardTo`'s proof lapses, and how many days are left,
+ * whether or not this keeper proves it.
+ */
+function logEligibility(t: Tick): void {
+  const reads = t.config.deployments.flatMap((d) => {
+    const read = t.state.eligibility[d.id];
+    return read !== undefined && read.readAt === t.chainTime ? [{ d, read }] : [];
+  });
+  if (reads.length === 0) return;
+  const said = reads.map(({ d, read }) => `${d.id}:${read.eligible}:${read.validUntil}:${whyNotEligible(read, t.chainTime)}`).join(",");
+  const daily = t.state.eligibilityLoggedAt === null || t.chainTime >= t.state.eligibilityLoggedAt + DAY;
+  if (said === t.state.lastEligibility && !daily) return;
+  t.state.lastEligibility = said;
+  t.state.eligibilityLoggedAt = t.chainTime;
+  for (const { d, read } of reads) {
+    t.emit({
+      type: "eligibility",
+      deployment: d.id,
+      registry: read.registry,
+      rewardTo: read.holder,
+      eligible: read.eligible,
+      validUntil: read.validUntil,
+      daysLeft: daysLeft(read.validUntil, t.chainTime),
+      spxWei: read.spx,
+      minSpxWei: MIN_SPX,
+      isAccount: read.isAccount,
+      reason: whyNotEligible(read, t.chainTime),
+    });
+  }
+}
+
+/**
+ * Why a read is not eligible, as `readHolderStatus` says it: a contract
+ * first, which no proof can fix, then the registry's own order; null when
+ * eligible, or unknown.
+ */
+function whyNotEligible(read: Eligibility, chainTime: bigint): string | null {
+  if (read.eligible === true || read.isAccount === null) return null;
+  if (!read.isAccount) return "contract";
+  if (read.validUntil === null) return null;
+  if (read.validUntil === 0n) return "not-proven";
+  if (chainTime > read.validUntil) return "lapsed";
+  if (read.spx !== null && read.spx < MIN_SPX) return "below-minimum";
+  return null;
+}
+
+/** This machine's clock, in whole seconds: what the bounds on proving are kept on, never the endpoint's. */
+const wallSeconds = (t: Pick<Tick, "wallClockMs">): bigint => BigInt(Math.floor(t.wallClockMs() / 1000));
+
+/** A proof this keeper sent was reported reverted less than a day ago, by the wall clock: no other is sent until the day is out. */
+const proveBackingOff = (t: Tick): boolean => t.state.proveRevertedAt !== null && wallSeconds(t) < t.state.proveRevertedAt + PROVE_REVERT_BACKOFF_SECONDS;
+
+/** Days from `chainTime` to a proof's lapse, to a tenth, negative once past; null when unknown or never proved. */
+function daysLeft(validUntil: bigint | null, chainTime: bigint): number | null {
+  if (validUntil === null || validUntil === 0n) return null;
+  return Number(((validUntil - chainTime) * 10n) / DAY) / 10;
+}
+
+/**
+ * With `SPDEX_KEEPER_PROVE=1`, prove `rewardTo`'s SPX to a release's registry
+ * once its proof has `PROOF_LAPSE_WARNING_SECONDS` (five days) or less left,
+ * or it never proved, and only when no other transaction is in flight. By
+ * this machine's clock, never the endpoint's (`PROVE_SPACING_SECONDS`): at
+ * most one try an accounting period, at most one proof sent a day, and none
+ * for a day after one reverted (`PROVE_REVERT_BACKOFF_SECONDS`). The keeper
+ * signs it through the nonce manager like any other, and
+ * `assertKeeperMaySign` allows it for the configured `rewardTo` alone.
+ */
+async function maybeProve(t: Tick): Promise<void> {
+  const { state, policy } = t;
+  if (!t.config.prove || t.keeper === null || t.rewardTo === null || state.pending) return;
+  const now = wallSeconds(t);
+  if (state.proveTriedAt !== null && now < state.proveTriedAt + policy.accountingSeconds) return;
+  if (state.proveSentAt !== null && now < state.proveSentAt + PROVE_SPACING_SECONDS) return;
+  if (proveBackingOff(t)) return;
+  for (const d of t.config.deployments) {
+    const read = d.registry === null ? undefined : state.eligibility[d.id];
+    // Unread at this head, or no registry on this chain: nothing to prove to.
+    if (read === undefined || read.readAt !== t.chainTime || read.validUntil === null) continue;
+    if (read.validUntil > t.chainTime + PROOF_LAPSE_WARNING_SECONDS) continue;
+    state.proveTriedAt = now;
+    await proveTo(t, d, read);
+    return;
+  }
+}
+
+/**
+ * One `prove`: the proof built from the `finalized` block, whose header is
+ * rebuilt and must hash to that block's hash, and checked against its state
+ * root before anything is signed (`buildHolderProof`); one that would not
+ * move `validUntil` is never sent (the registry would revert `NotNewer`); its
+ * gas limit is its estimate and a fifth (`proveGasLimit`), which is its
+ * test-run too; and it is bid at the patient tip. Every reason it is not sent
+ * is a `prove_skipped`, logged once until the reason changes.
+ */
+async function proveTo(t: Tick, d: Deployment, read: Eligibility): Promise<void> {
+  const { state } = t;
+  const holder = t.rewardTo!;
+  const keeper = t.keeper!;
+  const skip = (reason: Extract<KeeperLogBody, { type: "prove_skipped" }>["reason"], detail: string) => {
+    const said = `${d.id}:${reason}`;
+    if (state.lastProveSkip === said) return;
+    state.lastProveSkip = said;
+    t.emit({ type: "prove_skipped", deployment: d.id, holder, reason, detail });
+  };
+  if (read.isAccount === false) return skip("contract", "the registry pays only an account; rewardTo has code");
+  let proof: HolderProof;
+  try {
+    proof = await buildHolderProof(t.rpc, holder, { block: "finalized" });
+  } catch (error) {
+    if (error instanceof HoldingBelowMinimumError) return skip("below-min-spx", messageOf(error));
+    if (error instanceof HeaderHashMismatchError) return skip("header-mismatch", messageOf(error));
+    // `eth_getProof` refused (`ProofUnavailableError`), or a proof that is not of that block's state: the endpoint
+    // cannot serve a proof this keeper would send. Tried again next accounting period, and said once.
+    return skip("unsupported", messageOf(error));
+  }
+  if (proof.validUntil <= read.validUntil!) return skip("not-newer", `a proof valid until ${read.validUntil} is already recorded`);
+  const call = proveCall(proof, lower(d.registry!));
+  let estimate: bigint;
+  try {
+    estimate = BigInt((await t.rpc("eth_estimateGas", [{ from: keeper, to: call.to, data: call.data, value: "0x0" }])) as string);
+  } catch (error) {
+    const data = revertDataOf(error);
+    if (data === null) throw error;
+    const named = decodeVaultError(data);
+    return skip(named?.name === "NotNewer" ? "not-newer" : "refused", describeRegistryError(named) ?? named?.name ?? data.slice(0, 10));
+  }
+  let gas: bigint;
+  try {
+    gas = proveGasLimit(estimate);
+  } catch (error) {
+    return skip("gas", messageOf(error));
+  }
+  const chosen = chooseFees({ next: t.next, legacy: t.legacy, urgent: false }, t.policy);
+  if ("blocked" in chosen) return skip("fees-above-max", "network fees are above the policy's cap");
+  const balance = BigInt((await t.rpc("eth_getBalance", [keeper, "latest"])) as string);
+  state.balanceWei = balance;
+  if (balance < gas * maxFeePerGasOf(chosen.fees)) return skip("low-balance", "the key cannot pay for the proof at its highest price");
+
+  const nonce = await nextNonceFor(t.rpc, keeper, state);
+  const pending = newPendingTx(state, keeper, nonce, "prove", { deployment: d.id, gasLimit: gas, proveBlock: proof.blockNumber });
+  // Counted before it is broadcast, with the state persisted before the broadcast: a crash never forgets one went.
+  state.proveSentAt = wallSeconds(t);
+  const tx = buildTransaction({ from: keeper, chainId: t.config.chainId, nonce, to: call.to, data: call.data, gas, fees: chosen.fees });
+  const { attempt, refused } = await send(t, pending, tx, "prove");
+  state.lastProveSkip = null;
+  t.emit({
+    type: "prove_sent",
+    batchId: pending.batchId,
+    hash: attempt.hash,
+    deployment: d.id,
+    registry: call.to,
+    holder,
+    provenBlock: proof.blockNumber,
+    gasLimit: gas,
+    maxFeePerGas: maxFeePerGasOf(chosen.fees),
+    maxPriorityFeePerGas: tipOf(chosen.fees),
+    validUntil: proof.validUntil,
+  });
+  if (refused) t.emit({ type: "error", where: "send", message: `${refused.kind}: ${refused.message}` });
+  if (t.waitForReceiptMs > 0) await awaitReceipt(t);
+}
+
 // ─── The end of a tick ────────────────────────────────────────────────────────
 
 function finish(t: Tick): KeeperTickResult {
@@ -943,13 +1488,17 @@ function finish(t: Tick): KeeperTickResult {
   const upcoming = entries(state.vaults).map(([vault, e]) => ({ vault, nextBuyAt: e.readAt === null ? null : earliestBuyAt(e.terms, e.buysDone, e.lastBuyAt) }));
   result.upcoming = upcoming;
 
-  // The next tick: the nearest deadline, due time or resend, within [12 s, interval].
+  // The next tick: the nearest deadline, due time, resend, community window's urgent point or end, within [12 s, interval].
   const moments: bigint[] = [];
-  for (const [vault] of entries(state.vaults)) {
+  for (const [vault, e] of entries(state.vaults)) {
     const due = dueOf(t, vault);
     if (!due) continue;
     if (due.earliest > t.chainTime) moments.push(due.earliest);
     if (due.deadline > t.chainTime) moments.push(due.deadline);
+    if (due.community !== null && due.community.urgentAt > t.chainTime) moments.push(due.community.urgentAt);
+    // Left to holders, or to another bucket's: back when they no longer have first claim.
+    const opens = mayBePaidInWindow(t, e) ? turnHeldUntil(t, vault, e) : holdersFirstUntil(e, t.chainTime);
+    if (opens !== null && opens > t.chainTime) moments.push(opens);
   }
   const p = state.pending;
   if (p) moments.push(t.chainTime + SECONDS_PER_BLOCK * 2n);
@@ -959,8 +1508,33 @@ function finish(t: Tick): KeeperTickResult {
 
   state.spend = state.spend.filter(([at]) => at > t.chainTime - WEEK);
   const spentWeek = state.spend.reduce((sum, [, cost]) => sum + cost, 0n);
+  // Runway is the spend over the time it covers: since the keeper began keeping it, at most the last week. A keeper
+  // a day old is not taken to have spent a day's worth in a week (seven times the runway it has); one younger than a
+  // day has too little to say, and its runway is unknown.
+  const since = minOrNull([state.spendSince, ...state.spend.map(([at]) => at)]);
+  const covered = since === null || since < t.chainTime - WEEK ? WEEK : t.chainTime - since;
+  const runwayDays =
+    state.balanceWei === null || spentWeek === 0n || covered < DAY ? null : Number((state.balanceWei * covered * 10n) / (spentWeek * DAY)) / 10;
+  const lowRunway = runwayDays !== null && policy.minRunwayDays > 0 && runwayDays < policy.minRunwayDays;
+  if (lowRunway && !state.lowRunway) {
+    t.emit({ type: "low_runway", runwayDays: runwayDays!, thresholdDays: policy.minRunwayDays, etherWei: state.balanceWei!, spentWeekWei: spentWeek });
+  }
+  if (runwayDays !== null) state.lowRunway = lowRunway;
+  // The latest release's registry is the one new vaults ask; its read is what the heartbeat reports.
+  const latest = [...t.config.deployments].reverse().find((d) => d.registry !== null);
+  const kept = latest === undefined ? undefined : state.eligibility[latest.id];
+  // Another rewardTo's figures, from before a restart with a new one, say nothing about this one.
+  const read = kept?.holder === t.rewardTo ? kept : undefined;
+  const fresh = read !== undefined && read.readAt === t.chainTime;
   const attention: string[] = [];
   if (state.lowBalance) attention.push("low_balance");
+  if (state.lowRunway) attention.push("low_runway");
+  if (fresh && read.validUntil !== null && read.validUntil > 0n && t.chainTime <= read.validUntil && read.validUntil - t.chainTime <= PROOF_LAPSE_WARNING_SECONDS) {
+    attention.push("proof_lapsing");
+  }
+  // Only for an operator who means to be eligible: one who once proved, or proves.
+  if (fresh && read.eligible === false && ((read.validUntil ?? 0n) > 0n || t.config.prove)) attention.push("not_eligible");
+  if (proveBackingOff(t)) attention.push("prove_reverted");
   if (p && t.block - p.attempts[0]!.sentBlock > STUCK_PENDING_BLOCKS) attention.push("stuck_pending");
   if (state.lastMissedAt !== null && state.lastMissedAt > t.chainTime - DAY) attention.push("windows_missed_24h");
   if (state.breakerOpen) attention.push("subsidy_exhausted");
@@ -975,8 +1549,11 @@ function finish(t: Tick): KeeperTickResult {
     lastBatchHash: state.lastBatch?.hash ?? null,
     lastBatchAt: state.lastBatch?.at ?? null,
     balanceWei: state.balanceWei,
-    runwayDays: state.balanceWei === null || spentWeek === 0n ? null : Number((state.balanceWei * 70n) / spentWeek) / 10,
+    runwayDays,
     attention,
+    eligible: fresh ? read.eligible : null,
+    proofValidUntil: read?.validUntil ?? null,
+    proofDaysLeft: daysLeft(read?.validUntil ?? null, t.chainTime),
   };
   return result;
 }
@@ -987,7 +1564,9 @@ function finish(t: Tick): KeeperTickResult {
  * Deploy every listed release's batcher whose factory is on this chain and
  * whose batcher is not, through the nonce manager like any other transaction
  * (`--deploy-batcher`). Anyone may; the address is fixed by the bytecode and
- * the factory, so a second deployment, by anyone, lands nowhere new.
+ * its one argument — WETH for the batcher every release from v2 on shares,
+ * v1's factory for v1's — so a second deployment, by anyone, lands nowhere
+ * new, and releases that share a batcher deploy it once.
  */
 export async function deployMissingBatchers(
   rpc: JsonRpc,
@@ -1002,7 +1581,9 @@ export async function deployMissingBatchers(
   for (const deployment of config.deployments) {
     const hasCode = async (address: Address) => ((await rpc("eth_getCode", [address, "latest"])) as string) !== "0x";
     if (!(await hasCode(lower(deployment.factory))) || (await hasCode(lower(deployment.batcher)))) continue;
-    const call = deployBatcherCall(lower(deployment.factory));
+    // Each release's batcher from its own code — v1's frozen one for v1's factory — and only where that code lands.
+    const call = batcherDeploymentOf(deployment, config.weth);
+    if (call === null) throw new Error(`this build's code for ${deployment.id}'s batcher does not land at ${lower(deployment.batcher)}`);
     const estimate = BigInt((await rpc("eth_estimateGas", [{ from: keeper, to: call.to, data: call.data, value: "0x0" }])) as string);
     const chosen = chooseFees({ next: t.next, legacy: t.legacy, urgent: false }, config.policy);
     if ("blocked" in chosen) throw new Error("network fees are above SPDEX_KEEPER_MAX_FEE_GWEI; try again later");

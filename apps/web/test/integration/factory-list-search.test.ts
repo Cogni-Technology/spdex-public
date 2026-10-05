@@ -1,16 +1,17 @@
 /**
- * Finding an owner's vaults from the factory's own list, on the fork, through
- * a network service that refuses every log search — the kind the list search
- * exists for.
+ * Finding an owner's vaults from the factories' own lists, on the fork,
+ * through a network service that refuses every log search — the kind the list
+ * search exists for.
  *
- * A fresh owner makes two vaults (the factory is deployed first if the fork
- * doesn't have it yet). Through an in-process proxy that refuses
- * `eth_getLogs`, the app's log search can't find them and says so
- * (`complete: false`), and the list search finds both, newest first, and says
- * it read every owner (`complete: true`). No request it makes names the
+ * A fresh owner makes two v2 vaults and a v1 one (each release is deployed
+ * first, `deployReleaseCalls`, if the fork doesn't have it yet). Through an
+ * in-process proxy that refuses `eth_getLogs`, the app's log search can't
+ * find them and says so (`complete: false`, with both factories' counts), and
+ * the list search finds all three, v2's list first, each newest first, and
+ * says it read every owner (`complete: true`). No request it makes names the
  * owner: it compares owners here.
  *
- * The test closes both vaults at the end and touches no vault it didn't make.
+ * The test closes every vault at the end and touches no vault it didn't make.
  * The fork's clock is never moved. Requires a fork: `pnpm anvil:fork`.
  */
 
@@ -19,19 +20,23 @@ import { addressOfKey, generateSpendingKey, httpRpc, prepareTransaction, signPre
 import type { Address, Hex } from "@spdex/core";
 import {
   MAINNET_FACTORY,
+  V1_MAINNET_FACTORY,
   VAULT_LIMITS,
   buyFee,
-  deployFactoryCall,
+  defaultCommunityWindow,
+  deployReleaseCalls,
   encodeClose,
   encodeCreateVault,
   readVaultCount,
+  v1BuyFee,
   vaultBudget,
   vaultsCreatedBy,
   type RawLog,
   type VaultIdentityCache,
   type VaultPlan,
+  type VaultRelease,
 } from "@spdex/vault";
-import { searchVaultsFromFactoryList } from "../../src/lib/dca/factoryListSearch.js";
+import { factoryListSearchCost, searchVaultsFromFactoryList } from "../../src/lib/dca/factoryListSearch.js";
 import { searchAccountVaults } from "../../src/lib/dca/vault.js";
 
 const FORK_URL = process.env["SPDEX_FORK_URL"] ?? "http://127.0.0.1:8545";
@@ -65,6 +70,20 @@ async function sendOk(key: Hex, to: Address, data: Hex, value = 0n): Promise<{ l
 }
 
 /**
+ * A release's contracts on the fork, deployed the way anyone would where they
+ * aren't yet; another suite may deploy one first, and the code is there
+ * either way.
+ */
+async function ensureRelease(release: VaultRelease): Promise<void> {
+  for (const call of deployReleaseCalls(release)) {
+    if (((await rpc("eth_getCode", [call.address, "latest"])) as string) !== "0x") continue;
+    const deployer = await freshAccount(ETHER);
+    await sendOk(deployer.key, call.to, call.data).catch(() => undefined);
+    expect((await rpc("eth_getCode", [call.address, "latest"])) as string, `${release}'s ${call.name}`).not.toBe("0x");
+  }
+}
+
+/**
  * The fork, as a network service that caps log searches to nothing: every
  * `eth_getLogs` is refused, as some free tiers do past ten blocks. Every other
  * request goes through, and each is remembered.
@@ -81,19 +100,15 @@ function refusingLogs(inner: JsonRpc): { rpc: JsonRpc; sent: { method: string; p
   };
 }
 
-describe("finding an owner's vaults from the factory's list", () => {
+describe("finding an owner's vaults from the factories' lists", () => {
   let owner: { key: Hex; address: Address };
+  /** v2's two, oldest first, then v1's one. */
   const made: Address[] = [];
 
   beforeAll(async () => {
     expect(Number(BigInt((await rpc("eth_chainId", [])) as string))).toBe(CHAIN_ID);
-    if (((await rpc("eth_getCode", [MAINNET_FACTORY, "latest"])) as string) === "0x") {
-      const deployer = await freshAccount(ETHER);
-      const call = deployFactoryCall();
-      // Another suite may deploy it first; the code is there either way.
-      await sendOk(deployer.key, call.to, call.data).catch(() => undefined);
-    }
-    expect((await rpc("eth_getCode", [MAINNET_FACTORY, "latest"])) as string).not.toBe("0x");
+    await ensureRelease("v2");
+    await ensureRelease("v1");
 
     owner = await freshAccount(ETHER);
     const latest = (await rpc("eth_getBlockByNumber", ["latest", false])) as { timestamp: string };
@@ -106,6 +121,8 @@ describe("finding an owner's vaults from the factory's list", () => {
       startAt: BigInt(latest.timestamp),
       keeperReward: buyFee(amountPerBuy).reward,
       maxSlippageBps: 300n,
+      communityWindow: defaultCommunityWindow(VAULT_LIMITS.MIN_INTERVAL),
+      turnBuckets: 0n,
     };
     for (let i = 0; i < 2; i++) {
       const receipt = await sendOk(owner.key, MAINNET_FACTORY, encodeCreateVault(plan), vaultBudget(plan));
@@ -113,25 +130,46 @@ describe("finding an owner's vaults from the factory's list", () => {
       if (!created) throw new Error("no VaultCreated from the factory in the receipt");
       made.push(created.vault);
     }
+    // And one on v1's factory, from before the app created on v2: v1's
+    // `createVault(uint256 × 7)`, hand-encoded, with v1's fee and no window.
+    const word = (v: bigint) => v.toString(16).padStart(64, "0");
+    const v1Fee = v1BuyFee(amountPerBuy).reward;
+    const create = `0x3f8f7b79${[0n, amountPerBuy, VAULT_LIMITS.MIN_INTERVAL, 2n, BigInt(latest.timestamp), v1Fee, 300n].map(word).join("")}` as Hex;
+    const receipt = await sendOk(owner.key, V1_MAINNET_FACTORY, create, 2n * (amountPerBuy + v1Fee));
+    const [created] = vaultsCreatedBy(V1_MAINNET_FACTORY, receipt.logs);
+    if (!created) throw new Error("no VaultCreated from v1's factory in the receipt");
+    expect(created.source).toBe("v1");
+    made.push(created.vault);
   });
 
   afterAll(async () => {
     for (const vault of made) await sendOk(owner.key, vault, encodeClose());
   });
 
-  it("finds both where the log search can't, reading every owner and naming none", async () => {
+  it("finds all three where the log search can't, both releases' lists, reading every owner and naming none", async () => {
     const service = refusingLogs(rpc);
 
-    const logs = await searchAccountVaults(service.rpc, { chainId: CHAIN_ID, account: owner.address, factory: MAINNET_FACTORY });
-    expect(logs).toMatchObject({ vaults: [], expected: 2n, complete: false });
+    const logs = await searchAccountVaults(service.rpc, { chainId: CHAIN_ID, account: owner.address });
+    // Each factory's own count, and none found: the logs were refused.
+    expect(logs).toMatchObject({
+      vaults: [],
+      expected: 3n,
+      complete: false,
+      counts: [
+        { factory: MAINNET_FACTORY, expected: 2n },
+        { factory: V1_MAINNET_FACTORY, expected: 1n },
+      ],
+    });
 
     const before = service.sent.length;
     const cache: VaultIdentityCache = new Map();
     const found = await searchVaultsFromFactoryList(service.rpc, owner.address, { cache });
-    if (found === null) throw new Error("the factory is deployed");
-    expect(found.vaults).toEqual([made[1], made[0]]);
-    expect(found).toMatchObject({ expected: 2n, complete: true, unreadable: 0 });
-    expect(BigInt(found.listed)).toBeLessThanOrEqual(await readVaultCount(rpc, MAINNET_FACTORY));
+    if (found === null) throw new Error("the factories are deployed");
+    // v2's list first, newest first; then v1's.
+    expect(found.vaults).toEqual([made[1], made[0], made[2]]);
+    expect(found).toMatchObject({ expected: 3n, complete: true, unreadable: 0 });
+    const listed = (await readVaultCount(rpc, MAINNET_FACTORY)) + (await readVaultCount(rpc, V1_MAINNET_FACTORY));
+    expect(BigInt(found.listed)).toBeLessThanOrEqual(listed);
 
     const asked = service.sent.slice(before);
     expect(asked.map((r) => r.method)).not.toContain("eth_getLogs");
@@ -145,14 +183,16 @@ describe("finding an owner's vaults from the factory's list", () => {
     const service = refusingLogs(rpc);
     const cache: VaultIdentityCache = new Map();
     const first = await searchVaultsFromFactoryList(service.rpc, owner.address, { cache });
+    if (first === null) throw new Error("the factories are deployed");
     const calls = service.sent.length;
     const second = await searchVaultsFromFactoryList(service.rpc, owner.address, { cache });
-    // The block, the count and the list again; no owner() at all.
-    expect(service.sent.length - calls).toBe(2 + Math.ceil((first?.listed ?? 0) / 1_000));
-    expect(second?.vaults).toEqual(first?.vaults);
+    // The block, the counts and each list again; no owner() at all.
+    const counts = [await readVaultCount(rpc, MAINNET_FACTORY), await readVaultCount(rpc, V1_MAINNET_FACTORY)].map(Number);
+    expect(service.sent.length - calls).toBe(factoryListSearchCost(counts, first.searched));
+    expect(second?.vaults).toEqual(first.vaults);
 
-    const logs = await searchAccountVaults(rpc, { chainId: CHAIN_ID, account: owner.address, factory: MAINNET_FACTORY });
+    const logs = await searchAccountVaults(rpc, { chainId: CHAIN_ID, account: owner.address });
     expect(logs?.complete).toBe(true);
-    expect(new Set(logs?.vaults)).toEqual(new Set(first?.vaults));
+    expect(new Set(logs?.vaults)).toEqual(new Set(first.vaults));
   });
 });

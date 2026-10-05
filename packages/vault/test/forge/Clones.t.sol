@@ -18,14 +18,14 @@ contract ArgsEcho {
     function viaExtcodecopy() external view returns (bytes memory data) {
         data = new bytes(VaultArgs.LENGTH);
         assembly ("memory-safe") {
-            extcodecopy(address(), add(data, 0x20), 0x2d, 112)
+            extcodecopy(address(), add(data, 0x20), 0x2d, 117)
         }
     }
 
     function viaCodecopy() external pure returns (bytes memory data) {
         data = new bytes(VaultArgs.LENGTH);
         assembly ("memory-safe") {
-            codecopy(add(data, 0x20), 0x2d, 112)
+            codecopy(add(data, 0x20), 0x2d, 117)
         }
     }
 }
@@ -58,7 +58,9 @@ contract ClonesTest is Test {
         uint64 startAt,
         uint32 interval,
         uint16 maxBuys,
-        uint16 maxSlippageBps
+        uint16 maxSlippageBps,
+        uint32 communityWindow,
+        uint8 turnBuckets
     ) public {
         Args memory a = Args({
             owner: owner,
@@ -70,10 +72,12 @@ contract ClonesTest is Test {
             startAt: startAt,
             interval: interval,
             maxBuys: maxBuys,
-            maxSlippageBps: maxSlippageBps
+            maxSlippageBps: maxSlippageBps,
+            communityWindow: communityWindow,
+            turnBuckets: turnBuckets
         });
         bytes memory args = VaultArgs.encode(a);
-        assertEq(args.length, VaultArgs.LENGTH, "112 bytes");
+        assertEq(args.length, VaultArgs.LENGTH, "117 bytes");
         assertEq(abi.encode(VaultArgs.decode(args)), abi.encode(a), "decode(encode(a)) == a");
 
         address clone = cloneOf(address(echo), args);
@@ -92,7 +96,9 @@ contract ClonesTest is Test {
             startAt: type(uint64).max,
             interval: 0,
             maxBuys: type(uint16).max,
-            maxSlippageBps: type(uint16).max
+            maxSlippageBps: 0,
+            communityWindow: type(uint32).max,
+            turnBuckets: 0
         });
         address clone = cloneOf(address(echo), VaultArgs.encode(a));
         assertEq(abi.encode(ArgsEcho(clone).echo()), abi.encode(a), "alternating extremes survive");
@@ -102,14 +108,16 @@ contract ClonesTest is Test {
     function test_encodeRefusesAFigureWiderThanItsField() public {
         Args memory a;
         bytes memory refused = abi.encodeWithSelector(VaultArgs.ArgOutOfRange.selector);
-        for (uint256 field; field < 6; field++) {
-            a = Args(address(1), address(2), address(3), address(4), 1, 1, 1, 1, 1, 1);
+        for (uint256 field; field < 8; field++) {
+            a = Args(address(1), address(2), address(3), address(4), 1, 1, 1, 1, 1, 1, 1, 1);
             if (field == 0) a.amountPerBuy = uint256(type(uint64).max) + 1;
             if (field == 1) a.keeperReward = uint256(type(uint64).max) + 1;
             if (field == 2) a.startAt = uint256(type(uint64).max) + 1;
             if (field == 3) a.interval = uint256(type(uint32).max) + 1;
             if (field == 4) a.maxBuys = uint256(type(uint16).max) + 1;
             if (field == 5) a.maxSlippageBps = uint256(type(uint16).max) + 1;
+            if (field == 6) a.communityWindow = uint256(type(uint32).max) + 1;
+            if (field == 7) a.turnBuckets = uint256(type(uint8).max) + 1;
             vm.expectRevert(refused);
             this.encode(a);
         }
@@ -119,19 +127,21 @@ contract ClonesTest is Test {
     /// implementation's — not the clone's. EXTCODECOPY of `address()` reads the clone's,
     /// where the arguments are.
     function test_codecopyReadsTheImplementationNotTheClone() public {
-        bytes memory args = VaultArgs.encode(Args(address(1), address(2), address(3), address(4), 5, 6, 7, 8, 9, 10));
+        bytes memory args =
+            VaultArgs.encode(Args(address(1), address(2), address(3), address(4), 5, 6, 7, 8, 9, 10, 11, 12));
         address clone = cloneOf(address(echo), args);
 
         assertEq(ArgsEcho(clone).viaExtcodecopy(), args, "EXTCODECOPY(address()) reads the clone's arguments");
         bytes memory wrong = ArgsEcho(clone).viaCodecopy();
         assertTrue(keccak256(wrong) != keccak256(args), "CODECOPY does not");
-        assertEq(wrong, slice(address(echo).code, 0x2d, 112), "it reads the implementation's own bytes");
+        assertEq(wrong, slice(address(echo).code, 0x2d, 117), "it reads the implementation's own bytes");
     }
 
     /// The clone is exactly the standard EIP-1167 proxy for its implementation, then its
     /// arguments; and CREATE2 puts it where `predict` says.
     function test_aCloneIsTheStandardProxyThenItsArguments() public {
-        bytes memory args = VaultArgs.encode(Args(address(1), address(2), address(3), address(4), 5, 6, 7, 8, 9, 10));
+        bytes memory args =
+            VaultArgs.encode(Args(address(1), address(2), address(3), address(4), 5, 6, 7, 8, 9, 10, 11, 12));
         bytes32 salt = keccak256("salt");
         address predicted = ClonesWithArgs.predict(address(echo), args, salt, address(this));
         address clone = ClonesWithArgs.deploy(address(echo), args, salt);
@@ -176,22 +186,26 @@ contract ImplementationTest is ForkTest {
         expectNotAClone(abi.encodeCall(SpdexDcaVault.fund, ()), 1 ether);
         expectNotAClone(abi.encodeCall(SpdexDcaVault.close, ()), 0);
         expectNotAClone(abi.encodeCall(SpdexDcaVault.rescue, (WETH)), 0);
-        expectNotAClone(abi.encodeCall(SpdexDcaVault.execute, ()), 0);
+        expectNotAClone(abi.encodeCall(SpdexDcaVault.execute, (stranger)), 0);
         expectNotAClone(abi.encodeCall(SpdexDcaVault.owner, ()), 0);
         expectNotAClone(abi.encodeCall(SpdexDcaVault.terms, ()), 0);
         expectNotAClone(abi.encodeCall(SpdexDcaVault.buysDone, ()), 0);
         expectNotAClone(abi.encodeCall(SpdexDcaVault.lastBuyAt, ()), 0);
         expectNotAClone(abi.encodeCall(SpdexDcaVault.closed, ()), 0);
+        expectNotAClone(abi.encodeCall(SpdexDcaVault.windowBuys, ()), 0);
         expectNotAClone(abi.encodeCall(SpdexDcaVault.totalOut, ()), 0);
         expectNotAClone(abi.encodeCall(SpdexDcaVault.status, ()), 0);
         expectNotAClone(abi.encodeCall(SpdexDcaVault.quote, ()), 0);
         expectNotAClone(abi.encodeCall(SpdexDcaVault.totalRewards, ()), 0);
         expectNotAClone("", 1 ether);
 
-        // What it does answer is true of every clone: its limits and the WETH it pays with.
+        // What it does answer is true of every clone: its limits, the WETH it pays with and
+        // the registry it asks.
         SpdexDcaVault implementation = SpdexDcaVault(payable(factory.implementation()));
         assertEq(implementation.MAX_FUNDING(), 0.5 ether, "the cap");
+        assertEq(implementation.MIN_COMMUNITY_WINDOW(), 60, "the shortest window");
         assertEq(address(implementation.weth()), WETH, "WETH");
+        assertEq(address(implementation.registry()), registry, "the registry");
     }
 
     /// The same calls through a factory clone all answer.
@@ -203,9 +217,10 @@ contract ImplementationTest is ForkTest {
         vault.status();
         vault.quote();
         vm.prank(keeper);
-        vault.execute();
+        vault.execute(keeper);
         assertEq(vault.buysDone(), 1, "bought");
+        assertEq(vault.windowBuys(), 1, "inside its window, by a holder");
         assertEq(vault.totalRewards(), t.keeperReward, "rewarded");
-        assertEq(address(vault).code.length, 45 + 112, "a 157-byte clone");
+        assertEq(address(vault).code.length, 45 + 117, "a 162-byte clone");
     }
 }

@@ -19,6 +19,13 @@
  * by importing it. It reads apps/web/src/lib/engine.ts as text instead, and
  * fails when the Engine constructs a Guard class this file doesn't cover, or
  * constructs one on a provider that isn't wrapped by `this.#checked(…)`.
+ *
+ * Covering a class is not covering its paths: a new public `check…` method,
+ * or a new kind of vault transaction inside `VaultGuard.check`, could forget
+ * the second opinion with every class here covered. So every public `check…`
+ * method of every Guard class must have a path here (or a stated reason it
+ * simulates nothing), and every kind of plan `VaultGuard` takes
+ * (`VAULT_PLAN_ACTIONS`) must too.
  */
 
 import { describe, expect, it } from "vitest";
@@ -26,6 +33,7 @@ import { ScriptedPairProvider, ScriptedSimulationProvider } from "@spdex/testing
 import { EthSimulateV1Provider, type SimLog, type SimulationOutcome, type SimulationProvider } from "@spdex/chain";
 import * as guards from "../../src/index.js";
 import { SecondOpinionPair } from "../../src/second-opinion.js";
+import { VAULT_PLAN_ACTIONS } from "../../src/vault.js";
 import { GUARD_PATHS, type GuardClass } from "./fixtures/guards.js";
 
 declare global {
@@ -94,6 +102,28 @@ describe("the Guard classes the Engine builds", () => {
     );
     expect(mutated).not.toBe(engineSource);
     expect(uncheckedGuards(mutated)).toEqual(["VaultGuard(new DefiniteSimulationProvider(this.#rpc)…"]);
+  });
+
+  it("have every public check method run here: a path that simulates can't be added without one", () => {
+    // Methods that simulate nothing, so have no second opinion to apply, each with why.
+    const simulateNothing: Record<string, string> = {
+      "TipGuard.checkSignature": "a signature request is judged on the static layer; the transaction it authorises is checked when sent",
+    };
+    const classes = { Guard: guards.Guard, TipGuard: guards.TipGuard, ScheduledBuyGuard: guards.ScheduledBuyGuard, VaultGuard: guards.VaultGuard };
+    const missing: string[] = [];
+    for (const [name, cls] of Object.entries(classes)) {
+      for (const method of Object.getOwnPropertyNames(cls.prototype).filter((m) => /^check/.test(m))) {
+        const path = `${name}.${method}`;
+        if (simulateNothing[path] !== undefined) continue;
+        if (!GUARD_PATHS.some((p) => p.name.startsWith(`${path} `))) missing.push(path);
+      }
+    }
+    expect(missing, "public check methods with no path through the second opinion").toEqual([]);
+  });
+
+  it("have every kind of plan VaultGuard checks run here: a new vault transaction can't skip the second opinion unnoticed", () => {
+    const missing = VAULT_PLAN_ACTIONS.filter((action) => !GUARD_PATHS.some((p) => p.guard === "VaultGuard" && p.vaultAction === action));
+    expect(missing, "VaultGuard plans with no path through the second opinion").toEqual([]);
   });
 
   it("are every Guard class the package exports", () => {

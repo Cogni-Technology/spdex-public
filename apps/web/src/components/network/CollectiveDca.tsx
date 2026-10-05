@@ -1,5 +1,7 @@
 /**
- * Collective DCA: what every auto-buy vault has done, from the chain alone.
+ * Collective DCA: what every auto-buy vault has done, from the chain alone:
+ * v1's and v2's factories together, and the share of v2 buys SPX holders made
+ * inside their community window, shown only when every v2 vault was read.
  *
  * Folded to its title until opened, and nothing is read before then:
  * opening it is what asks the network service, through

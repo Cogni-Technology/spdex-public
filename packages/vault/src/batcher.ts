@@ -3,56 +3,106 @@
  * a batch did or would do.
  *
  * `SpdexVaultBatcher` (contracts/SpdexVaultBatcher.sol) calls `execute` on
- * many vaults in one transaction and passes every reward on to the address its
- * caller names. It has no owner and no fee, and it is bound to one factory,
- * whose vaults alone it triggers. A keeper uses it, and so does the app's
+ * many vaults in one transaction. It has no owner and no fee. From v2 on it is
+ * bound to no factory: it calls each vault's `execute(rewardTo)` with the
+ * `rewardTo` its own caller names, so each vault pays that address directly
+ * and no WETH passes through the batcher at all — which is also what lets a
+ * vault check, inside its community window, the address really paid — and it
+ * measures what that address earned instead of trusting any vault's answer.
+ * So one batcher serves every release whose vaults take `rewardTo`
+ * (`BATCHERS`; `MAINNET_BATCHER` is the newest), and a batch may mix them. Its
+ * caller gives each vault's `execute` its gas (`gasPerVault`, at least
+ * `MIN_EXECUTE_GAS`). v1's (still on mainnet, still serving v1's vaults) is
+ * bound to v1's factory, calls `execute()`, is paid itself, and forwards every
+ * reward to `rewardTo` in the same transaction, sweeping any stray WETH with
+ * it; it takes no gas argument. A keeper uses them, and so does the app's
  * "Help run the network": a person's wallet sends one batch of due buys in
  * other people's vaults, privately, with every buy fee to that wallet, after
  * the Guard's batch path (`VaultGuard`, packages/guard/src/vault.ts) has
  * checked it at the exact gas it is signed with. The app also reads the
- * registry's batcher addresses to label a buy in a vault's history
- * "triggered in a batch".
+ * batchers' addresses to label a buy in a vault's history "triggered in a
+ * batch".
  *
- * What a batch did comes back in two shapes. A simulation (`eth_call`) either
- * returns — `decodeExecuteBatchResult` — or reverts `NothingBought` or
- * `TooLittle` with one reason per vault — `decodeBatchRevert`. A mined batch
- * says it in logs: one `Triggered` or `NotTriggered` per vault attempted, each
- * `Triggered` right after that vault's own `Bought`, and one `Batch` —
- * `decodeBatcherEvent`, joined to `decodeVaultEvent`'s by log index in
- * `joinBatchLogs`, the one place that join is written: the keeper reads its
- * receipts with it, and the report the chain's history.
+ * Every batcher has the same answers and the same refusals, so one decoder
+ * serves them all; the encoder goes by the batcher's source. What a batch did
+ * comes back in two shapes. A simulation (`eth_call`) either returns —
+ * `decodeExecuteBatchResult` — or reverts `NothingBought` or `TooLittle` with
+ * one reason per vault — `decodeBatchRevert`. A mined batch says it in logs:
+ * one `Triggered` or `NotTriggered` per vault attempted, each `Triggered`
+ * right after that vault's own `Bought`, and one `Batch` — `decodeBatcherEvent`,
+ * joined to `decodeVaultEvent`'s by log index in `joinBatchLogs`, the one
+ * place that join is written: the keeper reads its receipts with it, and the
+ * report the chain's history.
  */
 
 import { decodeErrorResult, decodeEventLog, decodeFunctionResult, encodeEventTopics, encodeFunctionData, keccak256, toBytes } from "viem";
 import type { Address, Hex } from "@spdex/core";
-import { BATCHER_ABI, BATCHER_SALT, DETERMINISTIC_DEPLOYER, VAULT_ABI, batcherAddress, batcherInitCode } from "./artifacts.js";
+import {
+  BATCHER_ABI,
+  BATCHER_LIMITS,
+  CURRENT_SOURCE,
+  DEPLOYMENTS,
+  DETERMINISTIC_DEPLOYER,
+  MAINNET_BATCHER,
+  MAINNET_DEPLOYMENT,
+  SOURCES,
+  V1_BATCHER_ABI,
+  batcherAddress,
+  batcherInitCode,
+  type SourceId,
+} from "./artifacts.js";
+import { SOURCE_IDS_NEWEST_FIRST, batcherSourceOf } from "./releases.js";
 // index.ts re-exports this file; decodeVaultEvent is only ever called, never used while the modules load.
 import { decodeVaultEvent, type RawLog, type VaultEvent } from "./index.js";
 
 /**
- * The one-time, permissionless deployment of the batcher bound to `factory`,
- * and the address it will land at. Anyone may send it, once the factory
- * exists: the batcher's constructor reads the factory's WETH, and refuses an
- * address with no code. Sent where the batcher already exists, it reverts and
- * changes nothing.
+ * The one-time, permissionless deployment of a listed batcher, and the address
+ * it lands at (`batcher`, by default the newest, `MAINNET_BATCHER`), from its
+ * own source: one bound to no factory is built for WETH, and needs nothing
+ * deployed before it; v1's is built for v1's factory, whose code its
+ * constructor checks. Anyone may send it. Sent where the batcher already
+ * exists, it reverts and changes nothing. Throws for a batcher spDEX does not
+ * list.
  */
-export function deployBatcherCall(factory: Address): { to: Address; data: Hex; value: 0n; batcher: Address } {
+export function deployBatcherCall(batcher: Address = MAINNET_BATCHER): { to: Address; data: Hex; value: 0n; batcher: Address } {
+  const at = lower(batcher);
+  const source = batcherSourceOf(at);
+  if (source === null) throw new RangeError(`${at} is not a batcher spDEX lists`);
+  const s = SOURCES[source];
+  const argument = s.features.sharedBatcher
+    ? lower(MAINNET_DEPLOYMENT.weth)
+    : (DEPLOYMENTS.find((d) => d.batcher === at)?.factory as Address);
+  const initCode = batcherInitCode(argument, source);
+  if (batcherAddress(argument, source) !== at) throw new RangeError(`${at} is not where source ${source} puts a batcher`);
   return {
     to: DETERMINISTIC_DEPLOYER,
     // The deterministic deployer's whole interface: 32 bytes of salt, then init code.
-    data: `0x${BATCHER_SALT.slice(2)}${batcherInitCode(factory).slice(2)}` as Hex,
+    data: `0x${s.batcherSalt.slice(2)}${initCode.slice(2)}` as Hex,
     value: 0n,
-    batcher: batcherAddress(factory),
+    batcher: at,
   };
 }
 
 /**
- * `executeBatch`'s calldata: trigger `vaults` in this order, send every reward
- * to `rewardTo`, and revert unless the rewards come to at least `minRewards`
- * (0 accepts any).
+ * `executeBatch`'s calldata for `batcher` (by default the newest): trigger
+ * `vaults` in this order, have every reward paid to `rewardTo`, and revert
+ * unless the rewards come to at least `minRewards` (0 accepts any). A batcher
+ * from v2 on also takes the gas each vault's `execute` is given: `gasPerVault`,
+ * by default its least, `MIN_EXECUTE_GAS` (`MAX_EXECUTE_GAS_LIMIT` in
+ * index.ts). v1's takes none, and gives each vault a fixed 400,000.
  */
-export function encodeExecuteBatch(vaults: readonly Address[], rewardTo: Address, minRewards: bigint): Hex {
-  return encodeFunctionData({ abi: BATCHER_ABI, functionName: "executeBatch", args: [vaults, rewardTo, minRewards] });
+export function encodeExecuteBatch(
+  vaults: readonly Address[],
+  rewardTo: Address,
+  minRewards: bigint,
+  options: { batcher?: Address; gasPerVault?: bigint } = {},
+): Hex {
+  const source = batcherSourceOf(options.batcher ?? MAINNET_BATCHER) ?? CURRENT_SOURCE;
+  if (!SOURCES[source].features.sharedBatcher) {
+    return encodeFunctionData({ abi: V1_BATCHER_ABI, functionName: "executeBatch", args: [vaults, rewardTo, minRewards] });
+  }
+  const gas = options.gasPerVault ?? BATCHER_LIMITS.MIN_EXECUTE_GAS;
+  return encodeFunctionData({ abi: BATCHER_ABI, functionName: "executeBatch", args: [vaults, rewardTo, minRewards, gas] });
 }
 
 /** bytes4 hex, lowercase; "0x00000000" means bought. */
@@ -149,22 +199,29 @@ const typeOf = (parameter: AbiParameter): string =>
     : parameter.type;
 
 /**
- * Every refusal a keeper will see from a batch, by selector: the vault's own
- * errors, the batcher's reason codes and errors, and the two Solidity raises.
- * The vault's and the batcher's `Reentrancy` share a selector and a name.
+ * Every refusal a keeper will see from a batch, by selector: every source's
+ * vault errors (v2's `NotEligible`, `NotYourTurn` and `BadRewardTo` among
+ * them), every batcher's reason codes and errors (v1's `NotFromFactory` and
+ * `RewardTransferFailed` too), the SPX holder registry's, and the two Solidity
+ * raises. The vault's and the batcher's `Reentrancy` share a selector and a
+ * name, and so do errors of the same name in different sources.
  */
 const REASON_NAMES: ReadonlyMap<string, string> = new Map<string, string>([
-  ...[...VAULT_ABI, ...BATCHER_ABI].flatMap((item) =>
-    item.type === "error" ? [[keccak256(toBytes(signatureOf(item))).slice(0, 10), item.name] as const] : [],
+  ...SOURCE_IDS_NEWEST_FIRST.flatMap((id) => {
+    const { vaultAbi, batcherAbi, registryAbi } = SOURCES[id];
+    return [...vaultAbi, ...batcherAbi, ...(registryAbi ?? [])] as readonly { type: string; name?: string; inputs?: readonly AbiParameter[] }[];
+  }).flatMap((item) =>
+    item.type === "error" ? [[keccak256(toBytes(signatureOf(item as { name: string; inputs: readonly AbiParameter[] }))).slice(0, 10), item.name!] as const] : [],
   ),
   ["0x08c379a0", "Error"],
   ["0x4e487b71", "Panic"],
 ]);
 
 /**
- * A reason code's name: "TooSoon", "PriceBelowFloor", "NotFromFactory",
- * "EmptyRevert", "EmptyReturn", "NotTried", "Error", "Panic" and the rest; null
- * for a selector this package does not know, which says nothing about why.
+ * A reason code's name: "TooSoon", "PriceBelowFloor", "NotEligible",
+ * "NotYourTurn", "NotFromFactory" (v1's batcher), "EmptyRevert", "EmptyReturn",
+ * "NotTried", "Error", "Panic" and the rest; null for a selector this package
+ * does not know, which says nothing about why.
  */
 export function reasonName(code: ReasonCode): string | null {
   return REASON_NAMES.get(code.toLowerCase()) ?? null;
@@ -175,6 +232,8 @@ export type BatcherEvent =
   | {
       name: "Batch";
       emitter: Address;
+      /** Which source's batcher `Batch` is laid out as: v1's carries `swept`. */
+      source: SourceId;
       logIndex: number;
       caller: Address;
       rewardTo: Address;
@@ -182,6 +241,11 @@ export type BatcherEvent =
       tried: bigint;
       bought: bigint;
       earned: bigint;
+      /**
+       * Stray WETH v1's batcher swept to `rewardTo` beside the rewards. Always 0
+       * from v2 on, and not as an unknown: its vaults pay `rewardTo` directly and
+       * it has no way to move WETH at all, so there is nothing it could sweep.
+       */
       swept: bigint;
     }
   | { name: "Triggered"; emitter: Address; logIndex: number; vault: Address; received: bigint; gasUsed: bigint }
@@ -195,19 +259,32 @@ export type BatcherEvent =
       gasUsed: bigint;
     };
 
-export const BATCHER_EVENT_TOPICS: { Batch: Hex; Triggered: Hex; NotTriggered: Hex } = {
-  Batch: encodeEventTopics({ abi: BATCHER_ABI, eventName: "Batch" })[0] as Hex,
-  Triggered: encodeEventTopics({ abi: BATCHER_ABI, eventName: "Triggered" })[0] as Hex,
-  NotTriggered: encodeEventTopics({ abi: BATCHER_ABI, eventName: "NotTriggered" })[0] as Hex,
-};
-
-const BATCHER_EVENTS_ABI = BATCHER_ABI.filter((item) => item.type === "event");
+const batcherTopic = (abi: readonly unknown[], eventName: string): Hex => encodeEventTopics({ abi: abi as never, eventName } as never)[0] as Hex;
 
 /**
- * A log `batcher` wrote, decoded; null for any log another contract wrote
- * (compared case-insensitively) or that is not one of its events. Anyone can
- * emit a log shaped like `Batch`, so only the batcher's own say what a batch
- * did, as `vaultsCreatedBy` does for the factory.
+ * Each source's batcher events by topic, so nothing that filters logs copies
+ * one by hand. `Batch` differs (v1's carries `swept`); `Triggered` and
+ * `NotTriggered` are the same in every one.
+ */
+export const BATCHER_EVENT_TOPICS = Object.fromEntries(
+  SOURCE_IDS_NEWEST_FIRST.map((id) => {
+    const abi = SOURCES[id].batcherAbi;
+    return [id, { Batch: batcherTopic(abi, "Batch"), Triggered: batcherTopic(abi, "Triggered"), NotTriggered: batcherTopic(abi, "NotTriggered") }];
+  }),
+) as Record<SourceId, { Batch: Hex; Triggered: Hex; NotTriggered: Hex }>;
+
+/** Any source's batcher ABI items; a new source's batcher ABI joins this union. */
+type AnyBatcherAbi = readonly ((typeof BATCHER_ABI)[number] | (typeof V1_BATCHER_ABI)[number])[];
+const BATCHER_EVENTS_ABI = Object.fromEntries(
+  SOURCE_IDS_NEWEST_FIRST.map((id) => [id, (SOURCES[id].batcherAbi as AnyBatcherAbi).filter((item) => item.type === "event")]),
+) as unknown as Record<SourceId, AnyBatcherAbi>;
+
+/**
+ * A log `batcher` wrote, decoded, for any source's batcher; null for any
+ * log another contract wrote (compared case-insensitively) or that is not one
+ * of its events. Anyone can emit a log shaped like `Batch`, so only the
+ * batcher's own say what a batch did, as `vaultsCreatedBy` does for the
+ * factory.
  *
  * A batcher's logs are read to be joined with the vaults' by log index, so one
  * without its `logIndex` — which every receipt and log query carries — is a
@@ -216,30 +293,34 @@ const BATCHER_EVENTS_ABI = BATCHER_ABI.filter((item) => item.type === "event");
 export function decodeBatcherEvent(batcher: Address, log: RawLog): BatcherEvent | null {
   const emitter = lower(log.address);
   if (emitter !== lower(batcher)) return null;
-  let decoded;
-  try {
-    decoded = decodeEventLog({ abi: BATCHER_EVENTS_ABI, topics: log.topics as [Hex, ...Hex[]], data: log.data as Hex, strict: true });
-  } catch {
-    return null;
+  for (const source of SOURCE_IDS_NEWEST_FIRST) {
+    let decoded;
+    try {
+      decoded = decodeEventLog({ abi: BATCHER_EVENTS_ABI[source], topics: log.topics as [Hex, ...Hex[]], data: log.data as Hex, strict: true });
+    } catch {
+      continue;
+    }
+    const logIndex = logIndexOf(log);
+    switch (decoded.eventName) {
+      case "Batch": {
+        const { caller, rewardTo, listed, tried, bought, earned } = decoded.args;
+        const swept = "swept" in decoded.args ? decoded.args.swept : 0n;
+        return { name: "Batch", emitter, source, logIndex, caller: lower(caller), rewardTo: lower(rewardTo), listed, tried, bought, earned, swept };
+      }
+      case "Triggered": {
+        const { vault, received, gasUsed } = decoded.args;
+        return { name: "Triggered", emitter, logIndex, vault: lower(vault), received, gasUsed };
+      }
+      case "NotTriggered": {
+        const { vault, reason, gasUsed } = decoded.args;
+        const code = reason.toLowerCase() as ReasonCode;
+        return { name: "NotTriggered", emitter, logIndex, vault: lower(vault), reason: code, reasonName: reasonName(code), gasUsed };
+      }
+      default:
+        return null;
+    }
   }
-  const logIndex = logIndexOf(log);
-  switch (decoded.eventName) {
-    case "Batch": {
-      const { caller, rewardTo, listed, tried, bought, earned, swept } = decoded.args;
-      return { name: "Batch", emitter, logIndex, caller: lower(caller), rewardTo: lower(rewardTo), listed, tried, bought, earned, swept };
-    }
-    case "Triggered": {
-      const { vault, received, gasUsed } = decoded.args;
-      return { name: "Triggered", emitter, logIndex, vault: lower(vault), received, gasUsed };
-    }
-    case "NotTriggered": {
-      const { vault, reason, gasUsed } = decoded.args;
-      const code = reason.toLowerCase() as ReasonCode;
-      return { name: "NotTriggered", emitter, logIndex, vault: lower(vault), reason: code, reasonName: reasonName(code), gasUsed };
-    }
-    default:
-      return null;
-  }
+  return null;
 }
 
 /** One `executeBatch` as its logs tell it: each vault it tried, in order, and the `Batch` that closed the run. */
@@ -257,7 +338,12 @@ export interface BatchRun {
  * they record: per batcher `isBatcher` accepts, a run of attempts closed by
  * each `Batch`. A `Triggered` is joined to the log right before it by log
  * index, and only a `Bought` emitted by the vault the `Triggered` names
- * counts: anyone can emit a log shaped like either.
+ * counts: anyone can emit a log shaped like either. From v2 on the vault's
+ * `Bought` names the batcher as `keeper` and the batch's `rewardTo` as its
+ * `rewardTo`; in a v1 batch, the batcher as both. A batcher bound to no factory
+ * calls whatever its caller lists, so a `Triggered` says only that something
+ * answered like a buy: a reader counts a buy from a vault a listed factory
+ * vouches for, never from the `Triggered` alone.
  */
 export function joinBatchLogs(logs: readonly RawLog[], isBatcher: (address: Address) => boolean): BatchRun[] {
   const byIndex = new Map(logs.flatMap((log) => (log.logIndex === undefined ? [] : [[Number(BigInt(log.logIndex)), log] as const])));

@@ -11,18 +11,28 @@ chain. Pick them yourself, or take the recommended preset and swap in one click.
 
 - **No contract anyone controls, no admin key, no protocol fee, no governance
   token.** spDEX routes across pools that already exist. Its optional
-  contracts — the auto-buy vault, its factory, and the batcher keepers use to
-  trigger many vaults at once — have no owner, no upgrade and no fee, so
-  nobody (us included) can change a vault or take what is in it. There is
-  nothing here to rug. They are unaudited, though; see below.
-- **A vault plan pays a fixed buy fee** — a fixed amount for network fees
-  plus 10% of that, never more than 0.69% of the buy, network cost included —
-  to whoever triggers each buy. The 0.69% is in the contract: no vault can be
-  created that pays more, so nobody who triggers buys, spDEX's developers
-  included, ever makes more than that on one. No contract takes it. spDEX's
-  developers may run a keeper that collects this fee on the buys it triggers;
-  nothing obliges them, or anyone, to trigger any buy. A swap you send
-  yourself pays spDEX nothing.
+  contracts — the auto-buy vault, its factory, the batcher keepers use to
+  trigger many vaults at once, and from v2 the SPX holder registry — have no
+  owner, no upgrade and no fee, so nobody (us included) can change a vault or
+  take what is in it. There is nothing here to rug. They are unaudited,
+  though; see below.
+- **A vault plan pays a fixed buy fee** for each buy it makes, to whoever
+  makes the buy or the address they name. For a plan made from v2 on, it is
+  a fixed amount for network fees plus 0.25% of the buy, never more than
+  0.69% of the buy, network cost included; a v1 plan keeps the fee it was
+  made with (the fixed amount plus 10% of that). The 0.69% is in the
+  contract: no vault can be created that pays more, so nobody who makes buys,
+  spDEX's developers included, ever makes more than that on one. No contract
+  takes it. spDEX's developers may run a keeper that collects this fee on the
+  buys it makes, as a community keeper like any other, with no special
+  treatment; nothing obliges them, or anyone, to make any buy. A swap you
+  send yourself pays spDEX nothing.
+- **SPX holders first.** For the first minutes after each buy of a v2 vault
+  falls due, its fee can be paid only to an SPX holder who makes the buy, or
+  back to you; after that, anyone may make it. Community keepers make other
+  people's buys and are paid for each one; holding 690 SPX is the entry bar.
+  The SPX stays in the holder's wallet: nothing is deposited or locked, and
+  nobody keeps a list. See "v2: SPX holders first" below.
 - **No backend, no telemetry, ever.** A static bundle you can pin to IPFS and
   serve yourself. Bring your own RPC.
 - **Pool-level control.** Not "use Uniswap" — *use the SPX/WETH 1% pool and
@@ -70,10 +80,13 @@ chain. Pick them yourself, or take the recommended preset and swap in one click.
     buy**, so you need to be there, with spDEX open.
   - **Set and forget** — a vault, no tab needed: it buys when triggered, with or without
     spDEX open. It is a small contract you create for one plan. It holds the
-    plan's budget and makes each buy itself, whoever triggers it. Anyone may
-    trigger a due buy and be paid its buy fee: a keeper bot, an open spDEX
-    tab, or a keeper you run yourself (`docs/KEEPER.md`, with Docker). None
-    is guaranteed to, and a buy time nobody triggers is skipped. It buys SPX
+    plan's budget and makes each buy itself, whoever triggers it. For the
+    first minutes after each buy falls due (its community window: 30 minutes
+    by default, or a quarter of the time between buys when that is shorter), the buy fee
+    can go only to an SPX holder who makes the buy, or back to you; after
+    that, anyone may make it and be paid its buy fee: a keeper bot, an open
+    spDEX tab, or a keeper you run yourself (`docs/KEEPER.md`, with Docker).
+    None is guaranteed to, and a buy time nobody triggers is skipped. It buys SPX
     only, paid with ETH, and refuses any buy whose price is more than your
     allowance (1%, 2% or 3%) worse than Uniswap v3's 10-minute average, or
     than the pool's price now if that is better for you. It is
@@ -117,16 +130,22 @@ chain. Pick them yourself, or take the recommended preset and swap in one click.
   transaction did, read through their own network service rather than taken
   from the card.
 - **Collective DCA.** What every auto-buy vault has done — buys, SPX
-  delivered, vaults still buying, ETH spent — read from the vault factory's
-  list at one block when you open the panel.
+  delivered, vaults still buying, ETH spent — read from both releases'
+  factory lists at one block when you open the panel, v1 and v2 counted
+  together, with the share of v2 buys paid to community keepers inside
+  their community windows.
 - **Help run the network.** A panel of its own at the foot of the page: make
-  the vault buys that are due right now from your own wallet, in one
+  the v2 vault buys that are due right now from your own wallet, in one
   transaction, and be paid their buy fees. Offered only with private sending,
   and only when the fees cover the network fee at the price your wallet
-  signs; the Guard checks the batch before your wallet is asked.
+  signs; the Guard checks the batch before your wallet is asked. A buy still
+  inside its community window is offered only to a wallet that is a
+  community keeper. Its **Community keeping** fold says whether yours is,
+  and for an ordinary account holding 690 SPX, **Prove my SPX** makes it
+  one: a single transaction, once every 30 days.
 - **Trust and exits** (Settings → Check this build). How to check the copy you
   are running, and how to do without spDEX: close a vault from any wallet, find
-  your vaults from the factory's list, run a keeper, keep your settings and
+  your vaults from the factories' lists, run a keeper, keep your settings and
   records. `docs/WALKAWAY.md` says the same.
 - **A page of tiles, and display settings.** The page is a short column of
   tiles, one open at a time, like spx6900.com's main menu, with a disclaimer on
@@ -174,7 +193,56 @@ worth attacking into refusing them.
 That claim is a test suite, not a promise: `pnpm verify` runs a red-team suite
 of deliberately malicious modules the Guard must block. You can run it yourself.
 The vault's rules are tests too: forge tests on a fork of mainnet, in the same
-gate, including the attacks its security reviews tried.
+gate, including the attacks its security reviews tried. So are the SPX holder
+registry's: real proofs recorded from mainnet must prove, and false, altered
+and fuzzed ones must not.
+
+## v2: SPX holders first
+
+v2 is the second release of the auto-buy contracts. It is built and tested,
+and `packages/vault/deployments.json` records the addresses this build
+deploys to; until those are deployed on Ethereum, v1's are the only ones
+live. v1 stays live and unchanged for good: its vaults, factory and batcher
+keep working as they always have, and the app goes on showing, funding,
+triggering and closing them. There is no move from v1 to v2; new plans are
+made on the latest release. `docs/V2_UPGRADE.md` is the design.
+
+What a v2 vault does differently:
+
+- **A community window on every buy.** For the first minutes after a buy
+  falls due — 30 by default, a quarter of the time between buys for plans
+  that buy more often than every two hours, never under a minute or over an
+  hour — its fee can be paid only to an SPX holder who makes the buy, or back
+  to you. After that, anyone can make it, as with v1. The window is fixed
+  when the plan is made; in Expert you can choose it.
+- **Community keepers.** Community keepers make other people's buys and are
+  paid for each one; holding 690 SPX is the entry bar. An address qualifies
+  while it held at least 690 SPX at the end of a block in the last 30 days,
+  proven from Ethereum's own records (a proof lasts 30 days, and anyone may
+  send one), and holds that much at the moment of the buy. It must be an ordinary account,
+  not a contract wallet. Nothing
+  is deposited or locked, the SPX stays in the holder's wallet, and there is
+  no list and no admin. A proof is one transaction of about 655,000 to
+  685,000 gas, about 0.00007 ETH at 0.1 gwei. The **Community keeping** fold
+  under Help run the network builds and sends it in the browser; a keeper
+  you run can do it for you (`docs/KEEPER.md`, "Becoming a community
+  keeper").
+- **Trigger now** works on a due buy inside its window too, and pays the
+  fee back to you.
+- **The buy fee** for new plans is a fixed amount for network fees plus
+  0.25% of the buy, never more than 0.69% of it. At ETH at $2,643.94 that is
+  $0.0345 on a $5 buy (the 0.69% ceiling), $0.22 on $69 (0.33%) and $1.77
+  on $690 (0.26%), where v1's default was about $0.053 on any buy from $7.71
+  up.
+- **Built to change without new contracts.** Nothing deployed can ever be
+  changed, so v2 ships what is most likely to be wanted next, unused: turns
+  among holders, which give each holder first claim on its share of buys
+  rather than letting the fastest win, if one keeper ever wins most of them
+  (`docs/V2_UPGRADE.md`, decisions 29 and 35). The batcher is bound to no
+  factory, so later releases share it, and the app and the keeper treat
+  releases as data, so a release with another market list is one line in
+  `deployments.json`. `docs/ARCHITECTURE.md`, "Upgradeability", says what
+  still needs new contracts.
 
 ## Quick start
 
@@ -192,8 +260,9 @@ pnpm dev:fund 0xYourAddress # play money on the fork
 
 `docs/TRY-IT.md` walks through it, wallet setup included.
 
-To run a keeper — the bot that triggers due vault buys, for their buy fees —
-see `docs/KEEPER.md`: five steps with Docker, and what it earns and costs.
+To run a keeper — the bot that makes due vault buys and is paid their buy
+fees — see `docs/KEEPER.md`: five steps with Docker, what it costs to run,
+and how to become a community keeper.
 
 Feedback goes to GitHub issues on spDEX's repository: a bug report or an
 idea, each a short form (`.github/ISSUE_TEMPLATE/`). The app records nothing
@@ -265,7 +334,10 @@ reasoning for each:
 - **Helping run the network needs private sending,** and a wallet that can
   sign without broadcasting. Someone may make the same buys first; then yours
   buys nothing, and costs nothing only if your relay drops failing
-  transactions. Your address becomes public as the one who made the buys.
+  transactions. Your address becomes public as the one who made the buys. It
+  offers v2 vaults' buys only (v1's are left to keepers and anyone else), and
+  a buy still inside its community window only to a community keeper's
+  wallet.
 - **A plan you confirm yourself runs only while spDEX is open in a tab.**
   There is no server to run it anywhere else. A buy time that passes while no
   tab is open — or while the browser has paused a background one, which
@@ -276,10 +348,14 @@ reasoning for each:
 - **A vault plan runs only while somebody triggers it.** Still no server: a
   buy happens when a keeper bot, an open spDEX tab or a keeper you run sends
   the transaction, for the buy fee. Nobody promises to, and a buy time nobody
-  triggers is skipped. The fee is close to a buy's network cost and never above
-  0.69% of the buy, so it does not cover a buy made on its own; keepers that
-  put many vaults' buys into one transaction, through the batcher, pay less
-  per buy, and the form says when a plan's buys are too small even for them.
+  triggers is skipped. On a v2 vault, a buy inside its community window waits
+  for a community keeper, or for you; if none makes it, anyone may once the
+  window ends, and a window is never longer than an hour. The fee is priced
+  for a buy that shares its transaction with others, and never above 0.69%
+  of the buy, so on small buys it does not cover a buy made on its own;
+  keepers that put many vaults' buys into one transaction, through
+  the batcher, pay less per buy, and the form says when a plan's buys are too
+  small even for them.
   The vault's record is on chain, so it counts the
   same from any browser. So is the vault itself: with your wallet connected,
   spDEX looks on chain for the vaults you created and lists any your plans
@@ -288,11 +364,31 @@ reasoning for each:
   says how many it found when that isn't all of them.
 - **The vault is unaudited.** That is why you can put at most 0.5 ETH into one
   (per vault; nothing limits how many one account creates), and why the app
-  marks it Unaudited wherever it offers it. A keeper can choose when a due buy
-  happens and trade around it, within your allowance. It cannot change where
-  the tokens go or how much is spent. There is no pause: closing it, which
-  returns everything to you, is the only stop. It buys SPX only, because the
-  factory's list of markets is fixed; another list would be another factory.
+  marks it Unaudited wherever it offers it. v2 is more code than v1 — the
+  community window, and the SPX holder registry with its proof verifier
+  (Optimism's, vendored unchanged) — and is unaudited too, under the same
+  cap. A keeper can choose when a due buy happens and trade around it,
+  within your allowance; on a v2 vault it also names who is paid the fee.
+  It cannot change where the tokens go or how much is spent. There is no
+  pause: closing it, which returns everything to you, is the only stop. It
+  buys SPX only, because the factory's list of markets is fixed; another
+  list would be another factory.
+- **The community window filters past holding, not people.** It favours
+  addresses that held 690 SPX at the end of a block in the last 30 days and
+  hold it at the moment of the buy. SPX borrowed inside the buy's own
+  transaction (Uniswap v4 lends it for no fee) passes that second check, so
+  an address can buy 690 SPX, prove it, sell it back and stay eligible for 30
+  days. A bot that holds 690 SPX is a community keeper like anyone, and
+  inside a window the fastest community keeper wins. At worst a fee goes to
+  someone the window was meant to keep out, as any fee could in v1; nothing
+  in it reaches a vault's money (`docs/THREAT-MODEL.md`, "The community
+  window and the SPX holder registry").
+- **Proving is public.** A proof says on chain, for good, that an address
+  held at least 690 SPX, and a keeper's buys put the address it is paid at
+  beside the key that sent them. Prove a wallet kept for the SPX, not your
+  main one. Proving needs a network service that answers `eth_getProof`;
+  where yours doesn't, the panel shows the requests to run against another
+  service and checks what you paste against your own.
 - **A plan you confirm needs you there at every buy time.** Your wallet never
   opens by itself, so a due buy waits for you to confirm it, and one not
   confirmed before its buy time ends is skipped. A vault is the way to buy
@@ -317,12 +413,12 @@ reasoning for each:
   is no rate for them on Ethereum that spDEX could read without asking a
   third party.
 - **Stats count vaults only.** Collective DCA counts auto-buy vaults made by
-  spDEX's factory, from any app. One-time swaps and plans you confirm are
+  spDEX's factories, from any app. One-time swaps and plans you confirm are
   ordinary Uniswap trades with no spDEX marker, so nothing can count them —
   and a marker would label every address that used spDEX. Owners are
-  addresses, not people. Where the factory isn't deployed (any network but
-  Ethereum, where it has been since block 26,100,366), the panel says so
-  rather than showing zeros.
+  addresses, not people. Where a release's factory isn't deployed (v1's has
+  been on Ethereum since block 26,100,366; v2's isn't yet, nor either on any
+  other network), the panel says so rather than showing zeros.
 - **Your records are this browser's.** One-time swaps and tips are recorded
   from this version on, in this browser only; a cleared browser or another
   computer has none of them, and the app says what it leaves out rather than

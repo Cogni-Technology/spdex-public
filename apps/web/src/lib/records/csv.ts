@@ -11,6 +11,13 @@
  * - **Values at the time are per row.** There is no average cost, no price
  *   per SPX, anywhere: a tax tool works those out from the rows, and spDEX
  *   keeps no price history.
+ * - **Who made a vault buy** is in the last four columns, added after the
+ *   first twenty so a reader of those reads them as before: `made_by` (`you`,
+ *   `fee-returned-to-you`, `community-keeper`, `anyone-after-window`, or
+ *   `keeper` for a v1 vault), `caller` (the address that called `execute`:
+ *   the owner, a keeper, or a batcher calling for whoever sent it the batch),
+ *   `fee_paid_to` and `due_since_utc` (v2 vaults only; blank for v1, whose
+ *   log doesn't say them).
  * - **Safe to open.** Plan names are anyone's text, and arrive in shared
  *   settings links, so a cell a spreadsheet would run as a formula (one
  *   starting with `=`, `+`, `-`, `@`, a tab or a line break) is written with
@@ -22,6 +29,7 @@
  */
 
 import type { Address } from "@spdex/core";
+import type { BuyMaker } from "@spdex/vault";
 import { checksumAddress } from "../culture/contract.js";
 import { tokenFor } from "../dca/format.js";
 import type { CurrencyCode } from "../money/pricing.js";
@@ -52,7 +60,20 @@ export const CSV_COLUMNS = [
   "plan",
   "tx_hash",
   "block",
+  "made_by",
+  "caller",
+  "fee_paid_to",
+  "due_since_utc",
 ] as const;
+
+/** `made_by`, for software: the words Your activity says, as fixed values. */
+const MADE_BY: Readonly<Record<BuyMaker, string>> = {
+  owner: "you",
+  returned: "fee-returned-to-you",
+  community: "community-keeper",
+  open: "anyone-after-window",
+  caller: "keeper",
+};
 
 /** Every digit, "." for the mark, no grouping, trailing zeros dropped: "0.0081589", "6912.3", "20". */
 export function machineAmount(value: bigint, decimals: number): string {
@@ -111,6 +132,19 @@ function rowCells(row: RecordRow, currency: CurrencyCode, tokens: readonly Token
     row.planLabel ?? "",
     row.hashes.join(" "),
     row.block === null ? "" : row.block.toString(),
+    ...vaultBuyCells(row),
+  ];
+}
+
+/** A vault buy's `made_by`, `caller`, `fee_paid_to` and `due_since_utc`; blank for any other row, and for what isn't known. */
+function vaultBuyCells(row: RecordRow): string[] {
+  const buy = row.vaultBuy;
+  if (buy === undefined) return ["", "", "", ""];
+  return [
+    buy.maker === null ? "" : MADE_BY[buy.maker],
+    buy.caller === null ? "" : checksumAddress(buy.caller),
+    buy.rewardTo === null ? "" : checksumAddress(buy.rewardTo),
+    buy.dueSince === null ? "" : utcDate(buy.dueSince),
   ];
 }
 

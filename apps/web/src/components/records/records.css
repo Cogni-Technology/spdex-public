@@ -157,7 +157,10 @@
   white-space: nowrap;
 }
 
-/* The badge, and a missing wallet, get a line of their own under the figures. */
+/* Who made a vault buy: the app's quiet hint, on the line under the figures. */
+.spdex-activity__maker { font-size: 0.71875rem; color: var(--text-faint); }
+
+/* The badge, a missing wallet and who made a vault buy get a line of their own under the figures. */
 .spdex-activity__extra {
   grid-column: 1 / 6;
   grid-row: 2;

@@ -83,22 +83,36 @@ export const GUARD_VIOLATIONS = [
   // ── Vaults ──
   /**
    * A vault transaction is not the one its intent describes: another target,
-   * calldata, value, chain or plan; a vault the factory did not make for this
-   * account on these terms; a creation with a buy fee above the app's
-   * ceiling; or, in simulation, a vault created for someone else, on other
-   * terms, somewhere else, or a buy credited to another caller.
+   * calldata, value, chain or plan; a vault the claimed release's factory did
+   * not make for this account on these terms; a creation sent anywhere but
+   * the latest release's factory (v1's included), or with a buy fee above the
+   * app's ceiling or a community window outside the factory's bounds; a buy
+   * fee paid to anyone but the vault's owner (a v2 Trigger now, which only
+   * the owner sends) or the account (a v1 trigger, a batch); a proof sent
+   * anywhere but the release's SPX holder registry, with ether, or whose
+   * header isn't the block it names, or whose block the person's own network
+   * service doesn't know by that hash (or couldn't be asked: `detail.failure`).
+   * In simulation: a vault created for someone else, on other terms,
+   * somewhere else; a buy made by another caller, paid to someone else, or
+   * logged in the other release's layout; a batch whose figures aren't its
+   * vaults', or that pays the batcher; a proof recorded for another holder or
+   * block, or not as the registry records one.
    */
   "VAULT_MALFORMED",
   /**
    * Simulation shows a vault transaction falling short: the vault not holding
    * what was paid in, the owner receiving less than the buy's floor or less
-   * than a closing vault held, or the caller less than its reward.
+   * than a closing vault held, the buy fee's recipient (`rewardTo`) less than
+   * its fee, or a proof the registry records nothing for.
    */
   "VAULT_NOT_DELIVERED",
   /**
-   * A batch of vault buys would pay its caller WETH that someone sent the
-   * batcher (`Batch.swept` above zero). Nobody can say whose it is, so the
-   * caller is never made its receiver. `detail.swept` is the amount, in wei.
+   * A batch of vault buys would move money out of the batcher, which holds
+   * and passes on nothing: v2's vaults pay the account directly, and its
+   * batcher has no way to pay anyone, so whatever leaves it is money nobody
+   * can say whose it is, and the caller is never made its receiver.
+   * `detail.token` and `detail.amount` say what left it; for WETH,
+   * `detail.swept` is the amount too, in wei.
    */
   "VAULT_BATCH_UNACCOUNTED",
 

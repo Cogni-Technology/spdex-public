@@ -38,8 +38,10 @@ function refusal(env: Record<string, string>, files: Record<string, string> = {}
 describe("keeperEnvFrom", () => {
   it("defaults to a dry run with the stranger's policy", () => {
     const env = parse({});
-    expect(env).toMatchObject({ rpcUrl: null, sendUrl: null, sendPrivate: false, keeperKey: null, rewardTo: null, vaults: null, logLevel: "info", deployBatcher: false });
+    expect(env).toMatchObject({ rpcUrl: null, sendUrl: null, sendPrivate: false, keeperKey: null, rewardTo: null, vaults: null, logLevel: "info", deployBatcher: false, prove: false, gasPerVault: 400_000n });
     expect(env.policy).toEqual(DEFAULT_KEEPER_POLICY);
+    // A week's warning before the key's ether runs out at its recent spend.
+    expect(env.policy.minRunwayDays).toBe(7);
     expect(env.watchdogSeconds).toBe(300);
     expect(env.heartbeatLogSeconds).toBe(300);
   });
@@ -74,6 +76,9 @@ describe("keeperEnvFrom", () => {
       SPDEX_KEEPER_HEARTBEAT_LOG_SECONDS: "60",
       SPDEX_KEEPER_HEARTBEAT_URL: "https://hc-ping.com/abc",
       SPDEX_KEEPER_DEPLOY_BATCHER: "1",
+      SPDEX_KEEPER_PROVE: "1",
+      SPDEX_KEEPER_MIN_RUNWAY_DAYS: "10",
+      SPDEX_KEEPER_GAS_PER_VAULT: "550000",
       SPDEX_KEEPER_GIT_SHA: "e31a86e",
     });
     expect(env).toMatchObject({
@@ -92,6 +97,8 @@ describe("keeperEnvFrom", () => {
       // Five intervals, at least 300.
       watchdogSeconds: 300,
       deployBatcher: true,
+      prove: true,
+      gasPerVault: 550_000n,
       gitSha: "e31a86e",
     });
     expect(env.policy).toEqual({
@@ -111,6 +118,7 @@ describe("keeperEnvFrom", () => {
       confirmations: 1,
       maxHeadLagSeconds: 0n,
       minEth: 50_000_000_000_000_000n,
+      minRunwayDays: 10,
       intervalSeconds: 30,
     });
     // Every URL is one the log's redactor removes.
@@ -175,6 +183,13 @@ describe("keeperEnvFrom", () => {
       [{ SPDEX_KEEPER_CONFIRMATIONS: "0" }, "SPDEX_KEEPER_CONFIRMATIONS", "must be"],
       [{ SPDEX_KEEPER_DEADLINE_SHARE: "1.5" }, "SPDEX_KEEPER_DEADLINE_SHARE", "1.5"],
       [{ SPDEX_KEEPER_INTERVAL_SECONDS: "5" }, "SPDEX_KEEPER_INTERVAL_SECONDS", "5"],
+      [{ SPDEX_KEEPER_PROVE: "yes" }, "SPDEX_KEEPER_PROVE", "yes"],
+      [{ SPDEX_KEEPER_MIN_RUNWAY_DAYS: "-1" }, "SPDEX_KEEPER_MIN_RUNWAY_DAYS", "-1"],
+      [{ SPDEX_KEEPER_MIN_RUNWAY_DAYS: "3.5" }, "SPDEX_KEEPER_MIN_RUNWAY_DAYS", "3.5"],
+      // The batcher's own bounds on each vault's gas: below the least an honest buy needs, or above its sanity bound.
+      [{ SPDEX_KEEPER_GAS_PER_VAULT: "399999" }, "SPDEX_KEEPER_GAS_PER_VAULT", "399999"],
+      [{ SPDEX_KEEPER_GAS_PER_VAULT: "10000001" }, "SPDEX_KEEPER_GAS_PER_VAULT", "10000001"],
+      [{ SPDEX_KEEPER_GAS_PER_VAULT: "4e5" }, "SPDEX_KEEPER_GAS_PER_VAULT", "4e5"],
     ];
     for (const [env, variable, value] of cases) {
       const { variable: named, message } = refusal(env);
@@ -184,6 +199,14 @@ describe("keeperEnvFrom", () => {
     }
   });
 
+  it("turns the runway warning off with 0 days, and proving on only with 1", () => {
+    expect(parse({ SPDEX_KEEPER_MIN_RUNWAY_DAYS: "0" }).policy.minRunwayDays).toBe(0);
+    expect(parse({ SPDEX_KEEPER_PROVE: "0" }).prove).toBe(false);
+    expect(parse({ SPDEX_KEEPER_PROVE: "true" }).prove).toBe(true);
+    // Both are settings this keeper reads, never "unknown".
+    expect(parse({ SPDEX_KEEPER_PROVE: "1", SPDEX_KEEPER_MIN_RUNWAY_DAYS: "3" }).unknown).toEqual([]);
+  });
+
   it("counts every *_URL in the environment as a secret, the fork's included", () => {
     const env = parse({ SPDEX_FORK_RPC_URL: "https://archive.example/v2/SECRETSECRETSECRET", SPDEX_KEEPER_RPC_URL: "http://127.0.0.1:8545" });
     expect(env.secrets.urls).toEqual(expect.arrayContaining(["https://archive.example/v2/SECRETSECRETSECRET", "http://127.0.0.1:8545"]));
@@ -191,7 +214,7 @@ describe("keeperEnvFrom", () => {
 });
 
 describe("keeperConfig", () => {
-  it("fills in the registry, mainnet's WETH, no allowlist, a public send and the default policy", () => {
+  it("fills in the registry, mainnet's WETH, no allowlist, a public send, no proving and the default policy", () => {
     const config = keeperConfig({ chainId: 690069 });
     expect(config).toEqual({
       chainId: 690069,
@@ -200,8 +223,15 @@ describe("keeperConfig", () => {
       rewardTo: null,
       vaults: null,
       privateSend: false,
+      prove: false,
+      gasPerVault: 400_000n,
       policy: DEFAULT_KEEPER_POLICY,
     });
+    // Both releases, each batch to its own batcher; v2's with its SPX holder registry.
+    expect(config.deployments.map((d) => [d.id, d.registry === null])).toEqual([
+      ["v1", true],
+      ["v2", false],
+    ]);
     expect(keeperAddress(config)).toBeNull();
     expect(rewardToOf(config)).toBeNull();
   });
@@ -219,5 +249,7 @@ describe("keeperConfig", () => {
     expect(keeperConfig({ chainId: 1, policy: { maxBatchGas: 16_000_000n } }).policy.maxBatchGas).toBe(16_000_000n);
     expect(() => keeperConfig({ chainId: 1, policy: { maxVaultsPerBatch: 151 } })).toThrow(KeeperConfigError);
     expect(() => keeperConfig({ chainId: 1, policy: { confirmations: 0 } })).toThrow(KeeperConfigError);
+    expect(() => keeperConfig({ chainId: 1, policy: { minRunwayDays: -1 } })).toThrow(KeeperConfigError);
+    expect(() => keeperConfig({ chainId: 1, policy: { minRunwayDays: Number.NaN } })).toThrow(KeeperConfigError);
   });
 });

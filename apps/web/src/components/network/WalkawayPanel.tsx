@@ -5,7 +5,7 @@
  * says how to leave it: every line is something a person can do with only
  * their wallet, a block explorer or a copy of the source. Folded to its title
  * until opened, like the other panels few need on a given visit, and nothing
- * here reads the chain until "Find my vaults from the factory's list" is
+ * here reads the chain until "Find my vaults from the factories' lists" is
  * pressed.
  *
  * Vault lines appear only where vaults are offered. The addresses in them are
@@ -195,9 +195,9 @@ type Search =
   | { kind: "failed"; text: string };
 
 /**
- * "Find my vaults from the factory's list": every listed vault's owner, read
- * and compared here. For network services that cap log searches, where the
- * auto-buy panel's own search stops short.
+ * "Find my vaults from the factories' lists": every listed vault's owner, v1's
+ * and v2's, read and compared here. For network services that cap log
+ * searches, where the auto-buy panel's own search stops short.
  */
 function VaultSearch({
   rpc,
@@ -218,8 +218,11 @@ function VaultSearch({
   useEffect(() => setSearch({ kind: "idle" }), [rpc, chainId, account]);
 
   const known = rpc === null ? null : cachedPlatformRead(rpc);
-  const listed = known?.deployments.reduce((sum, d) => sum + (d.state === "read" ? Number(d.count) : 0), 0) ?? null;
-  const cost = listed === null || rpc === null ? null : factoryListSearchCost(listed, Math.min(listed, vaultIdentities(rpc, chainId).size));
+  // Each factory's list, newest release first, as the search reads them: a page per list.
+  const lists = known === null ? null : [...known.deployments].reverse().map((d) => (d.state === "read" ? Number(d.count) : 0));
+  const listed = lists === null ? null : lists.reduce((sum, count) => sum + count, 0);
+  const cost =
+    lists === null || listed === null || rpc === null ? null : factoryListSearchCost(lists, Math.min(listed, vaultIdentities(rpc, chainId).size));
   const blocked = rpc === null ? "Choose a network service first." : account === null ? "Connect a wallet to look for its vaults." : null;
 
   const run = () => {
@@ -241,7 +244,7 @@ function VaultSearch({
         const now = current.current;
         if (now.rpc !== asked.rpc || now.chainId !== asked.chainId || now.account !== asked.account) return;
         const said = error instanceof Error ? error.message : String(error);
-        setSearch({ kind: "failed", text: `Couldn't read the factory's list (${said.slice(0, 160).replace(/\.$/, "")}).` });
+        setSearch({ kind: "failed", text: `Couldn't read a factory's list (${said.slice(0, 160).replace(/\.$/, "")}).` });
       },
     );
   };
@@ -250,7 +253,7 @@ function VaultSearch({
     <div className="spdex-network-search" data-testid="vault-search-list">
       <div className="spdex-actions">
         <Button variant="ghost" testId="vault-search-list-run" disabled={blocked !== null || search.kind === "searching"} onClick={run}>
-          {search.kind === "searching" ? "Reading the factory's list…" : "Find my vaults from the factory's list"}
+          {search.kind === "searching" ? "Reading the factories' lists…" : "Find my vaults from the factories' lists"}
         </Button>
       </div>
       <p className="spdex-field__hint" data-testid="vault-search-list-hint">
@@ -265,7 +268,7 @@ function SearchResult({ search, chainId }: { search: Search; chainId: number }) 
   if (search.kind === "not-deployed") {
     return (
       <p className="spdex-network-line" data-testid="vault-search-list-result">
-        The vault factory isn't deployed on {networkName(chainId)}, so there are no vaults to find here.
+        spDEX&apos;s vault factories aren&apos;t deployed on {networkName(chainId)}, so there are no vaults to find here.
       </p>
     );
   }
@@ -283,8 +286,8 @@ function SearchResult({ search, chainId }: { search: Search; chainId: number }) 
     <div data-testid="vault-search-list-result" data-found={found} data-complete={String(result.complete)}>
       <p className="spdex-network-line">
         {found === 0
-          ? `None of the ${formatCount(BigInt(result.searched))} vaults searched on the factory's list ${result.unreadable === 0 ? "is" : "that could be read is"} owned by the connected wallet.`
-          : `${found === 1 ? "1 vault" : `${formatCount(BigInt(found))} vaults`} on the factory's list ${found === 1 ? "is" : "are"} owned by the connected wallet${found === 1 ? ":" : ", newest first:"}`}
+          ? `None of the ${formatCount(BigInt(result.searched))} vaults searched on the factories' lists ${result.unreadable === 0 ? "is" : "that could be read is"} owned by the connected wallet.`
+          : `${found === 1 ? "1 vault" : `${formatCount(BigInt(found))} vaults`} on the factories' lists ${found === 1 ? "is" : "are"} owned by the connected wallet${found === 1 ? ":" : ", newest first:"}`}
       </p>
       {found > 0 ? (
         <ul className="spdex-network-addresses">
@@ -298,7 +301,7 @@ function SearchResult({ search, chainId }: { search: Search; chainId: number }) 
       {result.searched < result.listed ? (
         <p className="spdex-network-warn" data-testid="vault-search-list-newest">
           Searched the newest {formatCount(BigInt(result.searched))} of the {formatCount(BigInt(result.listed))} vaults on the
-          factory&apos;s list, so an older vault of yours may not be here.
+          factories&apos; lists, so an older vault of yours may not be here.
         </p>
       ) : null}
       {result.unreadable > 0 ? (

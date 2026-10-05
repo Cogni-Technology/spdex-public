@@ -44,13 +44,16 @@ import {
   SecondOpinionPair,
   TipGuard,
   VaultGuard,
+  readBlockHash,
   secondOpinionHost,
   type GuardInput,
   type VaultBatchIntent,
   type VaultBatchTxPlan,
+  type VaultProveIntent,
+  type VaultProveTxPlan,
   type VaultTxPlan,
 } from "@spdex/guard";
-import { batcherAddress, encodeExecuteBatch } from "@spdex/vault";
+import { encodeExecuteBatch, encodeProve } from "@spdex/vault";
 import { SCHEDULER_MODULE_ID, TIPLIST_MODULE_ID } from "@spdex/config";
 import {
   candidatesFromQuotes,
@@ -764,13 +767,21 @@ export class Engine {
     this.#vaultGuard ??= new VaultGuard(this.#checked(new DefiniteSimulationProvider(this.#rpc)), {
       chainId: this.config.chainId,
       requireSimulation: this.config.guard.requireSimulation,
+      // A proof's block hash, read by the Guard itself from this service: what
+      // ties a proof to the chain's block rather than to one that only agrees
+      // with itself. Without it every proof is refused.
+      blockHash: (blockNumber) => readBlockHash(this.#rpc, blockNumber),
     });
     return this.#vaultGuard;
   }
 
-  /** The batcher bound to the vault Guard's factory: the one contract a batch of vault buys may be sent to. */
+  /**
+   * The batcher the vault Guard sends batches through: the one contract a
+   * batch of vault buys may be sent to. Bound to no factory, it serves every
+   * release whose vaults take `rewardTo`; the Guard's, not worked out here.
+   */
   get vaultBatcher(): Address {
-    return batcherAddress(this.#vaults().factory).toLowerCase() as Address;
+    return this.#vaults().batcher.toLowerCase() as Address;
   }
 
   /**
@@ -780,7 +791,8 @@ export class Engine {
    *
    * The plan is built here from the intent, never taken from a caller, so the
    * call that is checked is the call that is signed; the vault Guard proves
-   * it goes to the factory's own batcher, pays the account and nobody else,
+   * it goes to the listed batcher, that each vault in it is a listed factory's
+   * (`intent.claims`), pays the account and nobody else,
    * passes on nothing it can't account for, and is never signed unchecked.
    */
   async checkVaultBatch(intent: VaultBatchIntent): Promise<{ plan: VaultBatchTxPlan; verdict: GuardVerdict }> {
@@ -790,10 +802,45 @@ export class Engine {
       calls: [
         {
           to: this.vaultBatcher,
-          data: encodeExecuteBatch(intent.vaults, intent.rewardTo, intent.minRewards),
+          data: encodeExecuteBatch(intent.vaults, intent.rewardTo, intent.minRewards, { batcher: this.vaultBatcher }),
           value: 0n,
           gas: intent.gasLimit,
           gasPrice: intent.gasPrice,
+        },
+      ],
+    };
+    return { plan, verdict: await this.#vaults().check(plan) };
+  }
+
+  /** The SPX holder registry the vault Guard's factory names: the one contract a proof of SPX held may be sent to. */
+  get vaultRegistry(): Address {
+    return this.#vaults().registry;
+  }
+
+  /**
+   * Check a proof that an address held 690 SPX (Community keeping, under
+   * Help run the network), and return the one call it may be sent as.
+   *
+   * As for a batch, the plan is built here from the intent, never taken from
+   * a caller: one call to the registry, no ether, exactly `encodeProve` of
+   * the intent. The vault Guard ties the header to the block's hash as this
+   * service reports it, and simulates the rest. A proof moves no money, so it
+   * may be signed `unverified`; it never goes anywhere but the registry.
+   */
+  async checkVaultProof(intent: VaultProveIntent): Promise<{ plan: VaultProveTxPlan; verdict: GuardVerdict }> {
+    const plan: VaultProveTxPlan = {
+      version: 1,
+      intent,
+      calls: [
+        {
+          to: this.vaultRegistry,
+          data: encodeProve({
+            holder: intent.holder,
+            header: intent.header,
+            accountProof: [...intent.accountProof],
+            storageProof: [...intent.storageProof],
+          }),
+          value: 0n,
         },
       ],
     };

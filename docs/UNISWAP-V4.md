@@ -72,6 +72,26 @@ e2e suite trades WETH→SPX against v2 repeatedly, and a session's worth of that
 moves v2's price by a few percent — enough to make v4 look like it wins at
 small sizes, which it does not.
 
+## What the PoolManager lends
+
+Every v4 pool's tokens sit in the one `PoolManager`, and it lends any token it
+holds within a transaction for no fee: `unlock`, then `take`, and `sync` and
+`settle` to pay it back before `unlock` returns. spDEX doesn't route through
+v4, but this matters to the v2 vaults' community window: SPX borrowed this way
+meets the SPX holder registry's balance check at the moment of a buy, though
+never its proof, which reads a block's final state. Measured at the pinned
+block, with nothing dealt to v4 (`packages/vault/test/forge/FlashBorrow.t.sol`):
+
+| | |
+|---|---|
+| SPX the `PoolManager` held | 119,766 (the registry asks for 690). Every v4 pool's SPX is held there; the pools found at that block are the two ETH/SPX pools above |
+| v4's fee for lending 690 SPX within a transaction | 0: it ended holding exactly what it held before |
+| A batch of five in-window vault buys, sent by a proven holder holding its own SPX | 831,336 gas |
+| The same batch from the same holder holding none, the 690 SPX borrowed from v4 around it | 873,984 gas: 42,648 more, about 8,500 a buy |
+
+What that means, and why the contracts don't try to stop it, is in
+`docs/THREAT-MODEL.md`, "The community window and the SPX holder registry".
+
 ## Why discovery is harder than v3
 
 v3 pools are enumerable without an indexer: the address is `CREATE2` over

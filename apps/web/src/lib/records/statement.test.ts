@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { NATIVE_TOKEN, TOKENS } from "@spdex/chain";
 import type { Address } from "@spdex/core";
-import { isBuyFeesRow, kindLabel, statementOf, valuesLine } from "./statement.js";
+import { isBuyFeesRow, kindLabel, makerText, statementOf, statementWhat, valuesLine } from "./statement.js";
 import type { RecordRow } from "./types.js";
 
 const ME = "0xab5801a7d398351b8be11c439e05c5b3259aec9b" as Address;
@@ -117,5 +117,39 @@ describe("buy fees received for other people's vault buys", () => {
     expect(isBuyFeesRow(fees)).toBe(true);
     expect(kindLabel(fees.kind)).toBe("Buy fees earned");
     for (const kind of ["swap", "tip", "plan-buy", "vault-buy"] as const) expect(isBuyFeesRow({ kind })).toBe(false);
+  });
+});
+
+describe("who made a vault buy, on screen and on paper", () => {
+  const KEEPER = "0x4444444444444444444444444444444444444444" as Address;
+  const vaultBuy = (maker: NonNullable<RecordRow["vaultBuy"]>["maker"]) =>
+    row({ kind: "vault-buy", planLabel: "Daily SPX", vaultBuy: { caller: KEEPER, rewardTo: KEEPER, dueSince: 900, maker } });
+
+  it("says it in a few words for each maker, and nothing it can't tell", () => {
+    expect(makerText(vaultBuy("owner"))).toBe("Made by you");
+    expect(makerText(vaultBuy("returned"))).toBe("Made by someone else; the fee came back to you");
+    expect(makerText(vaultBuy("community"))).toBe("Made by a community keeper");
+    expect(makerText(vaultBuy("open"))).toBe("Made after the community window, when anyone could");
+    expect(makerText(vaultBuy(null))).toBeNull();
+    expect(makerText(row({}))).toBeNull();
+    // A v1 buy (no rewardTo) gets no line: v2 is what asks who made a buy,
+    // and a v1 log names only the caller — the batcher, for the owner's own
+    // Help run batch, which "Made by a keeper" got wrong.
+    const v1 = (maker: NonNullable<RecordRow["vaultBuy"]>["maker"]) =>
+      row({ kind: "vault-buy", planLabel: "Daily SPX", vaultBuy: { caller: KEEPER, rewardTo: null, dueSince: null, maker } });
+    expect(makerText(v1("caller"))).toBeNull();
+    expect(makerText(v1("owner"))).toBeNull();
+    expect(statementWhat(v1("caller"))).toBe("Vault buy · Daily SPX");
+    // Paid work, and the fee is a fee: never the contract's word for it, never a rate of return.
+    for (const maker of ["owner", "returned", "community", "open"] as const) {
+      expect(makerText(vaultBuy(maker))).not.toMatch(/reward|APR|APY|yield|earn/i);
+    }
+  });
+
+  it("adds it to the statement's What, after the plan", () => {
+    expect(statementWhat(vaultBuy("community"))).toBe("Vault buy · Daily SPX · made by a community keeper");
+    expect(statementWhat(vaultBuy(null))).toBe("Vault buy · Daily SPX");
+    expect(statementWhat(row({}))).toBe("Swap");
+    expect(statementWhat(row({ kind: "plan-buy", planLabel: "Weekly" }))).toBe("Plan buy · Weekly");
   });
 });

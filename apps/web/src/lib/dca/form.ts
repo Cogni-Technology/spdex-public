@@ -37,7 +37,15 @@ import type { AmountInput, FiatAmount, Pricing, RateSnapshot } from "../money/pr
 import { readTime, resolveField } from "../money/resolve.js";
 import { formatAmount, TOKEN_LIST, tradedAs, type TokenInfo } from "../tokens.js";
 import { ethUpTo, everyLabel, timesLabel } from "./format.js";
-import { DEFAULT_VAULT_SLIPPAGE_BPS, VAULT_CAP_WEI, vaultCapText, vaultCosts, vaultPlanProblems, type VaultCosts } from "./vault.js";
+import {
+  DEFAULT_VAULT_SLIPPAGE_BPS,
+  defaultVaultWindow,
+  VAULT_CAP_WEI,
+  vaultCapText,
+  vaultCosts,
+  vaultPlanProblems,
+  type VaultCosts,
+} from "./vault.js";
 
 /** The most a transaction with these fees can pay per gas. */
 function feeCap(fees: PreparedFees): bigint {
@@ -647,16 +655,22 @@ export function fixedAmountWhy(parsed: ParsedForm, signer: DcaSigner): string | 
  * that it pays with ETH and buys SPX, that each buy is large enough to pay a
  * buy fee (`MIN_VAULT_BUY_WEI`), and every term the vault factory checks — the
  * 0.5 ETH you can put in included, which counts each buy's fee: `buyFee`'s,
- * the one the form shows, which depends on the amount alone. For the vault
- * choice, beside `validationError`, which covers the rest.
+ * the one the form shows, which depends on the amount alone — and the
+ * community window: Expert's choice (`communityWindow`), else the plan's
+ * default (`defaultVaultWindow`). A window chosen in Expert and then left
+ * above a quarter of a shorter interval is refused here, never clamped. For
+ * the vault choice, beside `validationError`, which covers the rest.
  */
 export function vaultFormError(
   parsed: ParsedForm,
   maxSlippageBps = DEFAULT_VAULT_SLIPPAGE_BPS,
   money?: MoneyView,
+  communityWindow?: number | null,
 ): string | null {
   if (parsed.sell === null || parsed.buy === null || parsed.amountPerBuy <= 0n) return null;
   if (parsed.intervalSeconds === null || parsed.maxBuys === null) return null;
+  const window = communityWindow ?? defaultVaultWindow(parsed.intervalSeconds);
+  if (window === null) return null;
   const problems = vaultPlanProblems(
     {
       sell: parsed.sell.address,
@@ -668,7 +682,7 @@ export function vaultFormError(
       // form checks everything else.
       startAt: 0,
     },
-    { maxSlippageBps, keeperReward: buyFee(parsed.amountPerBuy).reward },
+    { maxSlippageBps, keeperReward: buyFee(parsed.amountPerBuy).reward, communityWindow: window },
     0,
   );
   const problem = problems[0] ?? null;

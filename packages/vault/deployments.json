@@ -1,9 +1,33 @@
-[
-  {
-    "id": "v1",
-    "factory": "0xe4a1410a9ee0833d41e7514306e65ad729b7199e",
-    "batcher": "0xc5ce65451dd5fc99d08eb18440b06f2bcca3c5a0",
-    "factoryBlock": 26100366,
-    "batcherBlock": 26100368
-  }
-]
+{
+  "releases": [
+    {
+      "id": "v1",
+      "factory": "0xe4a1410a9ee0833d41e7514306e65ad729b7199e",
+      "batcher": "0xc5ce65451dd5fc99d08eb18440b06f2bcca3c5a0",
+      "factoryBlock": 26100366,
+      "batcherBlock": 26100368
+    },
+    {
+      "id": "v2",
+      "source": "v2",
+      "factory": "0xbf40f0fb41e5ee1194173545749d80c4651bac32",
+      "registry": "0x2c7f732a453fe0a4a65f36ac564ff16007b5610d",
+      "markets": [
+        {
+          "tokenOut": "0xe0f63a424a4439cbe457d80e4f4b51ad25b2c56c",
+          "pair": "0x52c77b0cb827afbad022e6d6caf2c44452edbc39",
+          "oraclePool": "0x7c706586679af2ba6d1a9fc2da9c6af59883fdd3"
+        }
+      ],
+      "factoryBlock": null,
+      "registryBlock": null
+    }
+  ],
+  "batchers": [
+    {
+      "source": "v2",
+      "batcher": "0xd1f8327aa8398997bd88165f420412c703ebfed0",
+      "batcherBlock": null
+    }
+  ]
+}

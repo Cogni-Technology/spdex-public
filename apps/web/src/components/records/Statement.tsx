@@ -20,10 +20,10 @@ import { formatFiat } from "../../lib/money/format.js";
 import type { CurrencyCode } from "../../lib/money/pricing.js";
 import {
   isBuyFeesRow,
-  kindLabel,
   legExact,
   legSymbol,
   sideTotalText,
+  statementWhat,
   utcMinute,
   type StatementData,
 } from "../../lib/records/statement.js";
@@ -125,10 +125,7 @@ export function Statement({
                 {utcMinute(row.at.unix).replace(" UTC", "")}
                 {row.at.source === "device" ? " *" : ""}
               </td>
-              <td>
-                {kindLabel(row.kind)}
-                {row.planLabel === undefined ? "" : ` · ${row.planLabel}`}
-              </td>
+              <td>{statementWhat(row)}</td>
               <td className="spdex-statement__num">{isBuyFeesRow(row) ? "" : amount(row.sold)}</td>
               <td className="spdex-statement__num">
                 {row.kind === "tip" ? "" : isBuyFeesRow(row) ? `${amount(row.bought)} received in buy fees` : amount(row.bought)}

@@ -9,7 +9,9 @@
  *   (`#receipt=`, or any block explorer). The address only if its owner
  *   ticks the box; the hash leads to it anyway, and the dialog says so.
  * - **What it never says:** a price, a value in any currency, a gain or loss,
- *   or the SPX6900 logo and site art. spDEX's own name is set as text.
+ *   or the SPX6900 logo and site art. spDEX's own name is set as text. Nor
+ *   who made a vault buy (a community keeper, the owner, anyone after the
+ *   window): `#receipt=` doesn't check it, and Your activity says it.
  * - **Only real buys:** a card can be made only of SPX a pool or a vault
  *   delivered and the chain measured (`canCard` in stack.ts). A transfer
  *   from a friend can't become a "Bought" card.

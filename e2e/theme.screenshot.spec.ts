@@ -23,7 +23,7 @@
 
 import type { Page } from "@playwright/test";
 import { test, expect, FORK_URL, forkRpc, fundWeth, installWallet, seedConfig, watchRpc, openSection, openTile } from "./fixtures.js";
-import { encodeClose, encodeCreateVault, vaultBudget, vaultsCreatedBy, type VaultPlan } from "../packages/vault/src/index.js";
+import { DEFAULT_TURN_BUCKETS, encodeClose, encodeCreateVault, vaultBudget, vaultsCreatedBy, type VaultPlan } from "../packages/vault/src/index.js";
 import { ETHER, FACTORY, closeLeftoverVaults, fillVaultForm, freshAccount, history, keyWallet, planCard, sendAs } from "./vaults.js";
 
 const ONE_WETH = 10n ** 18n;
@@ -288,6 +288,8 @@ for (const { mode, suffix } of MODES) {
         startAt: BigInt(latest.timestamp),
         keeperReward: (ETHER * 69n) / 1_000_000n,
         maxSlippageBps: 200n,
+        communityWindow: 1_800n,
+        turnBuckets: DEFAULT_TURN_BUCKETS,
       });
       await made(plan(2n), true);
       const closed = await made(plan(1n), false);

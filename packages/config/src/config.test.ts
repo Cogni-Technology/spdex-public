@@ -653,7 +653,10 @@ describe("the auto-buy feature", () => {
     expect(feature.detail).toMatch(/at most 0\.5 ETH/);
     expect(feature.detail).toMatch(/closing it is the only way to stop it: switching Auto-buy off here doesn't/);
     expect(feature.detail).toMatch(/No one is guaranteed to trigger it/);
-    expect(feature.cost).toMatch(/buy fee from its budget — a fixed amount for network fees plus 10% of that, never more than 0\.69% of the buy/);
+    expect(feature.detail).toMatch(/when anyone triggers a due buy, SPX holders first\./);
+    expect(feature.cost).toMatch(/buy fee from its budget — a fixed amount for network fees plus 0\.25% of the buy, never more than 0\.69% of the buy/);
+    expect(feature.cost).toMatch(/to the keeper that makes each buy\.$/);
+    expect(feature.cost).not.toMatch(/10% of that/);
   });
 
   it("switches on the master switch and the scheduler module together", () => {

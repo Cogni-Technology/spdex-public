@@ -124,7 +124,8 @@ const STAGES = [
   },
   {
     id: "redteam",
-    description: "Guard refuses malicious plans: swaps, tips, scheduled buys, budget transfers, vault transactions",
+    description:
+      "Guard refuses malicious plans: swaps, tips, scheduled buys, budget transfers, vault transactions (a v2 Trigger now paying anyone but the owner; a holder proof sent anywhere but the release's registry, with ether, or for the wrong block), and Help run batches paying anyone but the account",
     cmd: ["pnpm", "vitest", "run", "--project", "redteam", "--passWithNoTests"],
   },
   {
@@ -150,7 +151,7 @@ const STAGES = [
   {
     id: "contracts",
     description:
-      "The vault contracts: artifacts.ts (the factory and batcher addresses) matches a fresh build, deployments.json ends with it, and the forge fork tests pass",
+      "The vault contracts: artifacts.ts (the registry, factory and batcher addresses) matches a fresh build, every frozen source still builds to the releases deployments.json records, deployments.json lists this build's release and batcher, and the forge fork tests pass, the SPX holder registry's real, false and fuzzed proofs included",
     // Last, after the stages that run against the shared local fork. The forge
     // tests fork mainnet from the archive endpoint themselves, every test its
     // own fork, and the local fork fetches any state it hasn't seen from that

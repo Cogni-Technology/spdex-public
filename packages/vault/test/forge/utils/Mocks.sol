@@ -94,7 +94,7 @@ contract ReenteringToken {
     function transfer(address to, uint256 amount) external returns (bool) {
         if (address(target) != address(0) && to == target.owner()) {
             attempts++;
-            try target.execute() {
+            try target.execute(address(this)) {
                 lastRevert = "";
             } catch (bytes memory reason) {
                 lastRevert = reason;
@@ -162,7 +162,7 @@ contract OwnerContract {
         if (msg.sender != address(vault)) return;
         if (mode == Mode.Refuse) revert("no ether, thanks");
         if (mode == Mode.Reenter) {
-            try vault.execute() {}
+            try vault.execute(address(this)) {}
             catch (bytes memory reason) {
                 executeRevert = reason;
             }
@@ -178,14 +178,16 @@ contract OwnerContract {
     }
 }
 
-/// A keeper contract that triggers twice in one transaction, to show the window rule
-/// holds within a transaction as well as across them.
+/// A keeper contract that triggers twice in one transaction, both times paying `rewardTo`,
+/// to show the one-buy-a-slot rule holds within a transaction as well as across them. (It
+/// names an account rather than itself: inside a community window only an account may be
+/// paid as a holder, since a contract can pass a fee on to anyone.)
 contract DoubleKeeper {
     bytes public secondRevert;
 
-    function run(SpdexDcaVault vault) external {
-        vault.execute();
-        try vault.execute() {}
+    function run(SpdexDcaVault vault, address rewardTo) external {
+        vault.execute(rewardTo);
+        try vault.execute(rewardTo) {}
         catch (bytes memory reason) {
             secondRevert = reason;
         }
@@ -222,52 +224,38 @@ interface IPairReads {
 }
 
 // ─── For the batcher ─────────────────────────────────────────────────────────────
-// Vault-shaped contracts that answer `execute()` the ways a batcher must survive, vouched
-// for by a factory that vouches for whatever a test tells it to. A batcher bound to that
-// factory then triggers them as it would a real vault, which is what these tests need:
-// the batcher trusts the factory's word and nothing else.
+// Vault-shaped contracts that answer `execute(rewardTo)` the ways a batcher must survive.
+// The batcher is bound to no factory and calls whatever its caller lists, so it triggers
+// these as it would a real vault, which is what these tests need: it trusts no answer, and
+// measures what `rewardTo` received instead.
 
 interface IWETHMock {
     function balanceOf(address) external view returns (uint256);
     function transfer(address, uint256) external returns (bool);
 }
 
-/// A factory that vouches for exactly the addresses a test lists, with mainnet's WETH.
-contract MockVaultFactory {
-    address public immutable weth;
-    mapping(address => bool) public isVault;
-
-    constructor(address weth_) {
-        weth = weth_;
-    }
-
-    function vouch(address vault) external {
-        isVault[vault] = true;
-    }
-}
-
 /// Records the gas it was given, as `gasleft()` on entry, and answers like a buy with no
-/// reward: 32 bytes.
+/// reward: 64 bytes.
 contract GasProbe {
     uint256 public seen;
 
-    function execute() external returns (uint256) {
+    function execute(address) external returns (uint256 received, uint256 reward) {
         seen = gasleft();
-        return 1;
+        return (1, 0);
     }
 }
 
 /// Spends every unit of gas it is given, as a vault built to drain keepers would: `INVALID`
 /// takes all of it and leaves no revert data.
 contract GasBurner {
-    function execute() external pure returns (uint256) {
+    function execute(address) external pure returns (uint256, uint256) {
         assembly {
             invalid()
         }
     }
 }
 
-/// Pays its caller a WETH reward and answers like a buy, as a real vault does: the batcher's
+/// Pays `rewardTo` a WETH reward and answers like a buy, as a real vault does: the batcher's
 /// revenue without an oracle or a market. Holds whatever WETH a test gives it.
 contract PayingVault {
     IWETHMock public immutable weth;
@@ -278,8 +266,38 @@ contract PayingVault {
         reward = reward_;
     }
 
+    function execute(address rewardTo) external returns (uint256, uint256) {
+        require(weth.transfer(rewardTo, reward), "reward");
+        return (7, reward);
+    }
+}
+
+/// Answers like a buy and claims a reward far larger than any it pays, which is none: what
+/// `earned` would have believed when it added up the rewards the vaults reported.
+contract LyingVault {
+    function execute(address) external pure returns (uint256, uint256) {
+        return (1, 1_000 ether);
+    }
+}
+
+/// Has v1's `execute()`, taking nothing, and no `execute(address)`: a v1 vault, as the
+/// batcher meets one. The call finds no such function and reverts with nothing.
+contract V1ShapedVault {
+    uint256 public calls;
+
     function execute() external returns (uint256) {
-        require(weth.transfer(msg.sender, reward), "reward");
+        calls++;
+        return 7;
+    }
+}
+
+/// Answers a success with one word, as a v1 vault's `execute()` did, and pays nothing: 32
+/// bytes is not a v2 vault's buy, however it looks.
+contract OneWordVault {
+    uint256 public calls;
+
+    function execute(address) external returns (uint256) {
+        calls++;
         return 7;
     }
 }
@@ -310,7 +328,7 @@ contract ReturnBomb {
         size = size_;
     }
 
-    function execute() external view returns (uint256) {
+    function execute(address) external view returns (uint256, uint256) {
         uint256 n = size;
         assembly {
             mstore(0, shl(224, 0xdeadbeef))
@@ -320,12 +338,12 @@ contract ReturnBomb {
 }
 
 interface IBatcherMock {
-    function executeBatch(address[] calldata vaults, address rewardTo, uint256 minRewards)
+    function executeBatch(address[] calldata vaults, address rewardTo, uint256 minRewards, uint256 gasPerVault)
         external
         returns (uint256 bought, uint256 earned, bytes4[] memory reasons);
 }
 
-/// A vouched-for vault whose `execute` calls the batcher back, naming its own `rewardTo`, to
+/// A vault in a batch whose `execute` calls the batcher back, naming its own `rewardTo`, to
 /// take the rewards collected so far; it records what the batcher answered, then pays and
 /// answers like a buy so the outer batch goes on.
 contract ReenteringVault {
@@ -345,13 +363,87 @@ contract ReenteringVault {
         attacker = attacker_;
     }
 
-    function execute() external returns (uint256) {
-        try batcher.executeBatch(targets, attacker, 0) {
+    function execute(address rewardTo) external returns (uint256, uint256) {
+        try batcher.executeBatch(targets, attacker, 0, 400_000) {
             innerRevert = "";
         } catch (bytes memory reason) {
             innerRevert = reason;
         }
-        require(weth.transfer(msg.sender, 1), "reward");
-        return 1;
+        require(weth.transfer(rewardTo, 1), "reward");
+        return (1, 1);
+    }
+}
+
+// ─── For the community window ────────────────────────────────────────────────────
+
+interface ISpxBalance {
+    function balanceOf(address) external view returns (uint256);
+}
+
+/// A stand-in for the SPX holder registry, answering `isEligible` however a test sets it,
+/// one holder at a time: yes or no, as the real registry answers, or one of the ways a
+/// broken registry could, which a vault must count as "not eligible".
+///
+/// A holder answered `Yes` also has its SPX balance read, as the real registry reads it
+/// (and ignored), so that a buy checked against this costs what one checked against the
+/// real registry does: one slot of the registry's own and one SPX balance. The answer is
+/// one slot per holder for the same reason: the real registry's `validUntil`.
+contract MockRegistry {
+    enum Answer {
+        No,
+        Yes,
+        /// Reverts, with a reason.
+        Revert,
+        /// Spends every unit of gas it is given.
+        BurnGas,
+        /// Succeeds with no answer at all.
+        Empty,
+        /// Succeeds with 31 bytes: `true`'s word less its first byte, which a reader that
+        /// padded a short answer would take for `true`.
+        Short,
+        /// Succeeds with the word 2: not a boolean.
+        Two
+    }
+
+    ISpxBalance public immutable spx;
+    mapping(address holder => Answer) public answerFor;
+
+    constructor(address spx_) {
+        spx = ISpxBalance(spx_);
+    }
+
+    function setEligible(address holder, bool eligible) external {
+        answerFor[holder] = eligible ? Answer.Yes : Answer.No;
+    }
+
+    function setAnswer(address holder, Answer answer) external {
+        answerFor[holder] = answer;
+    }
+
+    function isEligible(address holder) external view returns (bool) {
+        Answer answer = answerFor[holder];
+        if (answer == Answer.Yes) {
+            spx.balanceOf(holder);
+            return true;
+        }
+        if (answer == Answer.No) return false;
+        if (answer == Answer.Revert) revert("registry is broken");
+        assembly {
+            switch answer
+            case 3 {
+                invalid()
+            }
+            case 4 {
+                return(0, 0)
+            }
+            case 5 {
+                mstore(0, 1)
+                return(1, 31)
+            }
+            default {
+                mstore(0, 2)
+                return(0, 32)
+            }
+        }
     }
 }

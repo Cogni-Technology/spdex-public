@@ -33,6 +33,7 @@ import {
   kindLabel,
   legAmount,
   legSymbol,
+  makerText,
   RECORDS_FOOTNOTE,
   rowDay,
   statementOf,
@@ -314,6 +315,8 @@ function ActivityRow({
     onMakeCard !== undefined && !tip && row.bought.measured && row.bought.amount !== null && row.bought.token.toLowerCase() === SPX;
   const when = new Date(row.at.unix * 1000).toLocaleString(locale, { dateStyle: "medium", timeStyle: "short" });
   const plan = row.planLabel === undefined ? "" : ` · “${row.planLabel}”${row.buyIndex ? `, buy ${row.buyIndex.n} of ${row.buyIndex.of}` : ""}`;
+  // A vault buy's maker: one quiet line under the figures, said only when known.
+  const maker = makerText(row);
 
   return (
     <li className="spdex-activity__row" data-testid="activity-row" data-kind={row.kind} data-hash={last}>
@@ -321,7 +324,7 @@ function ActivityRow({
         <span className="spdex-activity__date" title={`${when}. ${dateSourceText(row)}`}>
           {rowDay(row.at.unix, nowMs, locale)}
         </span>
-        <span className="spdex-activity__what" title={`${kindLabel(row.kind)}${plan}`}>
+        <span className="spdex-activity__what" title={`${kindLabel(row.kind)}${plan}${maker === null ? "" : `. ${maker}.`}`}>
           {kindLabel(row.kind)}
         </span>
         <span className="spdex-activity__bought">
@@ -380,6 +383,11 @@ function ActivityRow({
         ) : null}
       </span>
       <span className="spdex-activity__extra">
+        {maker !== null ? (
+          <span className="spdex-activity__maker" data-testid="activity-maker" data-maker={row.vaultBuy?.maker ?? undefined}>
+            {maker}
+          </span>
+        ) : null}
         {row.account === null ? (
           <span className="spdex-activity__nowallet" data-testid="activity-no-wallet">
             Wallet unknown: left out of totals

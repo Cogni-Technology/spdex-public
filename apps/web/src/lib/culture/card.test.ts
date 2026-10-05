@@ -73,6 +73,21 @@ describe("what the card says", () => {
     expect(text.meta).toBe("Sep 17, 2026 UTC · Ethereum");
   });
 
+  it("says nothing of who made a vault buy, which the receipt view can't check: the card is the same whoever made it", () => {
+    const KEEPER = "0x4444444444444444444444444444444444444444" as Address;
+    const vaultRow = (maker: NonNullable<RecordRow["vaultBuy"]>["maker"]): RecordRow => ({
+      ...ROW,
+      kind: "vault-buy",
+      vaultBuy: { caller: KEEPER, rewardTo: maker === "owner" ? OWNER : KEEPER, dueSince: AT - 60, maker },
+    });
+    const plain = cardText({ ...ROW, kind: "vault-buy" }, CHOICES, null);
+    for (const maker of ["owner", "returned", "community", "open", "caller", null] as const) {
+      const text = cardText(vaultRow(maker), { ...CHOICES, showAddress: true }, null);
+      expect(text).toEqual({ ...plain, address: checksumAddress(OWNER) });
+      expect(Object.values(text).join(" ")).not.toMatch(/keeper|window|made by|0x4444/i);
+    }
+  });
+
   it("carries the last transaction, the one that delivered, and a fragment the receipt view reads", () => {
     const approval = `0x${"aa".repeat(32)}` as Hex;
     const withApproval = { ...ROW, hashes: [approval, HASH] };

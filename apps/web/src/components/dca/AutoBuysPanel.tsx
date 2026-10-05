@@ -61,7 +61,7 @@ export function subtitleFor(tabPlans: number, vaults: number): string {
 
 /** What running your own keeper takes, behind the one-line offer. */
 const OWN_KEEPER_TIP =
-  "docs/KEEPER.md in spDEX's source sets one up with Docker. It needs a computer that stays on and ETH for network fees: it pays each buy's network fee and is paid its buy fee. Out of the box it makes only buys whose fee covers that; the guide shows how to have it pay the difference for your own vaults.";
+  "docs/KEEPER.md in spDEX's source sets one up with Docker. It needs a computer that stays on and ETH for network fees: it pays each buy's network fee and is paid its buy fee. Out of the box it makes only buys whose fee covers that; the guide shows how to have it pay the difference for your own vaults. Inside a buy's community window it is paid only when it names a community keeper (an account proven to hold 690 SPX) or the vault's owner.";
 
 export function AutoBuysPanel({ autoBuy, deps, open, onSummary }: { autoBuy: AutoBuy; deps: AutoBuyDeps } & TilePanelProps) {
   const { config, account, walletChainOk } = deps;

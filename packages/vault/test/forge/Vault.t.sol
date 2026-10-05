@@ -9,7 +9,7 @@ import {SpdexVaultFactory} from "../../contracts/SpdexVaultFactory.sol";
 import {TickMath} from "../../contracts/libraries/TickMath.sol";
 import {OracleQuote} from "../../contracts/libraries/OracleQuote.sol";
 
-/// `Bought`'s data: everything but the indexed slot and keeper.
+/// `Bought`'s data: everything but the indexed slot, keeper and rewardTo.
 struct BoughtData {
     uint256 amountIn;
     uint256 amountOut;
@@ -17,6 +17,7 @@ struct BoughtData {
     uint256 floorOut;
     uint256 buyNumber;
     uint256 oracleDepth;
+    uint256 dueSince;
 }
 
 /// The vault — a clone the factory created — against real SPX/WETH markets at the pinned
@@ -29,12 +30,24 @@ contract VaultTest is ForkTest {
         vm.prank(owner);
         vm.expectRevert(reason);
         factory.createVault(
-            t.marketIndex, t.amountPerBuy, t.interval, t.maxBuys, t.startAt, t.keeperReward, t.maxSlippageBps
+            t.marketIndex,
+            t.amountPerBuy,
+            t.interval,
+            t.maxBuys,
+            t.startAt,
+            t.keeperReward,
+            t.maxSlippageBps,
+            t.communityWindow,
+            t.turnBuckets
         );
     }
 
     function err(bytes4 selector) internal pure returns (bytes memory) {
         return abi.encodeWithSelector(selector);
+    }
+
+    function windowOutOfRange(uint256 window, uint256 maximum) internal pure returns (bytes memory) {
+        return abi.encodeWithSelector(SpdexVaultFactory.CommunityWindowOutOfRange.selector, window, 60, maximum);
     }
 
     function test_createAcceptsSoundTerms() public {
@@ -124,6 +137,17 @@ contract VaultTest is ForkTest {
         expectCreateRevert(t, err(SpdexVaultFactory.StartOutOfRange.selector));
         t.startAt = block.timestamp - 366 days - 1;
         expectCreateRevert(t, err(SpdexVaultFactory.StartOutOfRange.selector));
+
+        // The community window: none is not allowed, nor under a minute, nor over a quarter
+        // of the interval (15 minutes here). Its every edge is `Window.t.sol`'s.
+        // The refusal names the window and both bounds.
+        t = defaultPlan();
+        t.communityWindow = 0;
+        expectCreateRevert(t, windowOutOfRange(0, 900));
+        t.communityWindow = 59;
+        expectCreateRevert(t, windowOutOfRange(59, 900));
+        t.communityWindow = t.interval / 4 + 1;
+        expectCreateRevert(t, windowOutOfRange(901, 900));
     }
 
     function test_createAcceptsEveryBoundary() public {
@@ -131,6 +155,7 @@ contract VaultTest is ForkTest {
         t.keeperReward = (t.amountPerBuy * 69) / 10_000; // exactly 0.69%
         t.maxBuys = 49; // 49 x 0.010069 = 0.493381
         t.interval = 300;
+        t.communityWindow = 75; // a quarter of the shortest interval
         t.maxSlippageBps = 500;
         t.startAt = block.timestamp + 366 days;
         create(t);
@@ -139,7 +164,12 @@ contract VaultTest is ForkTest {
         t.keeperReward = 0;
         t.maxBuys = 50; // exactly 0.5 ETH
         t.interval = 366 days;
+        t.communityWindow = 1 hours; // the longest window
         t.startAt = block.timestamp - 366 days;
+        create(t);
+
+        t = defaultPlan();
+        t.communityWindow = 60; // the shortest window
         create(t);
 
         t = defaultPlan();
@@ -182,7 +212,7 @@ contract VaultTest is ForkTest {
 
         // After a buy the need falls by exactly what the buy spent, so there is still no room.
         vm.prank(keeper);
-        vault.execute();
+        vault.execute(keeper);
         vm.prank(owner);
         vm.expectRevert(err(SpdexDcaVault.FullyFunded.selector));
         vault.fund{value: 1}();
@@ -209,11 +239,12 @@ contract VaultTest is ForkTest {
         uint256 spxBefore = spxOf(owner);
         vm.recordLogs();
         vm.prank(keeper);
-        uint256 received = vault.execute();
+        (uint256 received, uint256 reward) = vault.execute(keeper);
 
         assertEq(spxOf(owner) - spxBefore, received, "the owner received what execute reports");
         assertEq(received, spotOut, "exactly what quote() predicted");
         assertGe(received, floorOut, "at least the floor");
+        assertEq(reward, t.keeperReward, "execute reports the reward");
         assertEq(wethOf(keeper), t.keeperReward, "the keeper was paid, in WETH");
         assertEq(wethOf(address(vault)), budgetOf(t) - t.amountPerBuy - t.keeperReward, "one buy spent");
         assertEq(spxOf(address(vault)), 0, "the vault never holds what it buys");
@@ -233,8 +264,12 @@ contract VaultTest is ForkTest {
             vm.warp(t.startAt + (n - 1) * t.interval);
             (, uint256 floorOut, uint256 depth) = vault.quote();
             vm.recordLogs();
+            // The keeper sends it; the first pays the keeper, the second a holder it names,
+            // the third the owner: the caller and the paid are two fields.
+            address paid = n == 1 ? keeper : n == 2 ? stranger : owner;
+            if (n == 2) makeEligible(stranger);
             vm.prank(keeper);
-            uint256 received = vault.execute();
+            (uint256 received,) = vault.execute(paid);
             VmLog[] memory logs = vm.getRecordedLogs();
             uint256 found;
             for (uint256 i; i < logs.length; i++) {
@@ -242,6 +277,7 @@ contract VaultTest is ForkTest {
                 found++;
                 assertEq(uint256(logs[i].topics[1]), n - 1, "slot");
                 assertEq(address(uint160(uint256(logs[i].topics[2]))), keeper, "keeper");
+                assertEq(address(uint160(uint256(logs[i].topics[3]))), paid, "rewardTo");
                 BoughtData memory b = abi.decode(logs[i].data, (BoughtData));
                 assertEq(b.amountIn, t.amountPerBuy, "amount in");
                 assertEq(b.amountOut, received, "amount out");
@@ -251,6 +287,7 @@ contract VaultTest is ForkTest {
                 assertEq(b.buyNumber, n, "numbered from 1");
                 assertEq(b.oracleDepth, depth, "the depth quote() gave");
                 assertGe(b.oracleDepth, 10 ether, "deep enough to buy");
+                assertEq(b.dueSince, t.startAt + (n - 1) * t.interval, "due from its slot's start");
             }
             assertEq(found, 1, "one Bought event");
         }
@@ -261,32 +298,32 @@ contract VaultTest is ForkTest {
         Plan memory t = defaultPlan();
         SpdexDcaVault vault = createFunded(t);
         vm.prank(keeper);
-        vault.execute();
+        vault.execute(keeper);
 
         bytes memory tooSoon = abi.encodeWithSelector(SpdexDcaVault.TooSoon.selector, t.startAt + t.interval);
         vm.prank(keeper);
         vm.expectRevert(tooSoon);
-        vault.execute();
+        vault.execute(keeper);
 
         // Still the same window one second before it ends.
         vm.warp(t.startAt + t.interval - 1);
         vm.prank(stranger);
         vm.expectRevert(tooSoon);
-        vault.execute();
+        vault.execute(stranger);
     }
 
     function test_afterOneIntervalTheNextBuyWorks() public {
         Plan memory t = defaultPlan();
         SpdexDcaVault vault = createFunded(t);
         vm.prank(keeper);
-        vault.execute();
+        vault.execute(keeper);
 
         vm.warp(t.startAt + t.interval);
-        (bool due, uint256 nextBuyAt,,,) = vault.status();
+        (bool due, uint256 nextBuyAt,,,,,,,) = vault.status();
         assertTrue(due, "due at the start of the next window");
         assertEq(nextBuyAt, t.startAt + t.interval, "and says so");
         vm.prank(keeper);
-        vault.execute();
+        vault.execute(keeper);
         assertEq(vault.buysDone(), 2, "two buys");
         assertEq(vault.lastBuyAt(), t.startAt + t.interval, "the second at window 1's start");
     }
@@ -295,19 +332,19 @@ contract VaultTest is ForkTest {
         Plan memory t = defaultPlan();
         SpdexDcaVault vault = createFunded(t);
         vm.prank(keeper);
-        vault.execute();
+        vault.execute(keeper);
 
         // Three intervals pass with nobody triggering: windows 1 and 2 are gone.
         vm.warp(t.startAt + 3 * t.interval + 10);
         vm.prank(keeper);
-        vault.execute();
+        vault.execute(keeper);
         vm.prank(keeper);
         vm.expectRevert(abi.encodeWithSelector(SpdexDcaVault.TooSoon.selector, t.startAt + 4 * t.interval));
-        vault.execute();
+        vault.execute(keeper);
 
         assertEq(vault.buysDone(), 2, "one buy for the three windows, not three");
         assertEq(vault.lastBuyAt(), t.startAt + 3 * t.interval + 10, "the buy was in window 3");
-        (,, uint256 buysLeft,,) = vault.status();
+        (,, uint256 buysLeft,,,,,,) = vault.status();
         assertEq(buysLeft, t.maxBuys - 2, "the skipped windows did not use up buys");
     }
 
@@ -316,17 +353,17 @@ contract VaultTest is ForkTest {
         t.maxBuys = 2;
         SpdexDcaVault vault = createFunded(t);
         vm.prank(keeper);
-        vault.execute();
+        vault.execute(keeper);
         vm.warp(t.startAt + t.interval);
         vm.prank(keeper);
-        vault.execute();
+        vault.execute(keeper);
 
         vm.warp(t.startAt + 2 * t.interval);
         vm.prank(keeper);
         vm.expectRevert(err(SpdexDcaVault.NoBuysLeft.selector));
-        vault.execute();
+        vault.execute(keeper);
 
-        (bool due, uint256 nextBuyAt, uint256 buysLeft, uint256 wethBalance,) = vault.status();
+        (bool due, uint256 nextBuyAt, uint256 buysLeft, uint256 wethBalance,,,,,) = vault.status();
         assertTrue(!due, "nothing is due");
         assertEq(nextBuyAt, 0, "and nothing ever will be");
         assertEq(buysLeft, 0, "no buys left");
@@ -337,12 +374,12 @@ contract VaultTest is ForkTest {
         Plan memory t = defaultPlan();
         t.startAt = block.timestamp + 1 hours;
         SpdexDcaVault vault = createFunded(t);
-        (bool due, uint256 nextBuyAt,,,) = vault.status();
+        (bool due, uint256 nextBuyAt,,,,,,,) = vault.status();
         assertTrue(!due, "not due before the start");
         assertEq(nextBuyAt, t.startAt, "due at the start");
         vm.prank(keeper);
         vm.expectRevert(abi.encodeWithSelector(SpdexDcaVault.NotStarted.selector, t.startAt));
-        vault.execute();
+        vault.execute(keeper);
     }
 
     function test_insufficientBalanceReverts() public {
@@ -350,24 +387,24 @@ contract VaultTest is ForkTest {
         SpdexDcaVault vault = create(t);
         uint256 needed = t.amountPerBuy + t.keeperReward;
 
-        (bool due,,,, bool funded) = vault.status();
+        (bool due,,,, bool funded,,,,) = vault.status();
         assertTrue(!due && !funded, "an empty vault is neither funded nor due");
         vm.prank(keeper);
         vm.expectRevert(abi.encodeWithSelector(SpdexDcaVault.InsufficientBalance.selector, 0, needed));
-        vault.execute();
+        vault.execute(keeper);
 
         vm.prank(owner);
         vault.fund{value: needed - 1}();
         vm.prank(keeper);
         vm.expectRevert(abi.encodeWithSelector(SpdexDcaVault.InsufficientBalance.selector, needed - 1, needed));
-        vault.execute();
+        vault.execute(keeper);
 
         vm.prank(owner);
         vault.fund{value: 1}();
-        (due,,,, funded) = vault.status();
+        (due,,,, funded,,,,) = vault.status();
         assertTrue(due && funded, "one buy's worth is enough");
         vm.prank(keeper);
-        vault.execute();
+        vault.execute(keeper);
     }
 
     // ─── The price floor ─────────────────────────────────────────────────────────
@@ -380,14 +417,14 @@ contract VaultTest is ForkTest {
         SpdexDcaVault vault = createFunded(t);
 
         pushV2(300 ether); // about a tenth of the pair's WETH: SPX costs ~25% more
-        (bool due,,,,) = vault.status();
+        (bool due,,,,,,,,) = vault.status();
         assertTrue(due, "status() says nothing about price");
         (uint256 spotOut, uint256 floorOut,) = vault.quote();
         assertLt(spotOut, floorOut, "the spot price is now well outside the 3% floor");
 
         vm.prank(keeper);
         vm.expectRevert(abi.encodeWithSelector(SpdexDcaVault.PriceBelowFloor.selector, spotOut, floorOut));
-        vault.execute();
+        vault.execute(keeper);
         assertEq(vault.buysDone(), 0, "nothing bought");
         assertEq(wethOf(keeper), 0, "nothing paid");
 
@@ -397,7 +434,7 @@ contract VaultTest is ForkTest {
         (spotOut, floorOut,) = vault.quote();
         assertGe(spotOut, floorOut, "the average has caught up");
         vm.prank(keeper);
-        uint256 received = vault.execute();
+        (uint256 received,) = vault.execute(keeper);
         assertGe(received, floorOut, "and the buy goes through at the new price");
     }
 
@@ -406,28 +443,29 @@ contract VaultTest is ForkTest {
         SpdexDcaVault vault = createFunded(t);
 
         // Due and priced: execute delivers exactly the quoted spot amount.
-        (bool due,,,,) = vault.status();
+        (bool due,,,,,,,,) = vault.status();
         (uint256 spotOut, uint256 floorOut,) = vault.quote();
         assertTrue(due && spotOut >= floorOut, "due and inside the floor");
         vm.prank(keeper);
-        assertEq(vault.execute(), spotOut, "delivered == quoted");
+        (uint256 delivered,) = vault.execute(keeper);
+        assertEq(delivered, spotOut, "delivered == quoted");
 
         // Not due: execute refuses.
-        (due,,,,) = vault.status();
+        (due,,,,,,,,) = vault.status();
         assertTrue(!due, "not due again in the same window");
         vm.prank(keeper);
         vm.expectPartialRevert(SpdexDcaVault.TooSoon.selector);
-        vault.execute();
+        vault.execute(keeper);
 
         // Due, but priced outside the floor: execute refuses with the quoted figures.
         vm.warp(t.startAt + t.interval);
         pushV2(300 ether);
-        (due,,,,) = vault.status();
+        (due,,,,,,,,) = vault.status();
         (spotOut, floorOut,) = vault.quote();
         assertTrue(due && spotOut < floorOut, "due, but outside the floor");
         vm.prank(keeper);
         vm.expectRevert(abi.encodeWithSelector(SpdexDcaVault.PriceBelowFloor.selector, spotOut, floorOut));
-        vault.execute();
+        vault.execute(keeper);
     }
 
     /// The vendored TickMath and the oracle arithmetic against the live pool: the pool's
@@ -459,7 +497,7 @@ contract VaultTest is ForkTest {
         Plan memory t = defaultPlan();
         SpdexDcaVault vault = createFunded(t);
         vm.prank(keeper);
-        vault.execute();
+        vault.execute(keeper);
 
         vm.prank(stranger);
         vm.expectRevert(err(SpdexDcaVault.Unauthorized.selector));
@@ -477,11 +515,11 @@ contract VaultTest is ForkTest {
         vm.warp(t.startAt + t.interval);
         vm.prank(keeper);
         vm.expectRevert(err(SpdexDcaVault.VaultClosed.selector));
-        vault.execute();
+        vault.execute(keeper);
         vm.prank(owner);
         vm.expectRevert(err(SpdexDcaVault.VaultClosed.selector));
         vault.fund{value: 0.01 ether}();
-        (bool due,, uint256 buysLeft,,) = vault.status();
+        (bool due,, uint256 buysLeft,,,,,,) = vault.status();
         assertTrue(!due && buysLeft == 0, "a closed vault has nothing due");
 
         // Closing again is harmless, and sweeps anything that arrived since.
@@ -502,11 +540,43 @@ contract VaultTest is ForkTest {
         assertEq(wethOf(address(vault)) + address(vault).balance, 0, "the vault is empty");
     }
 
+    /// WETH sends a withdrawal with `transfer`'s 2,300-gas stipend, which a clone's `receive`
+    /// fits in today. Should a fork reprice it past that, `withdraw` reverts — here, every
+    /// `withdraw` WETH is asked for does — and `close` still stops the plan and returns the
+    /// whole budget, as WETH, with `Closed` saying how much. Were the failed unwrap fatal, no
+    /// owner could ever stop a plan again.
+    function test_closeReturnsTheBudgetAsWethWhenUnwrappingFails() public {
+        Plan memory t = defaultPlan();
+        SpdexDcaVault vault = createFunded(t);
+        uint256 held = wethOf(address(vault));
+        uint256 ethBefore = owner.balance;
+
+        vm.mockCallRevert(WETH, abi.encodeWithSelector(bytes4(keccak256("withdraw(uint256)"))), "");
+        vm.recordLogs();
+        vm.prank(owner);
+        vault.close();
+        VmLog[] memory logs = vm.getRecordedLogs();
+        vm.clearMockedCalls();
+
+        assertTrue(vault.closed(), "closed");
+        assertEq(wethOf(owner), held, "the whole budget back, as WETH");
+        assertEq(owner.balance, ethBefore, "and no ether");
+        assertEq(wethOf(address(vault)) + address(vault).balance, 0, "the vault is empty");
+        uint256 closedEvents;
+        for (uint256 i; i < logs.length; i++) {
+            if (logs[i].emitter == address(vault) && logs[i].topics[0] == keccak256("Closed(uint256)")) {
+                assertEq(abi.decode(logs[i].data, (uint256)), held, "Closed reports what went back");
+                closedEvents++;
+            }
+        }
+        assertEq(closedEvents, 1, "one Closed");
+    }
+
     function test_rescueReturnsStrayTokensAndWethOnlyOnceClosed() public {
         Plan memory t = defaultPlan();
         SpdexDcaVault vault = createFunded(t);
         vm.prank(keeper);
-        uint256 received = vault.execute();
+        (uint256 received,) = vault.execute(keeper);
 
         // The owner sends the SPX they bought back to the vault by mistake.
         vm.prank(owner);
@@ -549,27 +619,39 @@ contract VaultTest is ForkTest {
     ///
     /// Before the clones (phase 5a, a full contract per vault), the same steps measured:
     /// createVault 2,278,083; fund 46,425; execute 200,290 (first) and 57,948 (later);
-    /// close 19,905.
+    /// close 19,905. v1 as deployed: createVault 175,650 (185,146 funding one buy); fund
+    /// 48,303; execute 218,501 (first) and 61,215 (later); close 21,972. v2's buys here are
+    /// both inside their community window, paid to an eligible keeper, so each asks the
+    /// registry.
+    /// The gas `createVault` spends for the owner, sending `value` along; as a direct call, so
+    /// the figure is the factory's alone.
+    function measureCreate(Plan memory t, uint256 value) internal returns (uint256 used, address made) {
+        vm.prank(owner);
+        uint256 g = gasleft();
+        made = factory.createVault{value: value}(
+            t.marketIndex,
+            t.amountPerBuy,
+            t.interval,
+            t.maxBuys,
+            t.startAt,
+            t.keeperReward,
+            t.maxSlippageBps,
+            t.communityWindow,
+            t.turnBuckets
+        );
+        used = g - gasleft();
+    }
+
     function test_gas() public {
         Plan memory t = defaultPlan();
 
-        vm.prank(owner);
-        uint256 g = gasleft();
-        address made = factory.createVault(
-            t.marketIndex, t.amountPerBuy, t.interval, t.maxBuys, t.startAt, t.keeperReward, t.maxSlippageBps
-        );
-        uint256 createGas = g - gasleft();
+        (uint256 createGas, address made) = measureCreate(t, 0);
         SpdexDcaVault vault = SpdexDcaVault(payable(made));
 
         // The same plan again, created and funded with its first buy in one call.
-        uint256 firstBuy = t.amountPerBuy + t.keeperReward;
-        vm.prank(owner);
-        g = gasleft();
-        factory.createVault{value: firstBuy}(
-            t.marketIndex, t.amountPerBuy, t.interval, t.maxBuys, t.startAt, t.keeperReward, t.maxSlippageBps
-        );
-        uint256 createFundedGas = g - gasleft();
+        (uint256 createFundedGas,) = measureCreate(t, t.amountPerBuy + t.keeperReward);
 
+        uint256 g;
         vm.prank(owner);
         g = gasleft();
         vault.fund{value: budgetOf(t)}();
@@ -577,13 +659,13 @@ contract VaultTest is ForkTest {
 
         vm.prank(keeper);
         g = gasleft();
-        vault.execute();
+        vault.execute(keeper);
         uint256 firstExecuteGas = g - gasleft();
 
         vm.warp(t.startAt + t.interval);
         vm.prank(keeper);
         g = gasleft();
-        vault.execute();
+        vault.execute(keeper);
         uint256 laterExecuteGas = g - gasleft();
 
         vm.prank(owner);
@@ -602,7 +684,8 @@ contract VaultTest is ForkTest {
         // keepers pay it and the buy fee is priced from it; and creation is what the clones
         // exist to make cheap. The factory's vault list and `VaultCreated.funded` added about
         // 27,500 to a creation, which `BatchGas.t.sol` bounds at 31,000: these ceilings rose
-        // by that bound, from 150,000 and 200,000.
+        // by that bound, from 150,000 and 200,000. v2's window — a term, four bytes of clone
+        // code, and the registry's answer for a buy inside it — fits under the same ceilings.
         assertLt(firstExecuteGas, 250_000, "first execute stays under 250k");
         assertLt(createGas, 181_000, "createVault stays under 181k");
         assertLt(createFundedGas, 231_000, "creating and funding stays under 231k");

@@ -42,11 +42,13 @@ treats everything else as a module the user chooses.
 `TxPlan` and the `SwapIntent` everything else is phrased in terms of.
 
 `packages/vault` sits beside `chain` and outside the module path: the
-contracts spDEX ships (the auto-buy vault, its factory and the batcher), the
-TypeScript generated from them, the buy fee (`fee.ts`), and the keeper and its
-report, which the app never imports. It is host code, not a module, for the
-reason routing is — it decides where money goes. See "No contract anyone
-controls" below. `docker/keeper` packages the keeper for operators.
+contracts spDEX ships (the auto-buy vault, its factory, the batcher and, from
+v2, the SPX holder registry), the TypeScript generated from them for both
+releases, the buy fee (`fee.ts`), building and checking a holder's proof
+(`registry.ts`), and the keeper and its report, which the app never imports.
+It is host code, not a module, for the reason routing is — it decides where
+money goes. See "No contract anyone controls" below. `docker/keeper` packages
+the keeper for operators.
 
 ## The five rules the shape enforces
 
@@ -162,8 +164,9 @@ on; `pair.provider(primary)` wraps any `SimulationProvider` as an
 `AgreeingSimulationProvider`; `applySecondOpinion` is the last step of every
 check that simulates. The Engine (`apps/web/src/lib/engine.ts`) wraps the
 provider of every Guard it builds that simulates (`Guard`, `TipGuard`, the
-`Guard` inside `ScheduledBuyGuard`, and the lazily built `VaultGuard`), and
-only the preview Guard, which simulates nothing, is without one. The
+`Guard` inside `ScheduledBuyGuard`, and the lazily built `VaultGuard`, which
+checks a `prove` too), and only the preview Guard, which simulates nothing,
+is without one. The
 structural red-team test reads `engine.ts` and fails on a
 Guard class it doesn't know, so a new Guard can't quietly skip it. The same
 address twice, after normalising it, is no second opinion: the Engine ignores
@@ -229,7 +232,10 @@ its own oracle instance).
 **What it doesn't check.** Only test-runs are compared. The Guard's 10-minute
 price check, balances, allowances, code at an address, vault state and fees
 are read from the main service alone; cross-reading the price check on the
-second service is left out of this release. A check can run one block
+second service is left out of this release. So are a proof's inputs, the
+block header, its hash and `eth_getProof`'s answer; the test-run of the
+`prove` itself is compared, and a false proof only reverts, on either
+service. A check can run one block
 behind the main service's newest. Per check it costs a head and a
 header read on both, in parallel, and one `eth_simulateV1` on the second, in
 parallel with the main one.
@@ -435,8 +441,8 @@ The Guard doesn't rely on any of it. `tipIntentViolations` refuses, as
 (`token-contract`), to Permit2 (`permit2`), to `0x…dEaD` (`burn`), to a public
 development account off a test network (`public-dev-account`), and to any
 contract the host passes in `refuseRecipients` (`known-contract`: the listed
-tokens, the vault factory, batcher and implementation, the venues'
-contracts; a person's own vault is not in it, since vaults can't be listed
+tokens, both releases' vault factories, batchers and implementations, the
+SPX holder registry, the venues' contracts; a person's own vault is not in it, since vaults can't be listed
 ahead, and "My tip list" warns about code at any address instead). Refusal only, so it can
 narrow what passes and never widen it; the red-team cases are in
 `packages/guard/test/redteam/tips.test.ts` and `tips-permit2.test.ts`.
@@ -613,9 +619,17 @@ does a row of buy fees, whose sold and value cells are left empty rather than
 written as 0, and "Fill in values" skips it. Each
 source keeps every currency's answer, so a later change of currency leaves
 nothing blank that was known. Otherwise the cell is blank, never 0, and there
-is no average cost anywhere. A vault buy the owner triggered themselves has
-no buy fee (it came back to them), and its network fee is read from that
-transaction's receipt, unknown until then, never 0.
+is no average cost anywhere. A vault buy whose fee was paid back to its owner
+has no buy fee: the owner's own **Trigger now**, and on a v2 vault any call
+that named the owner, a stranger's or the owner's own Help run batch. Only a
+buy the owner sent themselves has a network fee, read from that transaction's
+receipt, unknown until then, never 0; one their own batch made is carried by
+that batch's row of buy fees received, which in turn counts only the fees
+other people's vaults paid (`feesEarnedFromOthers`), so nothing is counted
+twice. Each v2 vault buy also says who made it (`buyMaker`): "Made by you",
+"Made by someone else; the fee came back to you", "Made by a community
+keeper" or "Made after the community window, when anyone could"; a v1 buy
+says nothing, rather than guess.
 
 **Reads.** None until Your activity is opened, Your stack comes on screen, or
 Welcome waits for a first buy. Then one receipt per transaction not yet cached
@@ -624,7 +638,11 @@ and each vault plan's history, best effort.
 **The file and the statement.** The CSV (`lib/records/csv.ts`,
 `spdex-activity-v1`) is machine format whatever the page's number style, quoted
 as RFC 4180 says, with a leading `'` on any cell a spreadsheet would run as a
-formula, since plan names are anyone's text. What it leaves out is said on
+formula, since plan names are anyone's text. v2 appended four columns after
+the first twenty, so the format name stands: `made_by` (`you`,
+`fee-returned-to-you`, `community-keeper`, `anyone-after-window`, and
+`keeper` for a v1 buy someone else made), `caller`, `fee_paid_to` and `due_since_utc`, each blank when
+unknown or not a vault buy. What it leaves out is said on
 screen and on the statement, never as a trailing row that would break the
 parsers it is for. The statement is a print-only container and
 `window.print()`: per-token totals, no averages, and "Not tax advice".
@@ -633,9 +651,12 @@ parsers it is for. The statement is a print-only container and
 calendar as an `.ics` file (RFC 5545, escaped and folded; no address, key or
 hash in it): one repeating event for a whole number of days, the next 48 buy
 times for an hourly plan, none under an hour and none for a vault. And an open
-tab can notify you when a buy falls due while it is hidden: the permission is
-asked only when the box is checked, and the notification has no icon, image or
-badge, each of which would be a fetch (`no-requests.test.ts` fails on one).
+tab can notify you when a buy falls due while it is hidden, and, with a box of
+its own in Community keeping, when the connected wallet's SPX proof has five
+days or less left (`lapse.ts`, from the panel's last read; it reads nothing
+itself): the permission is asked only when a box is checked, and the
+notification has no icon, image or badge, each of which would be a fetch
+(`no-requests.test.ts` fails on one).
 There is no push service: Web Push needs an application server (rule 5).
 
 **Included → Final** (`lib/finality.ts`, `components/trust/FinalityBadge.tsx`).
@@ -659,7 +680,11 @@ loss, no projection.
 preview is JSX, so React escapes the caption; its PNG is that mounted SVG,
 serialized, drawn from a `data:` URL onto a 1,200 × 675 canvas and saved
 through `lib/download.ts`. It shows the amount, the date, the network and the
-hash, never a price or a money figure. A `#receipt=<chain>:<hash>` link opens
+hash, never a price or a money figure. Nor does it say who made a vault's
+buy (you, a community keeper, anyone after the window): a card prints only
+what its `#receipt=` view checks, and that view doesn't check the maker, so
+the same buy's card reads the same whoever made it (`card.test.ts`). Your
+activity, its statement and its CSV say who made each v2 buy. A `#receipt=<chain>:<hash>` link opens
 a view that trusts the card for nothing: it reads the transaction through the
 viewer's own service, counts only `Transfer` logs emitted by the SPX contract,
 netted per address, and never treats a pool as a receiver (SPX paid into one
@@ -667,7 +692,8 @@ was sold). "Bought" is only what a market's swap paid out: SPX a pool spDEX
 itself discovers for SPX (from every listed token, so a USDC buy counts) sent
 the receiver, less what they sent it back, and no more than that pool's own
 v2 or v3 `Swap` logs say it paid them. It is named as a vault's when the
-receiver owns an `isVault` vault whose `Bought` is in the logs. Anything else
+receiver owns a vault that a listed factory, v1's or v2's, vouches for
+(`isVault`) and whose `Bought` is in the logs. Anything else
 the receiver gained is a separate line, "received from … (an account)", and a
 pool's payout with no swap behind it (liquidity taken out, a skim) is said to
 be not a purchase.
@@ -679,7 +705,11 @@ outlives the tab, so the link it prints is a build setting,
 `VITE_SPDEX_APP_URL`, and never the address bar, which may be a dev server, a
 shared gateway or a stranger's copy. Unset, the file has no link and says so.
 Verify this build's `git clone` line works the same way, from
-`VITE_SPDEX_SOURCE_URL`.
+`VITE_SPDEX_SOURCE_URL`, and so do the two doc links Help run and Community
+keeping show ("Becoming a community keeper", and the services that answer
+`eth_getProof`): the source's address with `/blob/HEAD/<path>#<anchor>`
+appended, as GitHub browses a repository, and no link at all when it is
+unset.
 
 ## Recurring buys
 
@@ -824,37 +854,50 @@ would be a backend, which rule 5 in `AGENTS.md` rules out, and it would have to
 hold people's keys or money. A contract cannot wake itself up either: something
 has to send each buy's transaction. So the "server of sorts" is a contract that
 holds one plan's budget and enforces the plan itself, so that it does not
-matter who sends the transaction. The caller chooses only *when*, and only
-inside a window that is due; never how much, what, to whom, or at what price.
-Anyone may trigger a due buy and is paid a fixed buy fee from the vault for
-it. So spDEX now ships three contracts in `packages/vault/contracts`:
-`SpdexVaultFactory`, `SpdexDcaVault`, and `SpdexVaultBatcher`, which lets a
-keeper trigger many vaults' buys in one transaction. With them come the
+matter who sends the transaction. The caller chooses *when*, and only inside a
+slot that is due, and on a v2 vault who receives the caller's own fee; never
+how much, what, to whom, or at what price. A fixed buy fee from the vault pays
+for each buy. On a v1 vault anyone may make a due buy and is paid it; on a v2
+vault, for the first minutes after the buy falls due, only an SPX holder or
+the owner can be paid it, and after that anyone (below). So spDEX ships
+`SpdexVaultFactory`, `SpdexDcaVault` and `SpdexVaultBatcher`, which lets a
+keeper trigger many vaults' buys in one transaction, and from v2 a fourth,
+`SpxHolderRegistry`, in `packages/vault/contracts`. With them come the
 TypeScript generated from them (`@spdex/vault`) and a keeper.
 
-**What did not.** Nobody controls them. The factory and the batcher have no
-owner, no admin, no fee and no upgrade path. A vault has no pause switch
-anyone else holds. None of the three takes a fee; any keeper, including one
-spDEX's developers may run, collects each vault's buy fee on the buys it
-triggers. Once a vault exists, what it does is fixed:
+There are two releases. v1 has been on mainnet since block 26,100,366, and
+its factory, batcher and every vault made from it run unchanged for good; its
+deployed source is kept, frozen, in `packages/vault/releases/v1`. v2 is the
+current source: the community window, `execute(rewardTo)`, the registry and
+a batcher that no longer handles WETH. Its addresses are the ones this build
+deploys to, and it is not yet deployed. `docs/V2_UPGRADE.md` is its design,
+with the decisions it records numbered; this section cites them by number.
+
+**What did not.** Nobody controls them. The factories, the batchers and the
+registry have no owner, no admin, no fee and no upgrade path. A vault has no
+pause switch anyone else holds. None of the four takes a fee; any keeper,
+including one spDEX's developers may run, collects each vault's buy fee on
+the buys it makes. Once a vault exists, what it does is fixed:
 its terms are part of its code, and the implementation it delegates to is part
 of its proxy. That is what the old heading was protecting: there is still
 nothing for us, or anyone who takes this repository over, to switch. What is
 gone is "no contract to trust". These contracts are **unaudited**, and someone
 who chooses a vault trusts their code with what they put in. That is why every
-vault's budget is capped at 0.5 ETH (`MAX_FUNDING`), and why the app marks the
-choice **Unaudited** wherever it offers it.
+vault's budget is capped at 0.5 ETH (`MAX_FUNDING`), in v2 as in v1, and why
+the app marks the choice **Unaudited** wherever it offers it.
 
 ### What a vault can and cannot do
 
 A vault is one plan: buy SPX with WETH, `amountPerBuy` at a time, one buy per
-window of `interval` seconds from `startAt`, at most `maxBuys` times.
+slot of `interval` seconds from `startAt`, at most `maxBuys` times. (v1's
+NatSpec called these slots windows; v2 keeps that word for the community
+window, below.)
 
 It can:
 
-- make at most one buy per window, and none sooner than half an interval after
-  the last, so one push of the price cannot cover the end of one window and the
-  start of the next. A window nobody triggers is skipped, never made up later,
+- make at most one buy per slot, and none sooner than half an interval after
+  the last, so one push of the price cannot cover the end of one slot and the
+  start of the next. A slot nobody triggers is skipped, never made up later,
   for the reason a tab-run plan skips one: a catch-up burst defeats the
   averaging, and it is exactly what someone able to delay buys would want to
   provoke;
@@ -863,9 +906,11 @@ It can:
   if the owner received less than the pair sent;
 - refuse a buy priced more than `maxSlippageBps` below its price reference
   (below);
-- pay whoever triggered the buy its buy fee (`keeperReward`) in WETH, never as
-  a raw ether transfer, which would let an unknown address run code in the
-  middle of a buy;
+- pay the buy's fee (`keeperReward`) in WETH, never as a raw ether transfer,
+  which would let an unknown address run code in the middle of a buy: a v1
+  vault to whoever called `execute()`, a v2 vault to the `rewardTo` its caller
+  names in `execute(rewardTo)`, which may not be zero or the vault itself
+  (`BadRewardTo`);
 - take more budget from its owner (`fund`, which sends back whatever the
   remaining buys and their fees don't need), return everything to the owner as
   ether (`close`, which pays WETH instead to an owner that refuses ether, and
@@ -875,8 +920,9 @@ It can:
 It cannot:
 
 - change a term, pause, or be upgraded. `close` is the only way to stop it;
-- send its money anywhere except into a buy delivered to its owner, its
-  caller's fixed buy fee, or back to its owner;
+- send its money anywhere except into a buy delivered to its owner, the buy's
+  fixed fee to its caller (v1) or the `rewardTo` its caller named (v2), or
+  back to its owner;
 - buy a token, or use a pair or pool, that its factory did not list;
 - take more than 0.5 ETH from its owner. Creation refuses a budget (every buy
   plus its buy fee) above `MAX_FUNDING`, and `fund` never takes the vault's WETH
@@ -902,16 +948,159 @@ This floor refuses, where the app's oracle only warns. That is exactly what
 rule 2 in `AGENTS.md` warns about: whoever moves the average can make buys
 wait. It is the right trade here because nobody watches these buys to read a
 warning, and the alternative is a buy with no floor at all. What it costs the
-owner is skipped windows, not money. `docs/THREAT-MODEL.md` says what moving it
+owner is skipped slots, not money. `docs/THREAT-MODEL.md` says what moving it
 costs, and what a keeper can take within the allowance.
+
+### The community window (v2)
+
+A v1 vault pays its fee to whoever calls `execute()` first once a buy is due,
+and in practice that is whoever is fastest: on 2026-10-02 a mainnet smoke
+run's vault was triggered three blocks after it was created, by one of a
+chain of single-use accounts run by a searcher that collects public rewards
+across many protocols. Nothing went wrong, but every buy whose fee covers a
+stranger's gas went to the fastest stranger. v2 gives SPX's community first
+claim on each buy's fee instead, without changing who may *make* the buy or
+anything about it.
+
+`execute(address rewardTo)` takes one argument: who receives this buy's fee.
+It is the only thing about a buy its caller names, and it names nothing about
+the buy itself. The amount, the token, the recipient of what is bought, the
+market and the floor are the terms', exactly as they would be for any other
+`rewardTo`: a forge fuzz test checks that any two `rewardTo` values the vault
+accepts give byte-identical buys, with only the fee's recipient (and the
+count below) different (`testFuzz_anyTwoAcceptedRewardTosMakeTheSameBuy`;
+decision 11). Naming the recipient is what lets the vault check who is
+paid rather than who sent the transaction, so a keeper can sign with a hot
+key and be paid in a cold wallet, and a batcher in the middle no longer
+hides the real recipient.
+
+**When a buy falls due.** v1's earliest moment for the next buy, `nextBuyAt`,
+is the start of the slot after the last buy (or half an interval after it, if
+later), which is already in the past once a slot has been missed: gas above
+the fee, a floor that refused, a vault short of funds until a top-up.
+Measured from it, the first buy after a miss would be open to anyone at once,
+exactly when a bot is waiting. So the window is measured from
+
+```
+slotStart = startAt + ((now − startAt) / interval) × interval
+dueSince  = max(nextBuyAt, slotStart)
+```
+
+and every slot's buy gets its own first claim (decision 10). `dueSince` is at
+most half an interval into its slot and the window at most a quarter of the
+interval, so a window always ends inside the slot it started in and leaves
+the rest of that slot open to anyone (`testFuzz_aWindowAlwaysEndsInsideItsSlot`).
+
+**Inside the window.** While `block.timestamp < dueSince + communityWindow`,
+`rewardTo` must be the owner or an address the SPX holder registry finds
+eligible; anything else reverts `NotEligible(rewardTo, windowEndsAt)`. From
+`windowEndsAt` on, any address will do, as in v1, and the registry is not
+asked at all (`test_afterItsWindowABatchAsksTheRegistryNothing`). Who may
+send the transaction never changes; who may be paid does.
+
+| | Inside the community window | After it, until the next buy is due |
+|---|---|---|
+| A community keeper (eligible `rewardTo`) | May make the buy and is paid | The same |
+| The owner, or anyone paying the owner | May make the buy; the fee goes back to the owner | The same |
+| Anyone else | Can send the call, but can't be paid: the vault refuses (`NotEligible`) | May make the buy and is paid, at any address |
+
+**The owner's exception.** `rewardTo == owner` is always allowed, so
+**Trigger now** works inside the window. The exception is on who is paid,
+not who sends, so anyone may make an in-window buy by paying the fee back to
+the owner, at their own gas cost: they keep v1's lever of choosing the moment
+within a slot, without the fee, and can take a buy from the community keepers
+for nothing in return (`test_theOwnerMayBePaidInsideTheWindow`). Such a buy is
+not counted as the community's.
+
+**A registry that fails.** The vault asks the registry with a low-level
+`STATICCALL` and a fixed stipend (`ELIGIBILITY_GAS`, 100,000), copying back
+one word. Only a call that succeeds and answers a whole word equal to `true`
+counts; a revert, an out-of-gas, a short or odd answer is "not eligible"
+(decision 14, `test_aRegistryThatFailsCountsAsNotEligible`). So a broken
+registry can delay a buy only until its window ends, or until the owner
+makes it, and never touches the vault's money. The honest answer costs about
+11,200 gas from cold, under an eighth of the stipend: nothing can raise the
+stipend once a vault exists, and a fork that repriced cold reads past a
+tighter one would make every window one only owners can be paid in, for good
+(decision 38). A buy is charged only what the answer uses.
+
+**The window's length** is a term like the others, `communityWindow`
+seconds, fixed when the vault is made. The factory refuses one outside
+`MIN_COMMUNITY_WINDOW ≤ communityWindow ≤ min(interval / 4,
+MAX_COMMUNITY_WINDOW)`, 60 seconds to an hour
+(`CommunityWindowOutOfRange(communityWindow, minimum, maximum)`,
+`test_theFactoryHoldsTheWindowToItsBoundsToTheSecond`). Every v2 vault has
+one (decision 4). The minute keeps first claim from being nominal (five
+12-second blocks); the quarter keeps a window inside its slot; the
+hour bounds how long a buy nobody eligible makes waits for the open
+fallback. `MIN_INTERVAL` is 300, so every plan allows at least 75 seconds.
+The app proposes 30 minutes, or a quarter of the interval when that is
+shorter (decision 3).
+
+**Turns, shipped unused.** A plan may share its window's first half out in
+turns (`turnBuckets`, a term: 0 for none, or 2 to `MAX_TURN_BUCKETS`, 64).
+Every address falls in one bucket (`bucketOf`: `keccak256(address) mod k`) and
+each slot draws one (`turnOf`: `keccak256(vault, slot) mod k`). Until
+`dueSince + communityWindow / 2`, a `rewardTo` other than the owner must be
+eligible and in that bucket, or the vault refuses `NotYourTurn(rewardTo,
+turn, turnEndsAt)`; from then to the window's end, any eligible address. So a
+holder has first claim on about one buy in `k`, and a bot that wants first
+claim on every buy needs an eligible address, with 690 SPX of its own, in
+every bucket. Every plan the app creates has none (`DEFAULT_TURN_BUCKETS`)
+until decision 29 trips; then an app release, with nothing deployed, starts
+creating plans with turns (decision 35). A plan without turns pays one
+comparison for them; a buy inside its turn about 1,000 gas
+(`test_whatTurnsCostABuy`). The keeper and Help run the network skip a vault
+inside its turn when their `rewardTo` is not in its bucket, as they skip one
+inside its window when it is not eligible.
+
+**What it records.** `windowBuys()` counts the buys made inside their window
+and paid to someone other than the owner: the community's. It sits in the
+storage slot that already holds `_buysDone`, `_lastBuyAt` and `_closed`, so
+counting adds no storage write to a buy (decision 13). `status()` returns
+`dueSince`, `windowEndsAt`, `turnEndsAt` and `turn` beside v1's five
+figures, worked out exactly as `execute` works them out
+(`test_statusAgreesWithExecuteAtEveryEdge`); whether a given `rewardTo` is
+eligible is the registry's to say, not `status()`'s.
+
+**Two edges, by design.** A first buy whose window ended before its vault
+existed (`startAt` in the past by more than the window when the creation
+lands) is open to anyone at once, and so is a buy that becomes possible only
+after its window has ended, such as one funded late in its slot
+(`test_aFirstBuyWhoseWindowEndedBeforeTheVaultExistedIsOpenAtOnce`,
+`test_aBuyThatBecomesPossibleOnlyAfterItsWindowIsOpenAtOnce`). The contract
+does not record a creation time, which would make a vault's address depend on
+its block, so a plan whose first buy is to have a window must start late
+enough for its creation to land first; the first of those tests shows 120
+seconds of margin doing it. The app does that for a window under three
+minutes: a "first buy now" vault then starts `120 + 60 − communityWindow`
+seconds after the chain's time (`vaultStartLead` in
+`apps/web/src/lib/dca/vault.ts`: 105 seconds for a five-minute plan's 75,
+120 for Expert's one minute), so a creation that takes up to two minutes to
+sign and land still leaves its first buy at least a minute of first claim. A
+window of three minutes or more, every default from a 12-minute interval up,
+covers that itself, and its first buy is due at creation.
+
+**What it does not stop.** The registry proves that an address held SPX when
+a block closed. Nothing on chain can prove that SPX held during a
+transaction is not borrowed, so the check at the moment of the buy can be
+met with a flash borrow (decision 17, below). A bot that buys 690 SPX and
+proves it is a community keeper like any holder, and inside a window the
+fastest eligible keeper wins. None of this reaches the owner's money: at
+worst a fee is paid to someone the window was meant to keep out, which is
+what every fee in v1 was open to.
 
 ### Clones
 
 Each vault is an EIP-1167 minimal proxy: 45 bytes that delegate every call to
 one implementation, which the factory deploys, with the plan's terms appended
-to the clone's own code (112 bytes; `libraries/VaultArgs.sol` has the layout).
-A full contract per plan cost about 2.3 million gas to create. A clone costs
-about 175,000 (measured on the fork), of which about 29,000 is the factory
+to the clone's own code (`libraries/VaultArgs.sol` has the layout): 112 bytes
+in v1, 117 in v2, which adds `communityWindow` in 4 more and `turnBuckets` in
+1. The registry's
+address is not among them: it is an immutable of the implementation, the same
+for every clone. A full contract per plan cost about 2.3 million gas to
+create. A clone costs about 175,000 in v1 and 177,000 in v2 (`test_gas` in
+`Vault.t.sol`), of which about 29,000 is the factory
 adding it to its list (below), and each call about 5,000 more, for the proxy,
 the `delegatecall` and reading the terms back.
 
@@ -943,18 +1132,29 @@ state (see "Beta data", below), so the events carry what would otherwise need
 archive reads:
 
 - `Bought(slot, amountIn, amountOut, keeper, reward, floorOut, buyNumber,
-  oracleDepth)`. Besides what was bought and what its caller was paid, the
+  oracleDepth)` in v1, and in v2 the same with `rewardTo` (indexed) and
+  `dueSince` after them. Besides what was bought and what was paid, the
   floor the buy was held to, so execution against the oracle is one event's
   arithmetic (the fair amount is `floorOut × 10,000 / (10,000 −
   maxSlippageBps)`); the vault's buy count, this buy included, so a missing
-  log shows as a gap, which slot numbers cannot show because windows
+  log shows as a gap, which slot numbers cannot show because slots
   legitimately go unbought; and the oracle pool's depth at that buy, the only
   data that can say during the beta whether `MIN_ORACLE_DEPTH` (10 ETH) is
-  right before it is fixed for good. About 900 gas a buy.
-- `VaultCreated(owner, vault, marketIndex, terms, funded)`. `funded` is the
-  ether sent with the creation, so deposits are exact from the factory's and
-  the vaults' own events rather than from WETH's.
-- **The factory's list.** The factory keeps every vault it creates in an
+  right before it is fixed for good. About 900 gas a buy. `keeper` is the
+  caller, an account or a batcher. v2's two words say who was paid and when
+  the buy fell due, so whether it was made inside its window, and by whom —
+  the owner, the community, or anyone after the window — reads from the log
+  alone (decision 13). With the window's arithmetic and the longer calldata
+  they add about 2,000 gas to a buy that never asks the registry (2,016 for
+  a later buy paid to its owner, `WhatV2AddsGasTest`).
+- `VaultCreated(owner, vault, marketIndex, terms, funded)`, whose terms carry
+  `communityWindow` in v2. `funded` is the ether sent with the creation, so
+  deposits are exact from the factory's and the vaults' own events rather
+  than from WETH's.
+- `Proven(holder, blockNumber, balance, validUntil)`, from the registry, once
+  per accepted proof: the public record of who has proven what, since the
+  registry keeps no list.
+- **The factory's list.** Each factory keeps every vault it creates in an
   append-only list, read with `vaultCount()` and `vaultsPage(offset, limit)`
   (at most 1,000 a call). A keeper finds vaults there exactly, with no
   `eth_getLogs` range limits and no start block to know; a stranger starting
@@ -965,6 +1165,8 @@ archive reads:
 
 Nothing records which frontend or keeper was used. A marker in calldata or an
 event would answer that, and would fingerprint the people using it on chain.
+`rewardTo` is no such marker: it is who was paid, which v1 recorded too, as
+the caller.
 
 ### The market list
 
@@ -1005,49 +1207,245 @@ trap a keeper passes all of them once it has a genuine, deep market
 tokens are vetted by hand, by whoever writes a list. **Another list means
 another factory, at another address.** No function adds or removes a market.
 
+### The SPX holder registry (v2)
+
+`SpxHolderRegistry` decides one thing, which a v2 vault asks inside a buy's
+community window: may this `rewardTo` be paid the buy's fee? It never touches
+a vault's funds, holds no tokens or ether, and has no owner, admin, setter,
+upgrade, list or deposit. Its only storage is one time per address that has
+proven, `validUntil` (mapping slot 0, `test_validUntilIsMappingSlotZero`).
+
+```solidity
+interface ISpxHolderRegistry {
+    function prove(address holder, bytes calldata header, bytes[] calldata accountProof,
+        bytes[] calldata storageProof) external returns (uint64 validUntil);
+    function isEligible(address holder) external view returns (bool);
+    function validUntil(address holder) external view returns (uint64);
+    event Proven(address indexed holder, uint256 indexed blockNumber, uint256 balance, uint64 validUntil);
+    error NotNewer(uint64 validUntil);
+}
+```
+
+**Eligible** means three things at once (`isEligible`): a proof is still
+valid, through the second `validUntil` names; the address is an account, with
+no code or only an EIP-7702 delegation designator, which only its own key can
+put there; and it holds at least `MIN_SPX` right now, by SPX's `balanceOf`.
+The first is checked first, so an address that never proved costs one
+storage read.
+
+**Accounts only,** because a contract can hand what it is paid to whoever
+asks. Uniswap v2's SPX/WETH pair held 13 million SPX at the pinned block, and
+a true proof of it is as easy to send as anyone's; a fee paid to the pair
+sits above its reserves, and its `skim` hands that to any caller in the same
+transaction. With contracts eligible, a bot with no SPX and no proof of its
+own could name the pair, or v4's `PoolManager`, and take every window's fee
+(`test_aProvenContractThatHandsOutWhatItIsPaidIsNeverEligible`). An account's
+fee is its key-holder's, and its 690 SPX theirs. The cost is that SPX held
+in a contract wallet (a Safe, a smart account) cannot qualify; such a holder
+names an ordinary account holding 690 SPX of its own. Code is judged at the
+moment of the buy, since it can arrive after a proof
+(`test_eligibilityIsJudgedOnTheCodeAtTheMomentOfTheBuy`).
+
+**`prove`** records that `holder` held at least `MIN_SPX` when a recent block
+closed. Anyone may send anyone's proof: it states a fact about the chain, and
+`msg.sender` appears nowhere in it (`testFuzz_anyoneMayProveAnyHolder`), so a
+hot browser wallet can pay the gas to prove a keeper's cold `rewardTo`
+without the cold wallet touching a browser. In order:
+
+1. It reads the block header (RLP) for its state root, number and timestamp
+   (fields 3, 8 and 11, unmoved since Frontier) and requires the header's
+   hash to equal the block's real hash, which it reads from the chain and
+   never takes from the caller: `BLOCKHASH` for the last 256 blocks,
+   EIP-2935's history contract (`HISTORY`) for the last 8,191. Any other
+   block is `UnknownBlock`; a mismatch is `WrongBlockHash`.
+2. It follows `accountProof` from the state root to SPX's account, for its
+   storage root.
+3. It follows `storageProof` from there to the holder's balance, at
+   `keccak256(abi.encode(holder, 1))`.
+4. It requires at least `MIN_SPX` (`BelowMinimum` otherwise) and sets
+   `validUntil` to the block's time plus `PROOF_TTL`. A proof that would not
+   move it later reverts `NotNewer` (decision 16), so a private relay drops a
+   proof that would change nothing, as it drops a batch that bought nothing.
+
+**The verifier is not written here.** Steps 2 and 3 are the one complex piece
+of v2, so they use Optimism's MIT-licensed `SecureMerkleTrie` and its RLP
+reader, the library Optimism's portal proves every withdrawal with, vendored
+under
+`contracts/vendor/optimism` at tag `op-contracts/v8.0.0` (commit
+`f45a5ccf…`) with only their import paths changed. Its README gives each
+file's hash and a command to check them again. Review starts there. A bad
+proof reverts inside it, with its own messages; the registry adds only the
+two value shapes it expects (`BadProofValue`).
+
+**Which block.** The app and the keeper prove the `finalized` block, about 13
+minutes old (decision 15): no reorg can change its hash, so a proof never
+fails for that reason, and EIP-2935's 8,191 blocks, about 27 hours, let a
+built proof wait unsigned in a tab for hours. `BLOCKHASH` alone would leave it
+about half an hour; it stays because it keeps proving possible if a later
+hard fork moves EIP-2935, since the `finalized` block is within its 256.
+
+| Constant | Value | Basis |
+|---|---|---|
+| `SPX` | `0xE0f63A424a4439cBE457D80E4f4b51aD25b2c56C` | A plain contract, not a proxy; 8 decimals (checked 2026-10-02) |
+| `BALANCE_SLOT` | 1 | Checked against `balanceOf` for three holders (`test_theConstantsAreTheAgreedOnesAndTheSlotIsSpxsBalance`) and for every recorded proof |
+| `HISTORY` | `0x0000F90827F1C53a10cb7A02335B175320002935` | EIP-2935, live on mainnet |
+| `HISTORY_BLOCKS` | 8,191 | EIP-2935's reach |
+| `MIN_SPX` | 690 SPX (`69_000_000_000`) | Decision 1: within reach of ordinary holders; a bot can carry it too |
+| `PROOF_TTL` | 30 days, from the proven block's time | Decision 2 |
+
+All are constants. Changing one means a new registry, and with it a new
+factory and batcher, since the factory names the registry in its constructor:
+a new release.
+
+**What it costs.** Measured on the fork at the pinned block
+(`Registry.t.sol`): `prove` about 520,000 to 550,000 gas as a call and about
+655,000 to 685,000 as a transaction with its 8 KB of calldata, about 0.00007
+ETH at 0.1 gwei, once every 30 days. Nearly all of it is the vendored reader
+decoding each node of the two proofs (about 25,000 gas for each 17-item branch
+node), the price of not writing a verifier fresh. `isEligible` costs about
+11,200 gas from cold (11,700 for a delegated account) and 2,200 warm, the same
+for ten holders or fifty thousand. Inside a vault's buy the check measures
+9,463 gas when the holder sends the buy itself (a cold wallet paid by a hot
+key adds about 2,500), and in a batch paying one `rewardTo`, 9,006 once and
+3,001 for each later buy (`WhatV2AddsGasTest`, `BatchGas.t.sol`).
+
+**What a flash loan can and cannot do** (decision 17). A proof reads a
+block's final state, and a flash loan is borrowed and repaid inside one
+transaction, so it never appears there: to prove, an address must really
+have held `MIN_SPX` when a block closed. The balance check at the moment of
+the buy is different. A flash borrow meets it, one borrow can wrap a whole
+batch, and Uniswap v4's `PoolManager` lends within a transaction for no fee:
+it held 119,766 SPX at the pinned block, and a 690-SPX borrow around a
+5-vault batch, through a delegated account that holds no SPX, made all five
+in-window buys, cost the `PoolManager` nothing and added 42,648 gas to
+the batch
+(`test_aFlashBorrowFromV4MeetsTheBalanceCheckForAProvenHolderThatHoldsNothing`).
+So an address can buy 690 SPX, hold it past one block's end, prove, sell it
+back for about a round trip's cost, and stay eligible for 30 days paying only
+gas. What the registry really filters for is "held 690 SPX at a block's end
+in the last 30 days". The balance check stays anyway: it costs a few thousand
+gas, and it stops a holder who sold, or a bag moved from address to address
+and proven for each, unless they write code for the purpose.
+`docs/THREAT-MODEL.md`, "The community window and the SPX holder registry",
+has the rest.
+
+**What proving makes public** (decision 24). A `Proven` event says, for good,
+that an address held at least 690 SPX at a block. Since anyone may prove any
+address, it says nothing about whether that address runs a keeper. A keeper's
+buys do: each puts its `rewardTo` in calldata beside the key that sent it,
+linking the two in public. The app says so before a wallet's first proof, and
+`docs/KEEPER.md` suggests a wallet kept for the SPX rather than a main one.
+
+**Why not a deposit.** A bonded deposit is simpler to check and could be
+slashed, but it takes custody, adds a lock and an exit delay, and breaks the
+rule that eligibility stays in the holder's wallet (decision 8).
+
 ### One address, checkable from source
 
-The factory is deployed through the standard deterministic deployer
-(`0x4e59b44847b379578588920ca78fbf26c0b4956c`) with a fixed salt. So its
-address depends only on its bytecode, which includes the implementation's
-because the constructor deploys it, and on its constructor arguments: WETH,
-Uniswap's two factories and the market list. For Ethereum's list that address
-is `0xe4a1410a9ee0833d41e7514306e65ad729b7199e`, and the implementation it
-deploys is at `0xb32b5e1092de9596877be9b6c783c7e98b55b1c6`. The batcher is
-deployed the same way, with a salt of its own
-(`keccak256("spdex.vault.batcher.v1")`) and its factory as its one constructor
-argument, so its address follows from its code and its factory's:
-`0xc5ce65451dd5fc99d08eb18440b06f2bcca3c5a0`. The compiler is pinned (solc
-0.8.33), metadata hashes are off, and `via_ir` is never used (it would move
-every address and every gas figure), so two honest builds produce the same
-bytes. `packages/vault/src/artifacts.ts` is generated from the build, and the
+Every contract is deployed through the standard deterministic deployer
+(`0x4e59b44847b379578588920ca78fbf26c0b4956c`) with a fixed salt, so each
+address depends only on the bytecode and the constructor's arguments. A
+factory's bytecode includes the implementation's, because its constructor
+deploys it; its arguments are WETH, Uniswap's two factories, the market list
+and, from v2, the registry. v1's batcher's one argument is its factory; from
+v2 the batcher's is WETH. So the registry's address pins its code, the
+factory's pins the implementation, the markets and the registry, and the
+batcher's pins its code alone, on any chain's WETH. For Ethereum:
+
+| Release | Contract | Salt preimage | Address |
+|---|---|---|---|
+| v1 | Factory | `spdex.vault.factory.v1` | `0xe4a1410a9ee0833d41e7514306e65ad729b7199e` (block 26,100,366) |
+| v1 | Implementation | (deployed by the factory) | `0xb32b5e1092de9596877be9b6c783c7e98b55b1c6` |
+| v1 | Batcher | `spdex.vault.batcher.v1` | `0xc5ce65451dd5fc99d08eb18440b06f2bcca3c5a0` (block 26,100,368) |
+| v2 | Registry | `spdex.vault.registry.v2` | `0x2c7f732a453fe0a4a65f36ac564ff16007b5610d` |
+| v2 | Factory | `spdex.vault.factory.v2` | `0xbf40f0fb41e5ee1194173545749d80c4651bac32` |
+| v2 | Implementation | (deployed by the factory) | `0xeba51b96621f0fce83e017c0a46330c8cde323db` |
+| from v2 | Batcher | `spdex.vault.batcher.v2` | `0xd1f8327aa8398997bd88165f420412c703ebfed0` |
+
+Each salt is the keccak256 of its preimage. v1's are deployed. v2's are the
+addresses this build deploys to, the registry before the factory (the factory
+refuses a registry with no code, `NotARegistry`); the batcher needs nothing
+before it. They are not yet deployed. Any byte changed in the registry or the
+vendored verifier moves the registry and the factory; any byte changed in the
+batcher moves the batcher alone. The compiler is pinned (solc 0.8.33), metadata
+hashes are off, and `via_ir` is never used (it would move every address and
+every gas figure), so two honest builds produce the same bytes.
+`packages/vault/src/artifacts.ts` is generated from the build, and the
 `contracts` stage of `pnpm verify` rebuilds it and fails on a stale copy.
 Anyone can recompute the addresses the app and the keeper trust, just as anyone
 can check the bundle's CID.
 
-**Every release is listed, for good.** `packages/vault/deployments.json` lists
-each release — a factory, its batcher, and the mainnet blocks they were
-deployed in — oldest first, and `artifacts.ts` carries it as `DEPLOYMENTS`.
-`build:artifacts` rewrites only a trailing release not yet deployed (its blocks
-still null), and adds a new entry after one that is; the blocks are filled in
-by hand after the mainnet deployment, the only edit an entry ever gets, and
-freeze it. `--check` fails when a frozen entry changed or the last entry is not
-this build. No release is ever removed: the keeper and the report serve every
-listed release, each batch going to its own release's batcher, so a new
-release never orphans an old one's vaults. Today there is one, `v1`, not yet on
-mainnet. The app reads the last release's factory only. Once a second release
-exists, the intent is that the app lists, funds and closes vaults from every
-listed factory and creates only on the latest; that is agreed, not built.
+**Sources and releases.** A *source* is one version of the contracts' code; a
+*release* is one deployment of a source, with its own constructor arguments.
+`artifacts.ts` exports every source under its own prefix (`V1_*`, `V2_*`) and
+as data, `SOURCES`, with what its contracts can do (`features`:
+`executeTakesRewardTo`, `communityWindow`, `turns`, `registry`,
+`sharedBatcher`), read by the build from the ABIs themselves rather than
+written down; the current source also has unprefixed names (`VAULT_ABI`, …),
+for creating vaults. The app, the Guard and the keeper ask a release's source
+what it can do (`featuresOf`, `packages/vault/src/releases.ts`) and never which
+release it is, so a release built from an existing source — the same code with
+another market list, or another registry — is one entry in `deployments.json`
+and no code anywhere (decision 36).
 
-The app checks that there is code at that address. On a chain where there is
-none yet, it offers the one-time deployment. Anyone may send it: the factory
-has no owner to set, and it lands at the same address with the same list
-whoever sends it. It costs about 3.6 million gas (3,562,618 on the fork), and
-the batcher, which anyone may deploy after it, about 600,000 (601,283). A
-deployment sent while a market fails a check reverts, and succeeds when sent
-again once the market passes. The deterministic deployer reverts without a
-reason, so the app first runs the creation code as a plain call
-(`simulateFactoryDeployment`), which names the refusal.
+**Frozen sources.** `packages/vault/releases/v1/contracts` is a verbatim copy
+of the source v1 was deployed from, built by forge's `v1` profile with the
+same settings. `build:artifacts` refuses to write, and `--check` fails, unless
+it still builds to v1's deployed factory and batcher. That is how anyone can
+check v1's addresses after `contracts/` moved on, and how the app and the
+keeper go on shipping v1's ABIs and creation code. Before `contracts/` changes
+after a release built from it reaches mainnet, that source is frozen the same
+way: a copy under `releases/`, a profile, and its row in the build's
+`SOURCES` table marked frozen; the build refuses a deployed entry its source
+no longer builds to.
+
+**Every release is listed, for good.** `packages/vault/deployments.json` holds
+two lists, oldest first. `releases`: each release's factory, from v2 its
+source, registry and market list, and the mainnet blocks they were deployed in
+(v1's entry keeps its own batcher, bound to its factory). `batchers`: each
+batcher bound to no factory, its source, and its block. `artifacts.ts` carries
+them as `DEPLOYMENTS`, each release with the batcher its vaults go through
+(v1's own, or the newest shared one), and `BATCHERS`. `build:artifacts`
+recomputes every entry from its source, rewrites only a trailing entry not yet
+deployed, appends the current source's release and batcher when nothing lists
+them, and fills in a release entry appended by hand with `factory: null`. The
+blocks are filled in by hand after the mainnet deployment, the only edit an
+entry ever gets, and freeze it. `--check` fails when an entry is not what the
+build makes of it, and the build refuses one factory in two entries. No
+release is ever removed: the keeper and the report serve every listed release,
+v1's batches going to v1's batcher and every later release's to the shared
+one, so a new release never orphans an old one's vaults, and a fixed batcher
+is one more `batchers` entry, with no new factory. The app trusts every listed
+factory's `isVault`: it lists, funds, closes and triggers vaults from all of
+them, and creates only on the latest.
+
+The app checks that there is code at the latest release's addresses. On a
+chain where there is none yet, it offers the one-time deployment, for v2 the
+registry first and then the factory, each through the deterministic deployer
+(`deployRegistryCall` and `deployFactoryCall`, the first two of
+`deployReleaseCalls("v2")`), two transactions, each confirmed before the next.
+It is not a Guard path: it moves nobody's money, sends no ether and grants
+nothing, and its cost is its gas. Anyone may send it: none of these contracts
+has an owner to set, and each lands at the same address, with the same list,
+whoever sends it. v1's factory cost about 3.6 million gas (3,562,618 on the
+fork), and its batcher, which anyone may deploy after it, about 600,000
+(601,283). v2's have not been sent on mainnet; a rehearsal on a fork of
+Ethereum on 2026-10-05 measured 1,781,553 gas for the registry, 4,122,976
+for the factory and 539,274 for the batcher. Its vault is
+somewhat larger than v1's (11,853 bytes of runtime code against 10,211, in
+forge's build), its batcher smaller (2,218 against 2,496), and its registry
+7,977 bytes. A deployment
+sent while a market fails a check reverts, and succeeds when sent again once
+the market passes. The deterministic deployer reverts without a reason, so
+the app first runs the creation code as a plain call
+(`simulateFactoryDeployment`), which names the refusal. A v2 factory's
+constructor refuses a registry with no code (`NotARegistry`) before it checks
+its market, so while the registry is missing the app runs that call with a
+state override that gives the registry's address code
+(`factoryRefusalBeforeRegistry`): a factory that would be refused is said, and
+nothing is sent, before anyone pays for the registry. A service that takes no
+state override says nothing there, and the factory's own test-run still runs
+after the registry lands and before the factory's transaction.
 
 Two people sending it at about the same time is a race nobody can close. The
 second transaction's creation collides with the factory the first just made,
@@ -1060,104 +1458,158 @@ rest.
 ### The batcher
 
 A keeper that sends one transaction per buy pays a transaction's fixed costs
-on every buy. `SpdexVaultBatcher` lets it make many due buys in one:
-`executeBatch(vaults, rewardTo, minRewards)` calls `execute` on each listed
-vault its factory vouches for, and passes every buy fee on to `rewardTo` in
-the same transaction. In a batch, a later buy on a busy oracle pool costs
-about 101,000 gas, and the batch about 151,000 once, where a transaction of
-its own would pay that once-per-transaction part for every buy
-(`BatchGas.t.sol` pins both figures).
+on every buy. `SpdexVaultBatcher` lets it make many due buys in one, and
+every buy's fee reaches `rewardTo` in the same transaction. In a batch, a
+later buy on a busy oracle pool costs about 101,000 gas in v1 and 106,000 in
+v2 (its registry check included, warm), and the batch about 151,000 once in
+v1 and 152,000 in v2, where a transaction of its own would pay that
+once-per-transaction part for every buy (`BatchGas.t.sol` pins the v2 figures
+and records v1's).
 
 - **One more caller, with no more rights.** It calls each vault's `execute` as
-  anyone may, and each vault still checks its own terms and pays its caller,
-  here the batcher. It is bound at construction to one factory and asks that
-  factory's `isVault` on chain before calling any vault: one it does not vouch
-  for is skipped with no call (`NotFromFactory`). It has no owner, fee, setter
-  or storage but a transient lock, no `receive`, and holds nothing between
-  calls: every wei of WETH it holds at the end goes to `rewardTo`.
-- **Each vault gets exactly 400,000 gas** (`EXECUTE_GAS_CAP`, which
-  `@spdex/vault` mirrors as `MAX_EXECUTE_GAS_LIMIT`). A vault is attempted
-  only while at least 460,000 is left (`MIN_GAS_PER_ATTEMPT`: the cap after
-  the 1/64 the EVM keeps back, plus what finishing the batch costs), so a
-  hostile vault can burn its cap and no more, and when gas runs short the rest
-  are `NotTried`, never failed. It copies 32 bytes of a success and 4 of a
-  revert, so no vault can return-bomb it.
+  anyone may, and each vault still checks its own terms. It has no owner, fee,
+  setter or storage but a transient lock, and no `receive`.
+- **v1's: bound to v1's factory, paid, and passes it on.** `executeBatch(vaults,
+  rewardTo, minRewards)` asks its factory's `isVault` before calling a vault
+  (one it does not vouch for is skipped, `NotFromFactory`). A v1 vault pays its
+  caller, here the batcher, which forwards every reward to `rewardTo` in the
+  same transaction, and every wei of WETH it holds at the end with it. `Batch`
+  reports `earned`, the WETH that arrived during the call, apart from `swept`,
+  WETH it already held because someone sent it. Only `earned` counts toward
+  `minRewards`, and the report never counts `swept` as revenue.
+- **From v2: bound to no factory, and never paid at all.**
+  `executeBatch(vaults, rewardTo, minRewards, gasPerVault)` calls
+  `execute(rewardTo)` on each address listed, and each vault pays `rewardTo`
+  directly, so a vault inside its community window checks the real recipient,
+  not the batcher. No WETH passes through it: the forwarding, the sweep and
+  their accounting are gone, and `Batch` has no `swept`. `earned` is how much
+  `rewardTo`'s WETH rose during the call, which no contract in the list can
+  make larger without paying it (`test_earnedIsWhatRewardToReceivedNotWhatTheVaultsClaim`).
+  With no answer left to trust, it needs no factory: it is built for WETH
+  alone, at one address on any chain, and serves every release whose vaults
+  take `rewardTo` — v2's and any later one built that way — and a batch may mix
+  them (`test_vaultsOfTwoFactoriesBuyInOneBatch`, decision 34). Which vaults
+  are worth calling is its caller's to know: it calls whatever it is given, a
+  hand-made clone or a stranger's contract included, at the caller's own
+  expense. The keeper lists only vaults a listed factory's own list names;
+  the Guard checks every vault of a batch the app sends; a report counts buys
+  from the `Bought` logs of vaults a listed factory vouches for, never from a
+  `Triggered` alone. It refuses itself as `rewardTo` and has no way to send
+  WETH, so WETH anyone sends it stays there for good, as does a fee that a
+  direct caller of a vault names it to receive after a window: that caller's
+  own fee, lost by its own choice
+  (`test_aFeeNamedToTheBatcherByADirectCallerStaysThere`). Adding a sweep would
+  put WETH back through the batcher, so there is none.
+- **Each vault gets exactly the gas the caller names.** v1's gives a fixed
+  400,000 (`EXECUTE_GAS_CAP`). From v2 the caller names it, `gasPerVault`,
+  from `MIN_EXECUTE_GAS` (400,000, what the app and the keeper send:
+  `MAX_EXECUTE_GAS_LIMIT`) to `MAX_EXECUTE_GAS` (10,000,000): nothing can
+  change a deployed batcher, and a fork that repriced a buy past a fixed cap
+  would leave every buy short of gas there, for good. A vault is attempted
+  only while the cap after the 1/64 the EVM keeps back, plus
+  `ATTEMPT_OVERHEAD` (53,650, what finishing the batch costs at its dearest,
+  with room), is left — 460,000 at the least cap, as in v1 — so a hostile
+  vault can burn its cap and no more, and when gas runs short the rest are
+  `NotTried`, never failed. It copies 4 bytes of a revert and, of a success,
+  32 bytes (what the owner received), so no vault can return-bomb it.
 - **One refusal does not sink the rest.** A vault that refuses — another
-  trigger got there first, the price moved — is recorded
+  trigger got there first, the price moved, `rewardTo` isn't eligible inside
+  its window, or isn't in its bucket inside its turn — is recorded
   (`NotTriggered(vault, reason, gasUsed)`) and the others still buy. If none
   bought, the call reverts `NothingBought(reasons)`; if what it earned falls
   short of the caller's `minRewards`, it reverts `TooLittle`. A private,
   revert-protected relay then drops the transaction, so a lost race costs its
   sender nothing, and an `eth_call` of a hopeless batch says why each vault
   failed.
-- **Earned, never swept.** `Batch` reports `earned`, the WETH that arrived
-  during the call (the fees of the vaults that bought), apart from `swept`,
-  WETH it already held because someone sent it. Only `earned` counts toward
-  `minRewards`, and the report never counts `swept` as revenue.
-- **Why passing the fee on is not a fee.** Rule 6 allows a payment only to the
-  caller of `execute`. The batcher is that caller, and in the same transaction
-  hands the payment to whoever called the batcher, at the address that caller
-  names: the caller's own reward, sent where the caller chooses. The batcher
-  keeps nothing and charges nothing, and `minRewards` is a condition the caller
-  puts on its own transaction. A vault's caller still chooses only *when*.
+- **Why it is not a fee.** Rule 6 allows a payment only to the `rewardTo` the
+  caller of `execute` names (in v1, the caller itself). v1's batcher is that
+  caller, and in the same transaction hands the payment to whoever called
+  it, at the address that caller names; from v2 the batcher passes that
+  address to each vault, which pays it. Either way it is the caller's own
+  reward, sent where the caller chooses. The batcher keeps nothing and charges
+  nothing, and `minRewards` is a condition the caller puts on its own
+  transaction. A vault's caller still chooses nothing about the buy
+  (decision 11).
 
-The app neither deploys nor calls it. It knows the listed batchers' addresses
-only to say "triggered in a batch" in a vault's history.
+The app calls only the shared one: Help run the network sends a batch from
+the person's own wallet ("Helping run the network", below).
 
 ### The buy fee
 
 A vault pays one thing to anyone but its owner: its `keeperReward`, which the
 app calls the **buy fee**. It is fixed at creation, written into the clone's
 code (`VaultArgs.sol`), and nothing can change it afterwards, spDEX included.
-The app proposes it from `packages/vault/src/fee.ts`:
+The app proposes it for a new v2 vault from `packages/vault/src/fee.ts`
+(decision 9):
 
 ```
-network part = 122,000 gas × 0.15 gwei = 0.0000183 ETH, the same for every plan
-its tenth    = 10% of the network part, rounded up = 0.00000183 ETH
+network part = 126,000 gas × 0.15 gwei = 0.0000189 ETH, the same for every plan
+share        = 0.25% of the buy, rounded up
 ceiling      = 0.69% of the buy, rounded down: the contract's own limit
-buy fee      = the network part and its tenth (0.00002013 ETH), or the ceiling if that is less
+buy fee      = the network part and the share, or the ceiling if that is less
 ```
+
+v1 vaults keep the fee they were made with: v1's default was the network part
+at 122,000 gas (0.0000183 ETH) and a tenth more, 0.00002013 ETH, under the
+same ceiling, and the keeper still prices a v1 vault's buys by that rule.
 
 - **0.69%** is the most a buy can pay anyone for being made, the network
   cost included. It is a contract constant (`MAX_REWARD_BPS` in
-  `VaultLimits.sol`): the factory refuses a vault whose fee is higher,
-  whoever writes its terms. What a keeper keeps is the fee less the network
-  fee it paid, so nobody who triggers buys, spDEX's developers among them,
-  makes more than 0.69% of a buy. The app has no ceiling of its own to drift
-  from it: `BUY_FEE_CEILING_BPS` is read from the build.
-- **The tenth** (`BUY_FEE_MARKUP_BPS`) is all the fee asks for beyond cost
-  while spDEX is a prototype: about half a cent a buy. A later release may
-  raise the default towards the ceiling, for plans created after it. None can
-  pass the ceiling without a new factory at a new address.
-- **The network part** is one batched buy's gas: 106,000 for a buy in a batch
-  on a busy oracle pool (`BATCH_PER_BUY_GAS`; measured 101,255) and a tenth of
-  the 160,000 a batch pays once (`BATCH_FIXED_GAS`, measured 150,602;
-  `FEE_BATCH_SIZE` 10). It is priced at a constant of the release, 0.15 gwei
-  (`FEE_NETWORK_REFERENCE`), never at the fee of the moment. A plan fixes its
-  fee for every buy it will ever make, and keepers pay at each buy, not at
-  creation: priced live, two identical plans made in a dip and in a spike
-  would pay up to 2.2 times apart for life, for a figure that says nothing
-  about what keepers will pay. 0.15 gwei blends a week of mainnet fees for
-  cheap-block and deadline sends, with room for the small batches of the
+  `VaultLimits.sol`), the same in both releases: the factory refuses a vault
+  whose fee is higher, whoever writes its terms. What a keeper keeps is the
+  fee less the network fee it paid, so nobody who makes buys, or is named to
+  be paid for them, spDEX's developers among them, makes more than 0.69% of
+  a buy. The app has no ceiling of its own to drift from it:
+  `BUY_FEE_CEILING_BPS` is read from the build.
+- **The share** (`BUY_FEE_SHARE_BPS`, 25 basis points) is what the fee asks
+  for beyond the network cost: what a keeper is paid, beyond its gas, for
+  making someone else's buy. v1 asked a tenth of the network part instead,
+  about half a cent a buy whatever its size, while spDEX was a prototype; the
+  share grows with the buy. A plan's fee does not change while a window
+  runs: a buy pays the same inside its window as after it (decision 5). A
+  larger fee is also a larger prize for a bot that holds 690 SPX, which is
+  what the report's concentration figure watches ("Beta data", below). A
+  later release may change the default under the ceiling, for plans created
+  after it; none can pass the ceiling without a new factory at a new address.
+- **The network part** is one batched buy's gas: 110,000 for a later buy in a
+  batch on a busy oracle pool, inside its window and paid to a community
+  keeper (`BATCH_PER_BUY_GAS`; measured 105,969, the registry's warm check
+  included) and a tenth of the 160,000 a batch pays once (`BATCH_FIXED_GAS`,
+  measured 151,686 with the first vault's cold check; `FEE_BATCH_SIZE` 10):
+  `BATCHED_BUY_GAS`, 126,000, against v1's 122,000 (106,000 and 160,000,
+  measured 101,255 and 150,602). It is priced at a constant of the release,
+  0.15 gwei (`FEE_NETWORK_REFERENCE`), never at the fee of the moment. A plan
+  fixes its fee for every buy it will ever make, and keepers pay at each
+  buy, not at creation: priced live, two identical plans made in a dip and in
+  a spike would pay up to 2.2 times apart for life, for a figure that says
+  nothing about what keepers will pay. 0.15 gwei blends a week of mainnet fees
+  for cheap-block and deadline sends, with room for the small batches of the
   early beta, and is re-derived by a release when fees change regime.
-- **Where the ceiling binds.** Below about 0.00292 ETH a buy
-  (`FULL_FEE_BUY_THRESHOLD`) the fee is 0.69% of the buy, which is less than
-  the network part and its tenth; there a keeper that triggers the buy pays
-  the rest of its network cost, or skips it, and nothing obliges one not to
-  skip. Under about 0.00147 ETH (`CHEAP_BATCHED_BUY_THRESHOLD`) the fee does
-  not cover even a batched buy at a cheap block, and the form says such buys
+- **Where the ceiling binds.** Below about 0.0043 ETH a buy
+  (`CEILING_BINDS_BELOW`: the network part over 0.69% less 0.25%) the fee is
+  0.69% of the buy, which is less than the network part and the share; there
+  a keeper that makes the buy pays the rest of its network cost, or skips
+  it, and nothing obliges one not to skip. Under about 0.00152 ETH
+  (`CHEAP_BATCHED_BUY_THRESHOLD`) the fee does not cover even a batched buy
+  at a cheap block (126,000 gas at 0.083 gwei), and the form says such buys
   may be skipped. Under 0.000001 ETH it refuses the plan.
-- **What the fee does not cover.** A fee this close to cost pays a keeper
-  only when buys share transactions and blocks are cheap: a batch of ten
-  covers its gas up to about 0.165 gwei, a buy sent alone only under about
-  0.076. Otherwise a keeper waits, skips the buy or pays the difference
-  itself. spDEX's developers may run one that does during the prototype;
-  nothing obliges them, or anyone.
+- **What the fee does not cover.** The network part covers a batched buy at
+  0.15 gwei and no more. When gas costs more, a keeper pays the difference
+  out of the share, and where the ceiling binds there is no share to pay it
+  from. How far a fee stretches therefore depends on the buy: on a $69 buy a
+  batch of ten covers its gas up to about 0.67 gwei, and a buy sent alone
+  (246,552 gas, `WhatV2AddsGasTest`) up to about 0.34. Beyond that a keeper
+  waits, skips the buy or pays the difference itself. spDEX's developers may
+  run one that does; nothing obliges them, or anyone.
 
-At ETH at $2,643.94, a $1 buy pays $0.0069 and a $5 buy $0.0345 (0.69%, the
-ceiling), and every buy from $7.71 up pays $0.0532: 0.54% of $10, 0.22% of
-$25, 0.08% of $69. `docs/KEEPER.md` has what that leaves a keeper at each fee
-level and batch size, the losses on small batches included.
+At ETH at $2,643.94, the network part is $0.050. A $1 buy pays $0.0069, a $5
+buy $0.0345 and a $10 buy $0.069 (0.69%, the ceiling), as does every buy up
+to about $11.36; above that the fee is $0.050 and 0.25% of the buy: $0.1125
+on $25 (0.45%), $0.2225 on $69 (0.33%), $0.30 on $100 (0.3%) and $1.775 on
+$690 (0.26%). A v1 vault made at the same price paid $0.0532 on every buy
+from $7.71 up. The shares are rounded up to a whole basis point, as the app
+shows them. `docs/V2_UPGRADE.md`, "The fee", compares this with what other
+products charged on 2026-10-02.
 
 **Why the fee is not mutable on chain, even in the beta.**
 
@@ -1171,9 +1623,10 @@ level and batch size, the losses on small batches included.
 - The beta still gets the flexibility it needs, off chain. The default for new
   plans (`fee.ts`) changes with a release, an IPFS CID anyone can check. Each
   keeper operator sets its own policy in its environment: which vaults, how
-  much subsidy, what tips. An owner who wants a newer rate can close and
-  recreate, for about 267,000 gas (a close, 52,484 on the fork, and a funded
-  creation, about 214,600).
+  much subsidy, what tips. An owner who wants a newer rate, or a v1 owner who
+  wants a community window, can close and recreate, for about 270,000 gas (a
+  close, 52,484 on the fork, and a funded v2 creation, 216,263 in
+  `WhatV2AddsGasTest`); the app offers no move of its own (decision 27).
 - Too low, and an operator absorbs it or keepers skip those buys. Too high,
   and the next release lowers the default. Neither needs a contract change.
 - The ceiling is the one part that is on chain, and it is a constant like
@@ -1183,20 +1636,23 @@ level and batch size, the losses on small batches included.
 `VaultGuard` refuses a creation whose fee is above `feeCeiling`
 (`VAULT_MALFORMED`), by name and figure, before anything is sent; the factory
 would refuse it too (`RewardTooLarge`). Only creations. Funding, closing or
-triggering a vault is never refused for its fee: this factory cannot make one
+triggering a vault is never refused for its fee: neither factory can make one
 that pays more, and a later release with a lower ceiling must not trap the
-owners of vaults made under this one.
+owners of vaults made under an earlier one.
 
 ### The keeper
 
 There is still no server. A due buy happens when someone sends it: a
 stranger's keeper, an open spDEX tab's **Trigger now** (the owner's own wallet
-calling `execute`, with the buy fee paid back to them), any tab's **Help run
-the network** (a batch of other people's due buys from the person's own
-wallet, "Helping run the network" below), or a keeper anyone can run,
-`pnpm keeper` or its Docker image (`docs/KEEPER.md`). None is promised to
-run, and none needs the owner's trust: a keeper can make a buy happen or not
-happen, but never make it happen differently.
+calling `execute(owner)` on a v2 vault, `execute()` on a v1 one, with the buy
+fee paid back to them), any tab's **Help run the network** (a batch of other
+people's due v2 buys from the person's own wallet, "Helping run the network"
+below), or a keeper anyone can run, `pnpm keeper` or its Docker image
+(`docs/KEEPER.md`). None is promised to run, and none needs the owner's
+trust: a keeper can make a buy happen or not happen, but never make it
+happen differently. Inside a v2 buy's community window, only a community
+keeper or the owner can be paid for it. Community keepers make other people's
+buys and are paid for each one; holding 690 SPX is the entry bar.
 
 `packages/vault/src/keeper.ts` is one tick, and `scripts/keeper.ts` the loop
 around it, holding everything a tick must not touch — files, the lease,
@@ -1209,41 +1665,89 @@ scripted endpoint. A tick:
 3. finds new vaults in each listed release's factory list, a few pages a tick,
    never through `eth_getLogs` (or reads an allowlist);
 4. works out from the cached terms alone which vaults are due, and each one's
-   window and deadline;
-5. decides whether to send now: at a cheap block (a base fee under a
-   percentile of recent ones, rising from the 10th at a window's start to the
-   60th at its deadline), at a deadline (two hours before a daily window
-   closes, less for shorter plans; plans under an hour go as soon as due), or
-   at once when told to;
+   window and deadline (in the keeper, "window" is a buy's slot; the new
+   thing is always the community window) and, for a v2 vault, when its
+   community window ends, from the same arithmetic the vault uses
+   (`dueSinceAt`, `communityWindowEndsAt` in `keeper-plan.ts`);
+5. decides whether to send now. A keeper whose `rewardTo` is not eligible
+   leaves a v2 vault alone until its community window ends. One whose
+   `rewardTo` is eligible takes the buy at once, at the patient tip
+   (`FEE_TIP_REFERENCE`), and never escalates to beat another holder until
+   the window's last 2 minutes (the last quarter of a window under 8
+   minutes, `urgentFrom`), when it switches to the urgent tip, since the
+   window's end is a deadline after which bots can take the buy (decision
+   19). Otherwise,
+   as in v1: at a cheap block (a base fee under a percentile of recent ones,
+   rising from the 10th at a window's start to the 60th at its deadline), at
+   a deadline (two hours before a daily window closes, less for shorter
+   plans; plans under an hour go as soon as due), or at once when told to;
 6. only then reads those vaults and their prices, in one Multicall3, and
-   chooses a batch their fees pay for;
+   chooses a batch their fees pay for, one per release's batcher;
 7. simulates the batch with `eth_call` at the fee it will pay, drops any vault
    that refuses, and signs and sends it.
 
+Whether its `rewardTo` is eligible is read every tick, from each release that
+has a registry, the way the app reads it (`readHolderStatus`: `isEligible`,
+`validUntil` and its SPX balance in one Multicall3, and its code), and counts
+only for that head and while its proof is still valid a block later, where
+the vault asks; an answer it could not read counts as not eligible. A
+`rewardTo` that is a vault's owner is eligible for that vault. A `NotEligible`
+refusal, in a simulation or on chain, rests that vault until its window ends
+and makes the keeper read its eligibility again.
+
 - **Economics.** Each vault's fee is set against its share of the batch's gas
-  (`BATCH_PER_BUY_GAS`, 51,000 more for a first buy, and a share of
+  (`BATCH_PER_BUY_GAS`, 110,000, or v1's 106,000 for a v1 vault, whose buys
+  never ask a registry; 51,000 more for a first buy; and a share of
   `BATCH_FIXED_GAS`, scaled by what mined batches really used) at the next
   block's base fee plus 12.5% and the tip. A vault whose fee covers that goes
   in. One whose fee falls short rides along only if it pays the fee spDEX
-  proposes for its size and, by default, buys at least 0.0003 ETH on a plan
-  at least an hour apart, oldest vaults first, so a flood of new vaults cannot
-  crowd out older ones. By default the other vaults' surplus must carry it,
+  proposes for its size (for a v1 vault, by v1's rule) and, by default, buys
+  at least 0.0003 ETH on a plan at least an hour apart, oldest vaults first,
+  so a flood of new vaults cannot crowd out older ones. By default the other vaults' surplus must carry it,
   and a keeper never plans a loss. An operator may choose to subsidise the
   rest, within caps per buy, per vault and per owner each day: each vault is
   booked at most its own shortfall, within its own caps, never on another
   vault's allowance, and a breaker stops all subsidy once a day's realised
   losses reach the daily cap.
 - **Gas.** An explicit limit, never `eth_estimateGas`: 60,000, plus 127,000 a
-  vault (178,000 for a first buy), plus `MIN_GAS_PER_ATTEMPT`, so every vault
-  gets its whole cap. An estimate searches for the least gas at which the
+  vault (178,000 for a first buy), plus what the batcher must have left before
+  its last attempt (`minGasPerAttempt`, 460,000 at the 400,000 each vault is
+  given), so every vault gets its whole cap. An estimate searches for the least gas at which the
   transaction does not revert, and inside a try/catch that is where later
   vaults quietly fail.
 - **One nonce manager signs everything** (`keeper-send.ts`), and only what
   `assertKeeperMaySign` allows: a batch to a listed batcher paying the
   configured `rewardTo`, a listed batcher's deployment, a 0-value cancel to
-  itself, or a WETH unwrap when it is its own `rewardTo`. It persists each
-  signed transaction before broadcasting it, so a crash between the two
-  finishes on restart, and a lease stops two processes signing with one key.
+  itself, a WETH unwrap when it is its own `rewardTo`, or, only with
+  `SPDEX_KEEPER_PROVE=1`, a 0-value `prove` to a listed release's registry
+  whose holder is the configured `rewardTo`. It persists each signed
+  transaction before broadcasting it, so a crash between the two finishes on
+  restart, and a lease stops two processes signing with one key.
+- **Proving, if asked to** (decision 20). With `SPDEX_KEEPER_PROVE=1`, off by
+  default, the keeper proves its `rewardTo` when it has no proof, and again
+  once its proof has five days or less left (`buildHolderProof`, the app's
+  own): it reads the `finalized` block, rebuilds its header and refuses to go
+  on unless it hashes to the block's hash, fetches the proof with
+  `eth_getProof` from its own endpoint and checks it against that block's
+  state root, checks the proven balance and that the new `validUntil` would
+  be later, test-runs it with `eth_estimateGas` (its limit that and a fifth,
+  at most 750,000, `proveGasLimit`), and sends at the patient tip, with
+  nothing else in flight. A proof in flight that another proof overtakes, or
+  that it may no longer sign (proving turned off, `rewardTo` changed), is
+  withdrawn rather than bid up. Its endpoint answers every figure a proof
+  depends on, chain time and receipts included, so the bounds on what proving
+  can cost are kept on the machine's own clock (`PROVE_SPACING_SECONDS`): at
+  most one try every five minutes, at most one proof sent a day, and none
+  for a day after one reverts on chain. Each reason it doesn't prove is
+  logged once (`prove_skipped`). The hot key pays the gas; the SPX never
+  leaves the `rewardTo` wallet, which never signs. Whether or not it proves,
+  it logs when its proof will lapse.
+- **Runway.** With a cold `rewardTo`, the hot key earns nothing back: every
+  fee goes to the cold wallet. So the keeper logs and reports its runway, the
+  days of sends its balance covers at its spend over the time that spend
+  covers (at most a week; unknown in its first day), warns (`low_runway`)
+  below `SPDEX_KEEPER_MIN_RUNWAY_DAYS` (7 by default), and its operator tops
+  it up by hand (decision 18).
 - **Private orderflow.** Sent through a revert-protected relay
   (`SPDEX_KEEPER_SEND_URL`), a batch carries `minRewards`, so a partial race
   cannot land it at a loss and a lost one costs nothing. Without one, the
@@ -1256,7 +1760,8 @@ scripted endpoint. A tick:
   or until a new batcher.
   Honest failures — another trigger first, the price moved — never hold a
   vault back longer than a window: a refusal it paid for rests ten minutes,
-  at most twice a window, and one seen in a simulation costs nothing.
+  at most twice a window, and one seen in a simulation costs nothing. A
+  `NotEligible` rests only until the community window ends.
 - **Records.** Every decision is a JSONL record: typed fields validated and
   never redacted, free text redacted of the key and every configured URL. A
   heartbeat file feeds Docker's healthcheck, and a watchdog exits a keeper
@@ -1274,13 +1779,15 @@ truth. It has no ledger entry and no runner, and no scheduler module sees it.
 - **The buy fee on screen.** The form and the card call `keeperReward` the buy
   fee, never a reward, and show it in the chosen currency first when a rate is
   known ("≈ $0.05" or "≈ €0.05", then the ether), with its
-  exact share of the buy (`feeShareText`) and the rule that set it: "a fixed
-  amount for network fees plus 10% of that, never more than 0.69% of the buy" —
+  exact share of the buy (`feeShareText`) and the rule that set it: a fixed
+  amount for network fees plus 0.25% of the buy, never more than 0.69% of the
+  buy (a v1 card states v1's rule, the fixed amount plus 10% of it) —
   "fixed", because the network part is a release constant, not the gas price
   of the moment. The fee needs no fee read; only the creation's own network
   fee waits for one. Notes under the choice (`vaultFeeNotes`) say what the fee
-  pays for: a buy under about 0.00147 ETH "may be skipped"; one held at the
-  ceiling, under about 0.00292 ETH, "depends on low network fees"; and when
+  pays for: a buy under about 0.00152 ETH "may be skipped"; one whose fee the
+  ceiling holds below the network part itself, under about 0.00274 ETH
+  (`HELD_BELOW`), "depends on low network fees"; and when
   network fees are very low, confirming each buy yourself costs less than the
   vault's fee. That every vault buy rests on keepers sharing transactions is
   true of all of them, so the fee's tip says it and no note does. The other
@@ -1291,9 +1798,31 @@ truth. It has no ledger entry and no runner, and no scheduler module sees it.
   banner gives the buy fee a keeper is paid beside the network fee **Trigger
   now** costs at today's fees (`VAULT_GAS`: a busy pool's buy, not
   `EXECUTE_GAS`, which sizes a limit); when the network fee is more, it says
-  so, and **Trigger now** stops being the main button. A buy made through any
-  listed batcher reads "triggered in a batch" in the vault's history, rather
-  than naming the batcher.
+  so, and **Trigger now** stops being the main button. On a v2 vault
+  **Trigger now** sends `execute(owner)`, which the vault accepts at any
+  moment the buy is due, inside the window or after it, and which pays the
+  fee back to the owner. Each v2 buy in a vault's history, and in Your
+  activity and its CSV, says who made it, from its `Bought` event and the
+  transaction's sender (`buyMaker`): you; someone who paid the fee back to you;
+  a community keeper, inside the window; or anyone, after it ("triggered by a
+  community keeper, paid 0x… its … buy fee"). A v1 buy's history row reads as
+  it always has (by you, by an address, or in a batch, and whom it paid), and
+  Your activity gives it no maker line rather than guess one.
+- **The community window on screen.** Everyone sees one plain line in the
+  plan: "SPX holders can earn this plan's fee for its first 30 minutes after
+  each buy falls due; then anyone can." (with the plan's own length). The
+  window is chosen for the plan, 30 minutes or a quarter of the interval when
+  that is shorter (`defaultCommunityWindow`); in Expert alone the form offers
+  1, 5, 15, 30 and 60 minutes and "a quarter of the interval", any above a
+  quarter of the interval disabled and the quarter left out where it equals
+  one of them, beside one line: "Shorter: your buy happens sooner when no
+  holder is online. Longer: holders have more time to earn your fee."
+  (decision 26). It is a choice of the draft, not of the config, whose
+  version stays 9. While a v2 buy is due inside its window, the card's due
+  banner says "Community window until 14:32, then open to anyone.", by this
+  device's clock; a v1 card's is unchanged. Expert's vault details add the
+  release, the window, when the current one ends, and the vault's own count
+  of buys paid to community keepers.
 
 - **Reading.** The card reads terms, progress and totals from the vault in one
   Multicall3 round trip, and history from the vault's own logs, best effort.
@@ -1313,7 +1842,8 @@ truth. It has no ledger entry and no runner, and no scheduler module sees it.
   of a vault ends, because the vault never depended on it: a card deleted,
   settings replaced or wiped, or a new browser leaves it holding its budget
   and buying. With a wallet connected where vaults are offered, the app asks
-  the factory how many vaults the account has created (`nonces`), and if any,
+  each listed factory, v1's and v2's, how many vaults the account has created
+  there (`nonces`), and if any,
   asks again at the newest block and reads the factory's `VaultCreated` logs
   by their owner topic, newest first, up to that block, until every vault
   counted is accounted for (`findVaultsByOwner` in `@spdex/vault`). The count
@@ -1327,7 +1857,7 @@ truth. It has no ledger entry and no runner, and no scheduler module sees it.
   40 queries; then the page says how many of the factory's count it can't
   show, and why, since those are known to exist. When the log search comes
   back incomplete, as it does on a service that caps `eth_getLogs`, the app
-  also reads the factory's own list (`searchVaultsFromFactoryList`,
+  also reads the factories' own lists (`searchVaultsFromFactoryList`,
   `lib/dca/factoryListSearch.ts`): every listed vault's `owner()`, compared in
   the page, at one block and through Multicall3 only. That is 2 + ⌈N/1000⌉ +
   ⌈N/200⌉ requests for N listed vaults, and fewer once owners are cached, since
@@ -1335,7 +1865,7 @@ truth. It has no ledger entry and no runner, and no scheduler module sees it.
   and never calls `nonces(owner)`. It is not a privacy measure: the service
   still sees the address in every balance read, and who owns a vault is public.
   Trust and exits offers the same search as a button ("Find my vaults from the
-  factory's list"), and what it finds is listed here too. The search runs
+  factories' lists"), and what it finds is listed here too. The search runs
   once per account on each network service (an Engine rebuilt for another
   setting keeps what it found), again on **Look again**, which also reads
   every known vault again, and again by itself, a few times over about
@@ -1345,46 +1875,53 @@ truth. It has no ledger entry and no runner, and no scheduler module sees it.
   plan the vault's own terms describe (`planFromVault`) with `addDcaPlan`,
   once `vaultClaim` proves the vault the account's on those terms, and **Close
   and withdraw** sends a card's close, checked by `VaultGuard` against that
-  plan. Closed, empty ones are one collapsed line.
+  plan. Closed, empty ones are one collapsed line. A v1 vault found this way
+  is shown, funded, triggered and closed as v1 always was; nothing moves it
+  to v2 (decision 27).
 
-The four transactions the owner's wallet signs are create (funded in the same
-transaction), fund, close and **Trigger now**. The host composes them, and
+The four transactions the owner's wallet signs for a vault are create (funded
+in the same transaction, on the latest release only), fund, close and
+**Trigger now**. With Help run's batch and a `prove` ("Community keeping",
+below) that makes six vault transactions. The host composes them all, and
 `VaultGuard` (`packages/guard/src/vault.ts`) checks them, for the reason tips
 and scheduled buys are checked: "we wrote it" has never been an exemption.
+Every check knows which release the vault is (`VaultClaim.release`).
 
 - **Static checks.** Each call is compared byte for byte with a fresh encoding
   aimed at the factory the app computed, or at the plan's own vault. The Guard
   proves that vault by recomputing its address. A creation whose buy fee is
   above the 0.69% ceiling is refused; a vault that already exists is never
-  refused for its fee.
+  refused for its fee. A v2 **Trigger now** is refused unless it is
+  `execute(owner)` sent by the owner; a v1 one is `execute()`.
 - **Simulated effects.** A creation must produce exactly one `VaultCreated`,
   from the factory, for this account, on these terms, at the predicted address,
   and the vault must hold every wei sent. Funding must arrive as the vault's
   WETH. A close must pay only the account. A trigger must deliver at least the
-  floor to the owner and the buy fee to the caller.
+  floor to the owner and the buy fee back to the owner: on a v2 vault,
+  `Bought.rewardTo` must be the owner and the fee is measured at the owner.
 - **Its codes.** `VAULT_MALFORMED` and `VAULT_NOT_DELIVERED`.
 - **When simulation is unavailable.** A vault transaction that sends ether is
   never signed unchecked, whatever `requireSimulation` says, because ether sent
   to an address with no code yet is simply lost. One that sends none (a close,
-  a trigger, an unfunded creation) follows the setting, so an endpoint that
-  cannot simulate never keeps an owner from their own money.
+  a trigger, an unfunded creation, a `prove`) follows the setting, so an
+  endpoint that cannot simulate never keeps an owner from their own money.
 - **At the signature.** Each call carries the chain it was checked for: the
   wallet is asked which chain it is on the moment it is asked to send, and the
   id goes with the transaction, so a wallet switched to another network while
   the check ran is refused rather than signing there. **Trigger now** carries
-  a gas floor of its own (`KEEPER_MIN_EXECUTE_GAS_LIMIT`, 384,000), because a
-  buy estimated on a quiet pool runs out of gas when a trade lands on the pool
-  first.
+  a gas floor of its own (`KEEPER_MIN_EXECUTE_GAS_LIMIT`, 396,000: v2's
+  `EXECUTE_GAS`, 330,000, and a fifth more), because a buy estimated on a
+  quiet pool runs out of gas when a trade lands on the pool first.
 - **Recording a creation.** A plan's vault is written once, from what the
   chain shows: the factory's `VaultCreated` in the receipt, or, when the
   receipt can't be read, the code at the predicted address confirmed by
   `settleCreation`. Never the prediction on its own, which a creation from
   another tab could have moved to the next nonce's address.
 
-The factory's one-time deployment moves nobody's money and does not go through
-the Guard. Instead, the app checks that the factory is not already there, that
-the listing checks pass right now, and that a call of exactly that transaction
-returns the address the app trusts.
+The one-time deployment of a release's contracts moves nobody's money and does
+not go through the Guard. Instead, the app checks that each contract is not
+already there, that the listing checks pass right now, and that a call of
+exactly that transaction returns the address the app trusts.
 
 ### Beta data
 
@@ -1397,22 +1934,37 @@ endpoint the operator chooses: the factories' `VaultCreated`; every listed
 batcher's `Batch`, `Triggered` and `NotTriggered`; each vault's own events;
 block timestamps and batch receipts; and a daily ETH/USD from Chainlink's
 aggregator logs. It joins those with the operator's keeper JSONL and state,
-and writes CSV tables and a `summary.json` answering twenty questions: buys and
-volume, new plans, deposits and value held, fee revenue, gas against revenue,
-subsidy against its caps, execution against the oracle, every window's fate,
-time into the window, failures, keeper uptime, inclusion and resends, the fee
-at send against the target, who triggers, vault lifecycles, oracle health,
-whether `MIN_ORACLE_DEPTH` is right, whether the data is complete, whether the
-cost model is right, and token tips.
+and writes CSV tables and a `summary.json` answering twenty-one questions: buys
+and volume, new plans, deposits and value held, fee revenue, gas against
+revenue, subsidy against its caps, execution against the oracle, every
+window's fate, time into the window, failures, keeper uptime, inclusion and
+resends, the fee at send against the target, who triggers, vault lifecycles,
+oracle health, whether `MIN_ORACLE_DEPTH` is right, whether the data is
+complete, whether the cost model is right, token tips, and how concentrated
+community window wins are.
+
+From v2 it splits buys by who made them (`made_by`): this keeper, other
+community keepers, owners, someone who paid the fee back to the owner, and
+anyone after the window. The last question is decision 29's: over the 30
+days ending at the report's last block, the share of v2 buys made inside
+their windows, and paid to someone other than the owner, that the top 1 and
+the top 5 `rewardTo` addresses won. The developers' keeper counts like
+anyone's. One `rewardTo` winning more than half formally reopens turns among
+holders (decision 6), which v2 left out; a range shorter than 30 days, or a v2
+buy that can't be placed in or out of its window, leaves the shares and the
+flag unknown. It reports the keeper's runway and its proofs too. Earnings are
+reported only as what was paid, after the fact.
 
 It reads to `finalized` by default, so nothing it reports can be reorganised
 away; the same range always gives the same files; it keeps to a request rate
 and waits out rate limits; and it records its provenance: the block range and
-its hashes, each log file's sha256, the price source, and the endpoint's host,
-never its URL. A figure it could not know is empty or null, never zero.
-Completeness is checked rather than assumed: every vault's `buyNumber` must run
-without gaps, and every batch's `earned` must equal the fees of the buys it
-made, and a block range the endpoint would not serve is listed as unknown.
+its hashes, each log file's sha256, the price source, every listed
+release's contracts, and the endpoint's host, never its URL. A figure it could
+not know is empty or null, never zero. Completeness is checked rather than
+assumed: every vault's `buyNumber` must run without gaps, every batch's
+`earned` must equal the fees of the buys it made, every v2 buy must be placed
+in or out of its community window, and a block range the endpoint would not
+serve is listed as unknown.
 
 Some things are deliberately unknowable: swaps made in the app as such, forms
 abandoned, errors people saw, which frontend created a vault, and who uses the
@@ -1425,10 +1977,12 @@ comes through channels they choose, such as GitHub issues.
 "Collective DCA: auto-buy vaults" shows what every vault has done: buys made,
 SPX delivered to owners, vaults still buying, owner addresses, ETH spent on
 buys and buy fees paid, with the budget still committed and the ETH vaults
-still hold. It counts **vault activity only**. A one-time swap or a buy someone
-confirms in their own wallet is an ordinary Uniswap trade that carries no
-spDEX marker, and none will be added: a marker would publicly label every
-address that ever used spDEX. The panel says so under the figures, always
+still hold, v1's and v2's together. One row more, "v2 buys paid to community
+keepers" ("inside each buy's community window"), says what share of v2 buys
+paid a community keeper inside its window. It counts **vault activity
+only**. A one-time swap or a buy someone confirms in their own wallet is an
+ordinary Uniswap trade that carries no spDEX marker, and none will be added:
+a marker would publicly label every address that ever used spDEX. The panel says so under the figures, always
 visible, and says that addresses aren't people.
 
 **Host code, not a tracker module** (`packages/vault/src/platform.ts`, with
@@ -1450,22 +2004,31 @@ network service key restricted to a list of contracts can list Multicall3 but
 never a vault made after the key was set up.
 
 1. `eth_blockNumber` gives the block.
-2. Each factory in `DEPLOYMENTS` is asked `vaultCount()`. Through Multicall3,
-   a factory with no code answers with empty data, which is how "not deployed
-   on this network" is told apart from "no vaults yet": the first shows a
-   sentence, never a grid of zeros. Mainnet reads that way today.
-3. `vaultsPage(offset, 1000)` lists the vaults, 1,000 to a call. Every listed
-   vault is one the factory vouches for: the call that set `isVault` also
-   appended it.
+2. Each factory in `DEPLOYMENTS`, v1's and v2's, is asked `vaultCount()`.
+   Through Multicall3, a factory with no code answers with empty data, which
+   is how "not deployed on this network" is told apart from "no vaults yet":
+   the first shows a sentence, never a grid of zeros. Until v2 is deployed,
+   mainnet reads that way for v2's factory.
+3. `vaultsPage(offset, 1000)` lists each factory's vaults, 1,000 to a call.
+   Every listed vault is one its factory vouches for: the call that set
+   `isVault` also appended it.
 4. Per vault, `owner()` and `terms()` once per chain for the session (a
    vault's address commits to both), then `buysDone()`, `closed()`,
-   `totalOut()` and its WETH balance. `totalRewards()` and `status()` aren't
-   read: the first is `buysDone × keeperReward`.
+   `totalOut()` and its WETH balance, and for a v2 vault `windowBuys()`.
+   Each vault's terms are decoded by its own release's ABI. `totalRewards()`
+   and `status()` aren't read: the first is `buysDone × keeperReward`.
 
-That is 2 + ⌈N/1000⌉ + ⌈6N/200⌉ requests the first time for N vaults (13 at
-301) and 2 + ⌈N/1000⌉ + ⌈4N/200⌉ after. Nothing is read until the panel is
-opened; a read is kept for 5 minutes per network service, and **Read again**
-refreshes it. A read stops at 5,000 vaults and offers the rest, and until
+For N v1 vaults that is 2 + ⌈N/1000⌉ + ⌈6N/200⌉ requests the first time (13
+at 301) and 2 + ⌈N/1000⌉ + ⌈4N/200⌉ after; a v2 vault takes one call more each
+time, and each factory its own pages. The share of v2 buys paid to
+community keepers is Σ `windowBuys` over Σ `buysDone` of v2 vaults, read from
+state rather than logs: a whole percentage rounded down ("less than 1%" for a
+few), with "37 of 100 v2 buys" a tap away. It is shown only when every v2
+vault was read, "none yet" before the first v2 buy, and otherwise the row is
+left out: a share of a partial read is no bound of anything. The vault counts
+a buy by whom it paid, so a buy whose fee went back to its owner is not
+among them. Nothing is read until the panel is opened; a read is kept for 5
+minutes per network service, and **Read again** refreshes it. A read stops at 5,000 vaults and offers the rest, and until
 then the totals say "at least". A vault whose calls fail is left out of every
 total, which then says "at least", with how many couldn't be read. No request
 names the person's address.
@@ -1474,61 +2037,152 @@ The figures are counts of vaults, ETH and SPX, with no money value anywhere,
 and the footer names the block and how many requests it took. Once read, the
 ticker adds "N vault buys"; it is dropped when unknown.
 
-The same list serves the owner search in Trust and exits and the auto-buy
+The same lists serve the owner search in Trust and exits and the auto-buy
 panel's fallback (`searchVaultsFromFactoryList`, "In the app" above), and the
 two share the cache of owners.
 
 ### Helping run the network
 
 Under the Collective DCA figures, a connected wallet on the configured chain
-can make other people's due vault buys in one transaction and be paid their
+can make other people's due v2 vault buys in one transaction and be paid their
 buy fees (`components/network/HelpRunNetwork.tsx`, `lib/network/batch.ts`).
-It is offered only with private sending: a batch sent publicly is copied by
-bots that take the fees first, and the copy's loser still pays its network
-fee. Nothing about the person's address is read until they press **See which
-buys are due**.
+The batch names the connected wallet as `rewardTo`, so each vault pays it
+directly. It is offered only with private sending: a batch sent publicly is
+copied by bots that take the fees first, and the copy's loser still pays its
+network fee. v1 vaults' buys are not offered; they are left to keepers and
+anyone else (decision 27). Nothing about the person's address is read until
+they press **See which buys are due**.
 
 1. **Which are due.** `readDueCandidates(rpc, read, { block })`
-   (`packages/vault/src/platform.ts`) reads, for each vault in Collective
+   (`packages/vault/src/platform.ts`) reads, for each v2 vault in Collective
    DCA's read that isn't closed, has buys left and holds a buy and its fee,
    the same five things the keeper does (`buysDone`, `lastBuyAt`, `closed`,
    WETH, `quote()`), and the block's time, in one Multicall3 request per 30
    vaults. Due-ness is worked out locally with the keeper's `earliestBuyAt`,
-   never `status()`; a vault whose quote is under its floor, or whose price
-   pool is too thin to judge it, is left out, as the keeper leaves it. The app doesn't import `keeper-read.ts`: it pulls in the
-   keeper's sender and config; `@spdex/vault` re-exports only the keeper's
-   pure planning from `keeper-plan.ts`.
-2. **Which to make.** The gas price is read once and is the price signed.
+   and each buy's community window with its `dueSinceAt` and
+   `communityWindowEndsAt`, never `status()`; a vault whose quote is under its
+   floor, or whose price pool is too thin to judge it, is left out, as the
+   keeper leaves it. When any of them is inside its window, the wallet's
+   standing is read at the same block (`readHolderStatus`: `isEligible`,
+   `validUntil`, its SPX balance, its code). The app doesn't import
+   `keeper-read.ts`: it pulls in the keeper's sender and config;
+   `@spdex/vault` re-exports only the keeper's pure planning from
+   `keeper-plan.ts`.
+2. **Which are offered** (`splitByWindow`). A buy past its window is offered
+   to anyone, as before. One still inside it is offered only to a wallet the
+   registry finds eligible at that block, with its proof still valid a block
+   (12 seconds) later, where the vault asks (`eligibleInNextBlock`); a
+   standing that couldn't be read is not a yes. There is no exception for the
+   wallet's own vault: **Trigger now** on its card makes that buy. Any other
+   wallet is shown when holders' first claim ends, by this device's clock
+   ("SPX holders have first claim until 14:32."), why it isn't a community
+   keeper in one line (a contract; its shortfall, "You hold 120 of the 690
+   SPX."; a proof never made or lapsed), the paid-work sentence and a plain
+   link to `docs/KEEPER.md`, "Becoming a community keeper", built from the
+   source address the build was given and left out when there is none, and
+   no buy button for those buys, which are never ticked: keeping is described
+   as paid work, never with an APR or projected earnings (decision 23). With
+   no v2 buy due, the panel says "No v2 vault buy is due right now; v1
+   vaults' buys are left to keepers."
+3. **Which to make.** The gas price is read once and is the price signed.
    The keeper's own `selectBatch`, as a private send that plans no loss, at
-   most 20 vaults, small buys first. Every due vault is listed with its fee,
-   and no owner; unticking one asks again.
-3. **A test-run from the person's address** (`eth_simulateV1`) at the exact
+   most 20 vaults, small buys first. Every due vault offered is listed with
+   its fee, and no owner; unticking one asks again.
+4. **A test-run from the person's address** (`eth_simulateV1`) at the exact
    gas limit it will be signed with (`batchGasLimit`), since the batcher
    decides by the gas left whether to try each vault. Only the vaults that
-   bought stay, and it is run again until every one does; a batch that would
-   pass on swept WETH isn't offered.
-4. **Only when it pays.** `minRewards` = the test-run's gas × 1.1 × the price,
+   bought stay, and it is run again until every one does. No WETH passes
+   through v2's batcher, so there is no swept WETH to refuse.
+5. **Only when it pays.** `minRewards` = the test-run's gas × 1.1 × the price,
    rounded up; offered only when the fees earned reach it, and only for as
    much of the batch as the wallet can put up the maximum fee for, keeping
    `GAS_RESERVE_WEI` back.
-5. **The Guard.** `Engine.checkVaultBatch(intent)` builds the one call itself
-   (`executeBatch(vaults, account, minRewards)` to the factory's batcher, at
-   exactly the gas limit and price) and has `VaultGuard` check it: the batch
-   path is never signed unverified, and runs through the second opinion when
-   one is set. It also refuses (`VAULT_NOT_DELIVERED`) a `minRewards` below
-   the gas its own test-run of the call used × the signed price, taking the
-   larger of the two services' gas figures when there is a second opinion;
-   the price is the main service's. The **Make** button shows only for a
-   verified batch, and the check runs again when it is pressed.
-6. **Sending.** Through the page's one wallet lock, with `walletSender` and
+6. **The Guard.** `Engine.checkVaultBatch(intent)` builds the one call itself
+   (`executeBatch(vaults, account, minRewards)` to v2's batcher, at exactly
+   the gas limit and price) and has `VaultGuard` check it: the batch path is
+   never signed unverified, takes v2 vaults only, and runs through the second
+   opinion when one is set. Every `Bought` must pay the account, `earned`
+   must be the sum of the rewards, and a vault that refuses `NotEligible`
+   drops out without refusing the batch. It also refuses
+   (`VAULT_NOT_DELIVERED`) a `minRewards` below the gas its own test-run of
+   the call used × the signed price, taking the larger of the two services'
+   gas figures when there is a second opinion; the price is the main
+   service's. The **Make** button shows only for a verified batch, and the
+   check runs again when it is pressed.
+7. **Sending.** Through the page's one wallet lock, with `walletSender` and
    `submit`, privately, with no public fallback, signed at the call's exact
    `gas` and `gasPrice` (`SendableCall.gas`/`gasPrice`: no estimate is taken).
    A wallet that can't `eth_signTransaction` is told it can't help.
-7. **After.** The result is read from the receipt's `Batch` event, never the
+8. **After.** The result is read from the receipt's `Batch` event, never the
    test-run: buys made, WETH received, the network fee, and each untried
    vault's reason, with a finality badge. The browser's records keep a
    `buy-fees-earned` row, which Your activity, the CSV and the statement show
    as fees received, never as a buy or a sale.
+
+### Community keeping
+
+A closed fold at the foot of Help run the network, **Community keeping**,
+reads nothing until it is opened, and shows even without private sending,
+since proving needs none. Community keepers make other people's buys and are
+paid for each one; holding 690 SPX is the entry bar. The fold says whether the
+connected wallet is eligible and until when, and how much SPX it holds
+against `MIN_SPX`, all read at one block, with "unknown" for anything it could
+not read. A wallet that is a contract is told so: "Only an ordinary account
+can be paid as a community keeper; this address is a contract."
+
+- **Prove my SPX**, offered to an ordinary account holding `MIN_SPX` now
+  whose proof is missing or has five days or less left. The app reads the
+  `finalized` block from the person's network service, rebuilds its header as
+  RLP from the block's fields (`blockHeaderRlp`, `@spdex/chain`), and goes no
+  further unless it hashes to the block's hash (when the known fields don't,
+  it tries the answer's other hex fields after them, for a field a newer hard
+  fork appended, and takes only a header that hashes: `checkedHeaderOf`);
+  then `eth_getProof` for SPX's
+  balance slot at that block, checked against the header's state root and
+  refused in words if the balance there is under `MIN_SPX` ("At block … it
+  held … SPX; proving takes 690."), then `encodeProve`, the Guard's `prove`
+  check, and one transaction from the wallet, with a gas limit of its
+  estimate and a fifth, at most 750,000 (`buildHolderProof`, `proveGasLimit`
+  in `packages/vault/src/registry.ts`). The Guard's check: one call to the
+  release's registry, no ether, calldata exactly `encodeProve` of the proof,
+  a header hashing to the stated block hash, both proofs' root nodes tied to
+  that header's state root, the block's hash read from the service again, and
+  a simulation in which the registry emits exactly one `Proven` for this
+  holder and block; a proof the registry would refuse as `NotNewer` is
+  refused in words there. Unless the wallet is known to have proven before,
+  the panel first says what proving publishes (decision 24). A proof goes
+  out the way the person sends: privately when private sending is on, and,
+  when the wallet can't sign for that, publicly only after the panel asks. A
+  receipt that doesn't come within the wait says so and frees the panel
+  rather than leave it busy.
+- **Prove another address** (decision 22), a nested closed fold: the same,
+  for any address typed in (checked against its checksum when typed in mixed
+  case), with the connected wallet paying the gas. That is how a hot browser
+  wallet proves a keeper's cold `rewardTo` without the cold wallet touching a
+  browser. Its standing is read first: a contract, or an address holding
+  less than `MIN_SPX` now, is refused in words, since no proof could make it
+  a community keeper.
+- **Paste a proof**, a nested closed fold. When the person's service refuses
+  `eth_getProof`, the panel says so and opens it, and shows the exact
+  requests to run against another service as two `curl` commands
+  (`eth_getBlockByNumber` and `eth_getProof`, at a block number read from the
+  person's own service), takes the pasted answers, and checks them against
+  the person's own service before building the transaction: the rebuilt
+  header's hash, the block within the registry's 8,191, the proof against
+  its state root (`checkPastedProof`). It sends only for an ordinary account
+  holding `MIN_SPX` now. It never fetches from anywhere else (rule 4), and
+  points to `docs/RPC-RUNBOOK.md`, "Proving SPX held: `eth_getProof`", for
+  services that answer.
+- **Lapse reminders** (decision 25). From 5 days before a proof lapses
+  (`PROOF_LAPSE_WARNING_SECONDS`) to its last valid second, a banner in the
+  fold; and, if the person ticks its box, a notification of its own
+  (`lib/reminders/lapse.ts`) while a tab is open, through the buy-due
+  notification's path, with no icon. Its dates are this device's clock's.
+
+Proving moves no money: a `prove` carries no ether, and a false one only
+reverts. So it is not on the list of paths that never sign unchecked; it
+follows `requireSimulation` and may be signed "Checked on one service". Every
+prove button is a money control (UI rule R2).
 
 ## What adding a module kind actually takes
 
@@ -1745,7 +2399,11 @@ are `TileGroup` and `Tile` in `packages/ui`.
   TRADING AND BELIEVE IN SOMETHING". The tile that swaps and sets up auto-buys is
   chip BELIEVE, title **Buy SPX**, and the copy says "buy" and "swap".
   `copy.test.ts` and `e2e/shell.spec.ts` fail on the word anywhere a person can
-  read it, except the motto quoted as a saying.
+  read it, except the motto quoted as a saying. Nor is keeping sold as an
+  investment: community keeping is paid work, and no screen, Community
+  keeping's included, shows an APR or APY, a yield, a "reward", a projection
+  or an "earn up to" (decision 23); `e2e/shell.spec.ts` checks every screen
+  for them, and the copy tests each new sentence.
 
 ### UI rules
 
@@ -1763,7 +2421,8 @@ where the rules are.
   under the pointer (Send publicly, a settings link's Apply) arms its button
   only after that long (`useArmed`). `MONEY_CONTROLS` in `lib/tiles.ts` is
   the list. It includes Swap, Start, a vault's create, fund, close and
-  trigger, Confirm buy, Tip this address, Send publicly, Apply
+  trigger, Help run's Make, Prove my SPX, Prove another address and sending
+  a pasted proof, Confirm buy, Tip this address, Send publicly, Apply
   these settings, Remove and continue, turning
   auto-buy on, choosing or saving a network service, every button that opens
   the wallet, and anything marked `data-money-control`. Focus goes to the
@@ -1792,7 +2451,8 @@ where the rules are.
 - **R6 · Honest limits stay visible.** Short copy never hides these behind a
   tap. Each stays on screen as a word, a badge or a line, and only its
   explanation moves into a `Term` or a fold: UNAUDITED and the 0.5 ETH cap;
-  that anyone can make a vault's due buys and nobody has to; that only
+  that anyone can make a vault's due buys, SPX holders first for a v2 buy's
+  community window, and nobody has to; that only
   closing a vault stops it; who a buy fee is paid to; that missed buy times
   are skipped and the plan ends later; that a plan you confirm needs spDEX
   open; that a Permit2 permission is unlimited until revoked; that a later
@@ -1856,10 +2516,11 @@ where the rules are.
 - **No contract anyone controls.** Swaps, tips and tab-run auto-buys go
   through no contract of spDEX's, which is why a split route cannot be atomic
   (see `docs/THREAT-MODEL.md`). The contracts spDEX does ship, the auto-buy
-  vault, its factory and the batcher, have no owner, admin, upgrade, pause or
-  fee, and a new market list means a new factory, never an edit. What changed,
-  and what that does and does not buy, is under "No contract anyone controls"
-  above. They are unaudited, which is why each vault is capped at 0.5 ETH.
+  vault, its factory, the batcher and, from v2, the SPX holder registry, have
+  no owner, admin, upgrade, pause or fee, and a new market list means a new
+  factory, never an edit. What changed, and what that does and does not buy,
+  is under "No contract anyone controls" above. They are unaudited, which is
+  why each vault is capped at 0.5 ETH.
 
 ## Upgradeability
 
@@ -1890,15 +2551,48 @@ must still open, so `packages/config` carries migrations rather than a schema
 that quietly changes meaning.
 
 **The vault contracts are the exception: they cannot be upgraded at all,** and
-that is the point of them. A bug fix, a new limit or a new market means a new
-factory at a new address, a release whose generated artifacts point at it,
-and a new entry in `deployments.json` beside the old ones, never in their
-place. A batcher with a bug is replaced the same way, by new code or a new
-salt, in an entry naming the same factory; vaults are unaffected, since the
-batcher has no rights over them. Vaults already created keep the code they
-were created with, keepers go on serving them through their own release's
-batcher, and closing one needs only its owner's wallet calling `close()`. The
-vault pays the owner itself; this app is not in that path.
+that is the point of them. Vaults already created keep the code they were
+created with for good, keepers go on serving them, and closing one needs only
+its owner's wallet calling `close()`, which pays the owner itself; this app is
+not in that path. So every change of behaviour on chain means new contracts at
+new addresses, beside the old ones and never in their place, and the design
+works at making each such change as small as it can be, and as rare
+(decisions 34–38):
+
+- **Nothing deployed.** A different default fee, a different window or, once
+  decision 29 trips, turns among holders (shipped in the vault, unused:
+  `turnBuckets`), all reach new plans with an app release. So does a new gas
+  figure for batched buys, since the batcher takes it from its caller.
+- **A batcher alone.** The batcher is bound to no factory, so a fixed batcher
+  is one more `batchers` entry in `deployments.json`, deployed by itself, and
+  every release whose vaults take `rewardTo` goes through it.
+- **A factory from the same code.** Another market list, or another registry,
+  is a release built from an existing source: a `releases` entry the build
+  fills in, one deployment, and no code anywhere, because everything off chain
+  goes by a release's source's features rather than by its name.
+- **New code.** A fix to the vault, the factory or the registry, a new limit
+  (`MAX_FUNDING`, after an audit) or a new trading venue is a new source: the
+  deployed one frozen under `packages/vault/releases/`, the new one built from
+  `contracts/`, and a release from it. v2 is the first such release: a new
+  registry, factory and batcher, with v1's source frozen under
+  `packages/vault/releases/v1` and v1's contracts and vaults running on as
+  they are.
+
+Nothing a fork can reprice may strand anyone's money, since no deployed
+contract can be adjusted afterwards: `close` pays the budget as WETH if
+unwrapping it fails, and the registry's stipend has eight times the room an
+honest answer needs.
+
+A bug in the registry or its verifier found after deployment could let an
+address that never held SPX be paid inside a window, as anyone is paid for
+every buy in v1; it cannot reach a vault's money. The answer is decision 31:
+the app keeps creating v2 vaults, since the worst case is v1's behaviour, a
+build adds a notice, and a fixed registry and the factory that names it ship
+as v3, sharing the batcher. The notice is ready and empty: `REGISTRY_ADVISORY`
+(`lib/dca/advisory.ts`) is null in every build until then, and a build that
+sets it shows its words as a warning on every v2 vault's card, above the
+form that creates one, and in Community keeping, and nowhere for v1. It
+ships in the bundle; nothing is fetched to learn of it.
 
 ## Determinism
 
@@ -1911,7 +2605,14 @@ The vault's forge tests pin the same block as a constant
 (`packages/vault/test/forge/utils/Fork.sol`) and fork it themselves from the
 archive endpoint, never from the shared local fork. That lets them move time
 freely with `vm.warp`, which stays inside the test's own EVM. No test moves the
-shared fork's clock: a test that needs a second buy window leaves it to forge.
+shared fork's clock: a test that needs a second buy slot, or a community
+window's edge to the second, leaves it to forge.
+
+A fork cannot prove a block it mined, so the registry's tests send real
+mainnet proofs, recorded from the archive endpoint for blocks up to the pinned
+one (`packages/vault/test/fixtures/proofs`, `scripts/record-proofs.mjs`),
+each checked against the block's hash and SPX's `balanceOf` when it is
+recorded. `AGENTS.md` has the rules for eligibility on the shared fork.
 
 Modules must not read a clock or randomness, so that identical inputs produce
 byte-identical output. The sandbox has neither; natively they exist, and a
@@ -1926,5 +2627,7 @@ venue builds identical plans.
 - `docs/WRITING-MODULES.md` — the module interface
 - `docs/IPFS-RELEASE.md` — reproducible builds and publishing
 - `docs/RELEASE.md` — the release checklist, and deploying the contracts
+- `docs/V2_UPGRADE.md` — the design of v2, the community window, and its
+  numbered decisions
 - `docs/WALKAWAY.md` — checking a copy of spDEX, and doing without it
 - `AGENTS.md` — the verify gate, and what each stage proves

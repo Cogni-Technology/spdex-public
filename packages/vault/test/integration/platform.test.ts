@@ -5,13 +5,16 @@
  * reads each vault through a different path (one Multicall3 round trip per
  * vault, with `status()` rather than `balanceOf`).
  *
- * It makes vaults of its own first, so the fork holds at least one that has
- * bought and one that is closed whatever ran before it: the factory is
- * deployed if it isn't there yet, the plans start at the chain's own time so
- * the first buy is due at once, and every address is fresh. Assertions are
- * against reads made here, never against counts from an earlier run. It never
- * triggers or closes a vault it didn't create, and never moves the fork's
- * clock.
+ * It makes vaults of its own first, in both releases' factories, so the fork
+ * holds at least one that has bought, one bought by an SPX holder inside its
+ * community window, one that is closed and one of v1's, whatever ran before
+ * it: the contracts are deployed if they aren't there yet, the plans start at
+ * the chain's own time so the first buy is due at once (and inside its
+ * window), and every address is fresh. The SPX holder paid is the real one the
+ * fork tests borrow, proven from its recorded mainnet proof (`fork.ts`).
+ * Assertions are against reads made here, never against counts from an
+ * earlier run. It never triggers or closes a vault it didn't create, and never
+ * moves the fork's clock.
  *
  * Requires a fork: `pnpm anvil:fork`.
  */
@@ -21,21 +24,26 @@ import { decodeFunctionResult, encodeFunctionData } from "viem";
 import type { Address, Hex } from "@spdex/core";
 import { CONTRACTS, Multicall3Reader, TOKENS, addressOfKey, generateSpendingKey, httpRpc, prepareTransaction, signPrepared, type JsonRpc } from "@spdex/chain";
 import {
+  DEPLOYMENTS,
   FACTORY_ABI,
   KEEPER_MIN_EXECUTE_GAS_LIMIT,
   MAINNET_DEPLOYMENT,
   MAINNET_FACTORY,
+  V1_FACTORY_ABI,
+  V1_MAINNET_FACTORY,
   VAULT_LIMITS,
   buyFee,
-  deployFactoryCall,
   encodeClose,
   encodeCreateVault,
   encodeExecute,
+  encodeExecuteV1,
   factoryAddress,
+  featuresOf,
   readPlatform,
   readVault,
   readVaultCount,
   summarisePlatform,
+  v1BuyFee,
   vaultBudget,
   vaultsCreatedBy,
   type PlatformRead,
@@ -44,6 +52,7 @@ import {
   type VaultPlan,
   type VaultState,
 } from "../../src/index.js";
+import { HOLDER, ensureHolderProven, ensureRelease } from "./fork.js";
 
 const FORK_URL = process.env["SPDEX_FORK_URL"] ?? "http://127.0.0.1:8545";
 const CHAIN_ID = Number(process.env["SPDEX_FORK_CHAIN_ID"] ?? "690069");
@@ -110,9 +119,15 @@ function sumOfReadVault(states: VaultState[]) {
   let fees = 0n;
   let committed = 0n;
   let held = 0n;
+  let v2Buys = 0n;
+  let communityWindowBuys = 0n;
   const owners = new Set<string>();
   for (const s of states) {
     buys += s.buysDone;
+    if (featuresOf(s.release).communityWindow) {
+      v2Buys += s.buysDone;
+      communityWindowBuys += s.windowBuys!;
+    }
     if (s.terms.tokenOut === spx) spxDelivered += s.totalOut;
     owners.add(s.owner);
     ethSpent += s.buysDone * s.terms.amountPerBuy;
@@ -131,7 +146,7 @@ function sumOfReadVault(states: VaultState[]) {
     const need = left * (s.terms.amountPerBuy + s.terms.keeperReward);
     committed += s.status.wethBalance < need ? s.status.wethBalance : need;
   }
-  return { buys, spxDelivered, open, finished, closed, owners: BigInt(owners.size), ethSpent, fees, committed, held };
+  return { buys, spxDelivered, open, finished, closed, owners: BigInt(owners.size), ethSpent, fees, committed, held, v2Buys, communityWindowBuys };
 }
 
 describe("Collective DCA figures on the fork", () => {
@@ -139,7 +154,11 @@ describe("Collective DCA figures on the fork", () => {
   let plan: VaultPlan;
   const mine: Address[] = [];
   let bought: Address;
+  /** Bought inside its community window by a keeper paying the proven SPX holder. */
+  let holderBought: Address;
   let closedVault: Address;
+  /** A v1 vault, bought once by whoever called it. */
+  let v1Vault: Address;
   let block: bigint;
   const cache: VaultIdentityCache = new Map();
   let first: PlatformRead;
@@ -154,10 +173,10 @@ describe("Collective DCA figures on the fork", () => {
 
   beforeAll(async () => {
     expect(Number(BigInt((await rpc("eth_chainId", [])) as string))).toBe(CHAIN_ID);
-    const deployer = await freshAccount(ETHER);
-    const call = deployFactoryCall();
-    // Another suite may deploy it between the check and the send; the code is there either way.
-    if (!(await hasCode(MAINNET_FACTORY))) await send(deployer.key, call.to, call.data);
+    // Another suite may deploy them, or prove the holder, first: the state is the same either way.
+    await ensureRelease("v2");
+    await ensureRelease("v1");
+    await ensureHolderProven();
     expect(await hasCode(MAINNET_FACTORY)).toBe(true);
 
     owner = await freshAccount(ETHER);
@@ -166,32 +185,48 @@ describe("Collective DCA figures on the fork", () => {
     plan = {
       marketIndex: 0n,
       amountPerBuy,
-      interval: VAULT_LIMITS.MIN_INTERVAL,
+      interval: 3_600n,
       maxBuys: 3n,
-      // Chain time, never the wall clock: the first buy is due in the next block.
+      // Chain time, never the wall clock: the first buy is due in the next block,
+      // inside a 15-minute community window.
       startAt: BigInt(latest.timestamp),
       keeperReward: buyFee(amountPerBuy).reward,
       maxSlippageBps: 300n,
+      communityWindow: 900n,
+      turnBuckets: 0n,
     };
 
+    // Trigger now's buy, paid back to the owner: the window never refuses it, and it isn't the community's.
     bought = await createVault();
     const keeper = await freshAccount(ETHER / 10n);
-    await sendOk(keeper.key, bought, encodeExecute(), { gas: KEEPER_MIN_EXECUTE_GAS_LIMIT });
+    await sendOk(keeper.key, bought, encodeExecute(owner.address), { gas: KEEPER_MIN_EXECUTE_GAS_LIMIT });
+
+    // The community's: the same kind of buy, inside the window, paid to the proven holder.
+    holderBought = await createVault();
+    await sendOk(keeper.key, holderBought, encodeExecute(HOLDER), { gas: KEEPER_MIN_EXECUTE_GAS_LIMIT });
 
     closedVault = await createVault();
     await sendOk(owner.key, closedVault, encodeClose());
+
+    // A v1 vault, on v1's frozen factory, bought by whoever called.
+    const args = [0n, amountPerBuy, VAULT_LIMITS.MIN_INTERVAL, 2n, BigInt(latest.timestamp), v1BuyFee(amountPerBuy).reward, 300n] as const;
+    const v1Budget = 2n * (amountPerBuy + v1BuyFee(amountPerBuy).reward);
+    const created = await sendOk(owner.key, V1_MAINNET_FACTORY, encodeFunctionData({ abi: V1_FACTORY_ABI, functionName: "createVault", args }), { value: v1Budget });
+    v1Vault = vaultsCreatedBy(V1_MAINNET_FACTORY, created.logs)[0]!.vault;
+    await sendOk(keeper.key, v1Vault, encodeExecuteV1(), { gas: KEEPER_MIN_EXECUTE_GAS_LIMIT });
 
     block = BigInt((await rpc("eth_blockNumber", [])) as string);
   });
 
   afterAll(async () => {
-    // The vault still open goes back to its owner; the closed one already did.
-    if (bought) await sendOk(owner.key, bought, encodeClose());
+    // The vaults still open go back to their owner; the closed one already did.
+    for (const vault of [bought, holderBought, v1Vault]) if (vault) await sendOk(owner.key, vault, encodeClose());
   });
 
-  it("adds up, at one pinned block, exactly what readVault says of every listed vault at that block", async () => {
+  it("adds up, at one pinned block, exactly what readVault says of every listed vault of every release at that block", async () => {
     const recorded = recording(rpc);
-    first = await readPlatform(recorded.rpc, { block, cache, deployments: [{ id: "v1", factory: MAINNET_FACTORY }] });
+    // Every release there is, by default: v1's factory and this build's.
+    first = await readPlatform(recorded.rpc, { block, cache });
     // Every request was a Multicall3 call at the pinned block: no "latest" slipped in.
     for (const { method, params } of recorded.sent) {
       expect(method).toBe("eth_call");
@@ -199,40 +234,47 @@ describe("Collective DCA figures on the fork", () => {
       expect(params[1]).toBe(hex(block));
     }
     expect(first.requests).toBe(recorded.sent.length);
-
-    const [deployment] = first.deployments;
-    if (deployment?.state !== "read") throw new Error("the factory should be deployed");
-    // The count, asked of the factory directly rather than through Multicall3.
-    const countAtBlock = decodeFunctionResult({
-      abi: FACTORY_ABI,
-      functionName: "vaultCount",
-      data: (await rpc("eth_call", [{ to: MAINNET_FACTORY, data: encodeFunctionData({ abi: FACTORY_ABI, functionName: "vaultCount" }) }, hex(block)])) as Hex,
-    });
-    expect(deployment.count).toBe(countAtBlock);
-    expect(deployment.unreadable).toEqual([]);
-    expect(BigInt(deployment.listed)).toBe(deployment.count);
+    expect(first.deployments.map((d) => [d.id, d.release, d.factory])).toEqual(DEPLOYMENTS.map((d) => [d.id, d.id, d.factory]));
 
     const pinnedReader = new Multicall3Reader(rpc, { blockTag: hex(block) });
     const states: VaultState[] = [];
-    for (const figures of deployment.vaults) {
-      const state = await readVault(rpc, figures.vault, { reader: pinnedReader });
-      if (state === null) throw new Error(`${figures.vault} didn't read as a vault at block ${block}`);
-      expect(figures).toEqual({
-        vault: state.address,
-        owner: state.owner,
-        terms: state.terms,
-        closed: state.closed,
-        buysDone: state.buysDone,
-        totalOut: state.totalOut,
-        wethBalance: state.status.wethBalance,
+    let made = 0n;
+    for (const deployment of first.deployments) {
+      if (deployment.state !== "read") throw new Error(`${deployment.id}'s factory should be deployed`);
+      // The count, asked of the factory directly rather than through Multicall3.
+      const countAtBlock = decodeFunctionResult({
+        abi: FACTORY_ABI,
+        functionName: "vaultCount",
+        data: (await rpc("eth_call", [{ to: deployment.factory, data: encodeFunctionData({ abi: FACTORY_ABI, functionName: "vaultCount" }) }, hex(block)])) as Hex,
       });
-      states.push(state);
+      expect(deployment.count).toBe(countAtBlock);
+      expect(deployment.unreadable).toEqual([]);
+      expect(BigInt(deployment.listed)).toBe(deployment.count);
+      made += deployment.count;
+
+      for (const figures of deployment.vaults) {
+        const state = await readVault(rpc, figures.vault, { reader: pinnedReader });
+        if (state === null) throw new Error(`${figures.vault} didn't read as a vault at block ${block}`);
+        expect(state).toMatchObject({ release: deployment.release, fromFactory: true, factory: deployment.factory });
+        expect(figures).toEqual({
+          vault: state.address,
+          release: state.release,
+          owner: state.owner,
+          terms: state.terms,
+          closed: state.closed,
+          buysDone: state.buysDone,
+          totalOut: state.totalOut,
+          wethBalance: state.status.wethBalance,
+          windowBuys: state.windowBuys,
+        });
+        states.push(state);
+      }
     }
 
     const summary = summarisePlatform(first);
     if (summary.state !== "read") throw new Error("expected figures");
     const exact = sumOfReadVault(states);
-    expect(summary.made).toBe(deployment.count);
+    expect(summary.made).toBe(made);
     expect(summary.read).toBe(states.length);
     expect(summary.unreadable + Number(summary.unread)).toBe(0);
     for (const [key, value] of Object.entries(exact)) {
@@ -240,13 +282,21 @@ describe("Collective DCA figures on the fork", () => {
     }
   });
 
-  it("counts this test's own vaults as they are: one bought once, one closed", () => {
-    const [deployment] = first.deployments;
-    if (deployment?.state !== "read") throw new Error("the factory should be deployed");
-    const byAddress = new Map(deployment.vaults.map((v) => [v.vault, v]));
-    expect(byAddress.get(bought)).toMatchObject({ owner: owner.address.toLowerCase(), closed: false, buysDone: 1n });
+  it("counts this test's own vaults as they are: one bought for its owner, one by the community, one closed, one of v1's", () => {
+    const byAddress = new Map(first.deployments.flatMap((d) => (d.state === "read" ? d.vaults : [])).map((v) => [v.vault, v]));
+    const mine = owner.address.toLowerCase();
+    expect(byAddress.get(bought)).toMatchObject({ release: "v2", owner: mine, closed: false, buysDone: 1n, windowBuys: 0n });
     expect(byAddress.get(bought)!.totalOut > 0n).toBe(true);
-    expect(byAddress.get(closedVault)).toMatchObject({ owner: owner.address.toLowerCase(), closed: true, buysDone: 0n, wethBalance: 0n });
+    expect(byAddress.get(holderBought)).toMatchObject({ release: "v2", owner: mine, closed: false, buysDone: 1n, windowBuys: 1n });
+    expect(byAddress.get(closedVault)).toMatchObject({ release: "v2", owner: mine, closed: true, buysDone: 0n, wethBalance: 0n, windowBuys: 0n });
+    expect(byAddress.get(v1Vault)).toMatchObject({ release: "v1", owner: mine, closed: false, buysDone: 1n, windowBuys: null });
+    expect(byAddress.get(v1Vault)!.terms.communityWindow).toBeNull();
+    // The share counts the holder's buy among every v2 buy, and is known: every v2 vault was read.
+    const summary = summarisePlatform(first);
+    if (summary.state !== "read") throw new Error("expected figures");
+    expect(summary.communityWindowBuys.value).toBeGreaterThanOrEqual(1n);
+    expect(summary.v2Buys.value).toBeGreaterThanOrEqual(summary.communityWindowBuys.value + 1n);
+    expect([summary.v2Buys.atLeast, summary.communityWindowBuys.atLeast]).toEqual([false, false]);
   });
 
   it("reads the same figures again from the cache, never with more requests, and ignores a vault made after the block", async () => {
@@ -259,15 +309,15 @@ describe("Collective DCA figures on the fork", () => {
     for (const vault of first.deployments.flatMap((d) => (d.state === "read" ? d.vaults : []))) {
       expect(cache.get(vault.vault), vault.vault).toMatchObject({ owner: vault.owner, terms: vault.terms });
     }
-    const again = await readPlatform(rpc, { block, cache, deployments: [{ id: "v1", factory: MAINNET_FACTORY }] });
+    const again = await readPlatform(rpc, { block, cache });
     expect(again.requests).toBeLessThanOrEqual(first.requests);
     expect({ ...summarisePlatform(again), requests: 0 }).toEqual({ ...summarisePlatform(first), requests: 0 });
 
     // At the latest block the new vault is there; at the pinned one it isn't.
-    const latest = summarisePlatform(await readPlatform(rpc, { cache, deployments: [{ id: "v1", factory: MAINNET_FACTORY }] }));
+    const latest = summarisePlatform(await readPlatform(rpc, { cache }));
     const pinned = summarisePlatform(first);
     if (latest.state !== "read" || pinned.state !== "read") throw new Error("expected figures");
-    expect(latest.made).toBe(await readVaultCount(rpc, MAINNET_FACTORY));
+    expect(latest.made).toBe((await readVaultCount(rpc, V1_MAINNET_FACTORY)) + (await readVaultCount(rpc, MAINNET_FACTORY)));
     expect(latest.made > pinned.made).toBe(true);
   });
 
@@ -277,7 +327,7 @@ describe("Collective DCA figures on the fork", () => {
     expect(await hasCode(elsewhere)).toBe(false);
     const recorded = recording(rpc);
     const read = await readPlatform(recorded.rpc, { block, deployments: [{ id: "elsewhere", factory: elsewhere }] });
-    expect(read.deployments).toEqual([{ id: "elsewhere", factory: elsewhere, state: "not-deployed" }]);
+    expect(read.deployments).toEqual([{ id: "elsewhere", release: "v2", factory: elsewhere, state: "not-deployed" }]);
     expect(recorded.sent.map((s) => (s.params[0] as { to: string }).to)).toEqual([CONTRACTS.multicall3]);
     expect(summarisePlatform(read)).toEqual({ state: "not-deployed", block, requests: 1 });
   });

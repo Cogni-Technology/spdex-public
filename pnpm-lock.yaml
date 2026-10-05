@@ -466,6 +466,12 @@ importers:
       '@spdex/core':
         specifier: workspace:*
         version: link:../core
+      '@spdex/vault':
+        specifier: workspace:*
+        version: link:../vault
+      viem:
+        specifier: ^2.56.8
+        version: 2.56.8(typescript@7.0.2)(zod@4.6.5)
 
   packages/ui:
     devDependencies:

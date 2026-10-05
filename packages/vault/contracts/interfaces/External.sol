@@ -61,10 +61,3 @@ interface IUniswapV2FactoryMinimal {
 interface IUniswapV3FactoryMinimal {
     function getPool(address tokenA, address tokenB, uint24 fee) external view returns (address pool);
 }
-
-/// @notice What the batcher reads from the vault factory it is bound to: whether it created a
-///         vault, and the WETH its vaults pay rewards in.
-interface IVaultFactoryMinimal {
-    function isVault(address vault) external view returns (bool);
-    function weth() external view returns (address);
-}

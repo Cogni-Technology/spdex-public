@@ -37,10 +37,10 @@ on these too.
 | `lint` | Nothing yet — it cannot fail: no workspace package defines a `lint` script, so the stage runs nothing. It does not enforce the no-telemetry rule (rule 4); `apps/web/src/no-requests.test.ts`, in `unit`, is that rule's partial check |
 | `unit` | Logic is wrong (mocked RPC, no network) |
 | `integration` | Logic disagrees with the real chain (pinned fork) |
-| `contracts` | The vault contracts break a rule their forge tests pin, on a mainnet fork at the pinned block, or `packages/vault/src/artifacts.ts` is stale: the factory and batcher addresses the app and the keeper ship are not the ones the source builds to, or `packages/vault/deployments.json` does not end with this build. Runs `build-artifacts.mjs --check`, then `forge test`. Skips without `forge` on PATH or without `SPDEX_FORK_RPC_URL`. The forge tests fork from that archive endpoint themselves, so a rate limit (HTTP 429) fails the stage without any assertion failing; read the output before believing a red |
+| `contracts` | The vault contracts break a rule their forge tests pin, on a mainnet fork at the pinned block (the SPX holder registry's included: real proofs recorded from mainnet, false ones, and fuzzed headers and trie nodes), or `packages/vault/src/artifacts.ts` is stale: the registry, factory and batcher addresses the app and the keeper ship are not the ones the source builds to, v1's frozen source (`packages/vault/releases/v1`) no longer builds to v1's deployed factory and batcher, or `packages/vault/deployments.json` is not what this build makes of it (every release and batcher recomputed from its source). Runs `build-artifacts.mjs --check`, then `forge test`. Skips without `forge` on PATH or without `SPDEX_FORK_RPC_URL`. The forge tests fork from that archive endpoint themselves, so a rate limit (HTTP 429) fails the stage without any assertion failing; read the output before believing a red |
 | `conformance` | A module violates the interface, or escaped its sandbox |
 | `parity` | Native and QuickJS runtimes disagree — the fast path has drifted. It runs fixture modules covering every loadable kind, not the shipped ones; each first-party module checks its own parity in `unit` (tip list, tracker, scheduler: whole outputs) or `integration` (venues: pool discovery and quotes, not the calls that get signed) |
-| `redteam` | **The Guard let a malicious plan through** — a swap, a tip, a scheduled buy, a vault transaction (a creation above the buy-fee ceiling included), or a batch of other people's due vault buys (Help run the network) — or a second opinion that disagrees was talked out of refusing, or one that went quiet made a plan more signable than one service alone would. It also fails when the Engine builds a Guard class the second-opinion structural test doesn't know. Never ship this red. |
+| `redteam` | **The Guard let a malicious plan through** — a swap, a tip, a scheduled buy, a vault transaction (a creation above the buy-fee ceiling included, a v2 **Trigger now** paying anyone but the owner, and a `prove` sent anywhere but the release's registry, carrying ether, or built against the wrong block), or a batch of other people's due vault buys (Help run the network) paying anyone but the account — or a second opinion that disagrees was talked out of refusing, or one that went quiet made a plan more signable than one service alone would. It also fails when the Engine builds a Guard class the second-opinion structural test doesn't know. Never ship this red. |
 | `reproducible` | Two release builds disagree, so a published CID cannot be checked against the source |
 | `e2e` | The app is broken in a real browser against a real fork |
 
@@ -64,7 +64,38 @@ on these too.
   `confirmations: 1` and `maxHeadLagSeconds: 0n`: the fork mines only when
   sent a transaction, and its idle head is days behind the wall clock. They
   never call `anvil_setNextBlockBaseFeePerGas` or `anvil_setMinGasPrice`, and
-  never mine a block just to reach a confirmation.
+  never mine a block just to reach a confirmation. A fresh key is never an
+  SPX holder, so a keeper test on a v2 vault either pays an eligible address
+  (next rule) or waits for a vault whose community window has passed.
+- Eligibility on the fork. anvil cannot prove a block it mined (its state
+  root is zero), so every proof a test sends is a real mainnet one, for a real
+  holder at a block up to the pinned one: recorded from the archive endpoint
+  by `packages/vault/scripts/record-proofs.mjs` into
+  `packages/vault/test/fixtures/proofs`, or, in the browser suite, built by
+  the page from the fork's own answers for such a block. The registry checks
+  a proven block's hash against the chain:
+  `BLOCKHASH` for the last 256 blocks, the fork's EIP-2935 history contract
+  for the last 8,191, both counted back from the fork's head. So a fork that
+  has mined about 8,000 blocks can no longer prove the recorded blocks:
+  restart `pnpm anvil:fork`, never bump the block. A proof lasts 30 days
+  from its block's time, by the fork's clock. An eligible address that never signs (a keeper's or a batch's
+  `rewardTo`) is a real holder proven from its recorded proof by a fresh key;
+  read `validUntil` first, since on a reused fork it is proven already and the
+  same proof again reverts `NotNewer`. An eligible address that must sign
+  (Help run's connected wallet) is a fresh key that buys at least 690 SPX
+  with a real swap on the fork and is then made eligible by writing its
+  `validUntil` record with `anvil_setStorageAt` (the registry's slot 0, at
+  `keccak256(abi.encode(key, 0))`, pinned by `test_validUntilIsMappingSlotZero`).
+  That is the one write to the registry a test may make on the shared fork,
+  and only for a fresh key: never for a real holder, never to SPX's balances,
+  never to code (`writeEligibleOnFork`, `packages/testing/src/vaultFork.ts`).
+  The mainnet smoke suite's rehearsal runs on a fork of its own, of today's
+  chain, never this one, and `docs/MAINNET-SMOKE.md` says what it writes
+  there. anvil's `finalized` block is its head − 64, which is a mainnet
+  block, and so provable, only until 64 blocks are mined; a browser test that proves
+  pins `finalized` to a forked block with `page.route`. A community window's
+  edges are forge's (`vm.warp`); on the fork, exactly one integration case
+  waits a 60-second window out in real time.
 - A second opinion on the fork is the same fork under its other host name
   (`http://127.0.0.1:8545` and `http://localhost:8545`). Two forks of the
   pinned block are not an agreeing pair once either has mined anything: their
@@ -115,13 +146,28 @@ on these too.
    `MIN_DCA_INTERVAL_SECONDS` is a constant for the same reason the tip
    ceiling is.
    So are the four vault transactions the host composes (create, fund, close,
-   trigger), and a fifth: a batch of other people's due vault buys sent from
-   the person's own wallet (Help run the network). They go through
-   `VaultGuard`, and one that sends ether is never signed `unverified`,
-   whatever `requireSimulation` says. A batch is never signed `unverified` at
-   all, is offered only with private sending and only when its buy fees cover
-   its network fee, and pays nobody but the account. What else the Guard
-   checks on a batch: `docs/THREAT-MODEL.md`, "Helping run the network".
+   trigger), a fifth: a batch of other people's due vault buys sent from
+   the person's own wallet (Help run the network), and a sixth: `prove`, a
+   proof that an address held 690 SPX, sent to the release's SPX holder
+   registry. They go through `VaultGuard`, and one that sends ether is never
+   signed `unverified`, whatever `requireSimulation` says. On a v2 vault,
+   **Trigger now** is `execute(owner)` sent by the owner, and the Guard
+   refuses any other `rewardTo` or sender (a v1 vault's is `execute()`, as it
+   always was). A batch is
+   never signed `unverified` at all, is offered only with private sending and
+   only when its buy fees cover its network fee, takes only vaults whose
+   source takes `rewardTo` (v2's), pays nobody but the account (its
+   `rewardTo`), goes only to the newest batcher at the gas per vault the host
+   encodes, and lists only vaults the Guard has proved, from the host's
+   per-vault claims (owner, nonce, terms), to be where a listed factory put
+   them: the batcher is bound to no factory and calls whatever it is given. A `prove` is refused unless
+   it goes to the release's registry, carries no ether, and its header hashes
+   to that block's hash as the network service reports it, with both halves
+   of the proof tied to that header's state root; it is simulated
+   like any other, and, since it moves no money and a false proof only
+   reverts, it is not on the list below: it follows `requireSimulation` and
+   may be signed `unverified`. What else the Guard checks on a batch:
+   `docs/THREAT-MODEL.md`, "Helping run the network".
    The second opinion (`guard.secondOpinion.url`) is part of the Guard, not
    beside it: every Guard the Engine builds that simulates runs through
    `AgreeingSimulationProvider` when one is set, and a structural red-team
@@ -135,11 +181,18 @@ on these too.
    they don't cover: `docs/THREAT-MODEL.md`, "A second opinion".
    The keeper is not the app and has no Guard, but the same idea bounds it:
    it signs only what `assertKeeperMaySign` (`keeper-send.ts`) allows —
-   `executeBatch` to a listed batcher paying the configured `rewardTo`, a
-   listed batcher's deployment, a 0-value cancel to itself, and a WETH unwrap
-   when it is its own `rewardTo`, none of them carrying ether — and everything
-   else throws before the key is used. Widen that list and you widen what a
-   bug, or an endpoint that lies, can get a hot key to sign.
+   `executeBatch` to a listed batcher paying the configured `rewardTo` (from
+   v2 at exactly its configured gas per vault), a listed batcher's
+   deployment, a 0-value cancel to itself, a WETH unwrap
+   when it is its own `rewardTo`, and, only when its operator opts in with
+   `SPDEX_KEEPER_PROVE=1`, a `prove` to a listed release's registry whose
+   holder is the configured `rewardTo`, none of them carrying ether — and
+   everything else throws before the key is used. Widen that list and you
+   widen what a bug, or an endpoint that lies, can get a hot key to sign. And
+   since the batcher calls whatever it is given, the keeper batches only
+   vaults it has proven its factory's clones (their address recomputed from
+   owner, terms and nonce, `proveClones` in `keeper-read.ts`), never on an
+   endpoint's word.
    Trackers are the opposite case: never in the path of a signature, so their
    output is display-only and every figure degrades to *unknown* rather than to
    zero. Do not let a routing decision read from one. Collective DCA
@@ -167,71 +220,179 @@ on these too.
    `src`, a stylesheet `url()`, a name built at run time), there is no lint
    rule (see the `lint` stage), and the CSP leaves `connect-src` open so
    users can choose any endpoint. So check any new request against the rule yourself, and add
-   an allowance to that test only with where the request goes. The keeper and
+   an allowance to that test only with where the request goes. Proving is
+   no exception: the header and `eth_getProof` come from the network service
+   in use, and when it refuses `eth_getProof` the app shows the requests to
+   run against another service and checks what is pasted against its own;
+   it never fetches them itself. The keeper and
    its report are operator tools, not the app: they contact only the endpoints
    their operator configures (an optional dead-man's-switch URL included), and
    the app never contacts a keeper. `index.ts` never re-exports them, with one
    exception: the keeper's pure planning in `keeper-plan.ts` (`selectBatch`,
-   `batchGasLimit`, `modelBatchGas`, `earliestBuyAt` and their constants),
-   which Help run the network uses. It reads nothing, signs nothing and imports only types, the
+   `batchGasLimit`, `modelBatchGas`, `earliestBuyAt`, the community window's
+   arithmetic — `slotStartAt`, `dueSinceAt`, `communityWindowEndsAt`,
+   `inCommunityWindow`, `urgentFrom` — and their constants), which Help run
+   the network uses. It reads nothing, signs nothing and imports only types, the
    artifacts and the fee, and `boundaries.test.ts` pins exactly that. Nothing
    under `apps/web` imports `@spdex/vault/keeper` or any other keeper module
    (`boundaries.test.ts`).
 5. **No backend.** The app is a static bundle. If a feature seems to need a
    server, it needs a module or a different design.
-6. **No contract anyone controls.** The auto-buy vault, its factory and the
-   batcher (`packages/vault/contracts`) have no owner, admin, upgrade path,
-   pause switch anyone else holds, or fee, and none may be added. That includes
-   a setter, an initializer, a proxy whose implementation can change, a
-   "guardian", or a fee "for keepers" routed anywhere but the caller of
-   `execute`.
+6. **No contract anyone controls.** The auto-buy vault, its factory, the
+   batcher and the SPX holder registry (`packages/vault/contracts`) have no
+   owner, admin, upgrade path, pause switch anyone else holds, or fee, and
+   none may be added. That includes a setter, an initializer, a proxy whose
+   implementation can change, a "guardian", or a fee "for keepers" routed
+   anywhere but the `rewardTo` the caller of `execute` names (on a v1 vault,
+   the caller itself). Two releases are on record: v1, on mainnet since block
+   26,100,366 and unchanged for good, and v2, the current source, whose
+   addresses in `deployments.json` are the ones this build deploys to (not
+   yet deployed).
+   - A vault's caller chooses *when* and, on a v2 vault, who receives the
+     caller's own fee; nothing about the buy. So v1's `execute` takes no
+     parameter and v2's exactly one, `rewardTo`, who receives the caller's own
+     fee (decision 11 of `docs/V2_UPGRADE.md`); never give it another. The
+     amount, the token, the recipient of what is bought,
+     the market and the floor are fixed when the vault is created, and a
+     forge fuzz test pins that any two `rewardTo` values a vault accepts make
+     byte-identical buys (`testFuzz_anyTwoAcceptedRewardTosMakeTheSameBuy`).
+     `rewardTo` may not be zero or the vault. For the community window, from
+     when the buy fell due (`dueSince`) for `communityWindow` seconds, it must
+     be the owner or pass the registry's `isEligible`, asked with a fixed gas
+     stipend (`ELIGIBILITY_GAS`, 100,000: about nine times an honest answer,
+     because no vault can ever be given more, and a fork that repriced cold
+     reads past a smaller one would shut holders out of every window for
+     good); any failure counts as not eligible, so a broken registry delays a
+     buy at most until its window ends. A plan with turns (`turnBuckets`, a
+     term: 0, or 2 to `MAX_TURN_BUCKETS`) also holds the window's first half
+     to the eligible addresses in that slot's bucket (`bucketOf`, `turnOf`;
+     `NotYourTurn`); the owner is never refused. A plan names a market only by
+     its index in the factory's list, never by a token, pair or pool address.
+   - The SPX holder registry (`SpxHolderRegistry`, from v2) is held to the
+     same standard and decides one thing: whether a `rewardTo` may be paid
+     inside a v2 vault's community window. It has no owner, setter, list or
+     deposit, takes no ether, and never holds or moves anyone's tokens; its
+     only storage is one `validUntil` time per address that has proven.
+     `prove` records, from a block's own header and two Merkle-Patricia
+     proofs, that an address held at least `MIN_SPX` when a recent block
+     closed, and anyone may prove any address. `isEligible` is true while a
+     proof is valid, the address is an account (no code, or only an EIP-7702
+     delegation) and it holds `MIN_SPX` now. `MIN_SPX` (690 SPX) and
+     `PROOF_TTL` (30 days) are constants for the reason the tip ceiling is:
+     never make either a setting or a vault term; changing one is a new
+     registry and a new release. Keep it accounts only: a contract can hand
+     what it is paid to whoever asks (a pair's `skim`), so an eligible
+     contract would let anyone take every window's fee
+     (`test_aProvenContractThatHandsOutWhatItIsPaidIsNeverEligible`). The
+     proof verifier under `contracts/vendor/optimism` is Optimism's, vendored
+     with only its import paths changed; never edit it here.
    - The batcher (`SpdexVaultBatcher`) is held to the same standard. It has no
-     owner, fee, setter or storage beyond a transient lock, and holds nothing
-     between calls. It is one more caller of each vault's `execute`, and it
+     owner, fee, setter or storage beyond a transient lock. It is one more
+     caller of each vault's `execute`, and any change to it means a new
+     address. v1's is bound to v1's factory, is paid as each vault's caller and
      forwards every reward, in the same transaction, to the `rewardTo` its own
-     caller names: that is the caller's own reward sent where the caller
-     chooses, not a fee routed elsewhere. `minRewards` is a condition the
-     caller sets on its own transaction; a revert is the same as not sending.
-     It is bound to one factory, and any change to it means a new address.
+     caller names, sweeping any WETH it holds. From v2 the batcher is bound to
+     no factory: it is built for WETH alone, passes its caller's `rewardTo` to
+     the `execute(rewardTo)` of each address its caller lists, and each vault
+     pays that address directly, so no reward passes through it and it holds
+     no WETH. So one batcher serves every release whose vaults take
+     `rewardTo`, and a batch may mix them. It has no way to send WETH either,
+     so WETH sent to it, or a fee a direct caller of a vault names it to
+     receive after a window, is stranded there for good
+     (`test_aFeeNamedToTheBatcherByADirectCallerStaysThere`). Never add a
+     sweep: it would put WETH back through the batcher. Its `earned` is how
+     much `rewardTo`'s WETH rose during the call, which nothing in the list
+     can inflate without paying it; it trusts no vault's answer, which is why
+     it needs no factory. It calls whatever it is given, so deciding which
+     vaults are worth calling is its caller's: the keeper lists only vaults a
+     listed factory's own list names, and the Guard's batch path checks every
+     vault in a batch the app sends. The gas each vault's `execute` gets is the
+     caller's (`gasPerVault`, `MIN_EXECUTE_GAS` to `MAX_EXECUTE_GAS`), so a
+     fork that reprices a buy needs a new figure in the app and the keeper,
+     never a new batcher. Either way the fee is the caller's own, paid where
+     the caller chooses, not a fee routed elsewhere. `minRewards` is a
+     condition the caller sets on its own transaction; a revert is the same
+     as not sending.
    - The buy fee is each vault's `keeperReward`, fixed at creation and never
-     changeable afterwards. The app's default comes from
-     `packages/vault/src/fee.ts`: one batched buy's network cost at a release
-     constant (122,000 gas × 0.15 gwei) and a tenth more, never above 0.69% of
-     the buy. That ceiling is the contract's `MAX_REWARD_BPS`, the whole fee
-     with the network cost included: nobody who triggers a buy, spDEX's
-     developers among them, is ever paid more for it. Never raise it, and
-     never add a second fee beside it. Changing the default under it is a
-     release decision, never a setting on chain, and it only reaches plans
-     created after the release. Do not make the ceiling configurable in the
-     app: `VaultGuard` refuses a creation above it, and so does the factory.
+     changeable afterwards. The app's default for new vaults comes from
+     `packages/vault/src/fee.ts`: one batched buy's network cost at release
+     constants (`BATCHED_BUY_GAS`, 126,000 gas, × 0.15 gwei) plus 0.25% of the
+     buy, never above 0.69% of the buy. v1's default was that network cost,
+     at 122,000 gas, and a tenth more; every vault keeps the fee it was made
+     with. The ceiling is the contract's `MAX_REWARD_BPS`, the whole fee with
+     the network cost included: nobody who makes a buy, or is named to be
+     paid for one, spDEX's developers among them, is ever paid more for it.
+     Never raise it, and never add a second fee beside it. Changing the
+     default under it is a release decision, never a setting on chain, and it
+     only reaches plans created after the release. Do not make the ceiling
+     configurable in the app: `VaultGuard` refuses a creation above it, and
+     so does the factory.
    - The limits in `VaultLimits.sol` are constants, not terms, for the reason
      the tip ceiling is. Above all `MAX_FUNDING` (0.5 ETH, the hard cap on what
      an owner can put into a vault) stays a constant: it is what makes
-     unaudited code a risk a person can decide to accept.
+     unaudited code a risk a person can decide to accept. So do v2's window
+     bounds: `MIN_COMMUNITY_WINDOW` (60 seconds) and `MAX_COMMUNITY_WINDOW`
+     (an hour), and `MAX_TURN_BUCKETS` (64). Every v2 vault has a window, and
+     the factory also holds it to a quarter of the plan's interval, so a
+     window always ends inside its slot. Turns ship unused: the app creates
+     every vault with none (`DEFAULT_TURN_BUCKETS`, 0) until decision 29 of
+     `docs/V2_UPGRADE.md` trips, when a new app build may create vaults with
+     them and nothing is deployed. Nothing a fork can reprice may strand an
+     owner's money: `close` returns the budget as WETH if WETH's `withdraw`
+     (a 2,300-gas send to the clone) ever fails
+     (`test_closeReturnsTheBudgetAsWethWhenUnwrappingFails`), and no gas
+     figure a vault depends on may shrink.
    - The market list is fixed in the factory's constructor. Adding, removing
      or changing a market means a new factory at a new address, never an edit
-     to this one. The same goes for any change to any of the three contracts.
+     to this one. The same goes for any change to any of the four contracts.
+     The factory names the registry in its constructor, so a new registry
+     means a new factory too; the batcher names only WETH, so a fixed batcher
+     is one more entry in `deployments.json`'s `batchers` and no new factory.
+     A new market list or registry with the factory's code unchanged is a
+     release built from an existing source: one more `releases` entry (its
+     `source`, `registry`, `markets`, and `factory: null`), which
+     `build:artifacts` fills in, and no code anywhere changes. One factory
+     belongs to one release: the build refuses an entry that reuses one.
    - After any change under `contracts/`, regenerate `src/artifacts.ts`
      (`pnpm --filter @spdex/vault build:artifacts`), and never hand-edit it.
-     The `contracts` stage refuses a stale copy.
-   - `packages/vault/deployments.json` is append-only. `build:artifacts`
-     rewrites only a trailing release not yet deployed (`factoryBlock` null);
-     once a release's blocks are filled in by hand after its mainnet
-     deployment, it is frozen. Never remove or edit a deployed entry: keepers
-     and reports serve every entry, so an entry removed is a release whose
-     vaults nobody triggers. The intent, not yet built, is that once a second
-     release exists the app lists, funds and closes vaults from every listed
-     factory and creates only on the latest; today it reads the last one only.
-   - A vault's caller chooses only *when*, so never give `execute` a
-     parameter. The amount, recipient, market and floor are fixed when the
-     vault is created. A plan names a market only by its index in the
-     factory's list, never by a token, pair or pool address.
+     The `contracts` stage refuses a stale copy. It carries every source of
+     the contracts under its own prefix (`V1_*`, `V2_*`) and as data
+     (`SOURCES`, each with `features` read from its ABIs: `executeTakesRewardTo`,
+     `communityWindow`, `turns`, `registry`, `sharedBatcher`), the current
+     source also under unprefixed names (`VAULT_ABI`, …, for creating vaults
+     only), the latest release's addresses (`MAINNET_FACTORY`,
+     `MAINNET_BATCHER`, `MAINNET_REGISTRY`, …), and the record (`DEPLOYMENTS`,
+     `BATCHERS`). Code that handles a vault of any release goes by its
+     release's source's features (`featuresOf`, `packages/vault/src/releases.ts`),
+     never by a release's name: a release built from an existing source must
+     need no code change. v1's source is built by forge's `v1` profile from
+     `releases/v1/contracts`, a verbatim copy of the source v1 was deployed
+     from. Never edit `releases/v1`: the build refuses to write unless it
+     still gives v1's deployed factory and batcher. Before `contracts/`
+     changes after a release built from it reaches mainnet, freeze it the
+     same way (`releases/vN`, a profile, its `SOURCES` row in
+     `build-artifacts.mjs` set frozen, and a row for the next source); the
+     build refuses a deployed entry its source no longer builds to.
+   - `packages/vault/deployments.json` is append-only: `{ "releases": [...],
+     "batchers": [...] }`. v1's release keeps the five keys it was written
+     with (`id`, `factory`, `batcher`, `factoryBlock`, `batcherBlock`); every
+     later release records `id`, `source`, `factory`, `registry`, `markets`,
+     `factoryBlock` and `registryBlock`, and every shared batcher `source`,
+     `batcher` and `batcherBlock`. `build:artifacts` recomputes every entry
+     from its source and refuses one that differs; it rewrites only a trailing
+     entry not yet deployed (its blocks null), and appends the current
+     source's release and batcher when nothing lists them. Once an entry's
+     blocks are filled in by hand after its mainnet deployment (a release's
+     `registryBlock` ≤ `factoryBlock`), it is frozen. Never remove or edit a
+     deployed entry: keepers and reports serve every entry, so an entry
+     removed is a release whose vaults nobody triggers.
    - The app, the keeper and the report trust only vaults a factory vouches
-     for (`isVault`): the app its one factory, the keeper and the report any
-     factory in `DEPLOYMENTS`. The factory's vault list (`vaultCount`,
-     `vaultsPage`) is append-only and changes nothing about trust: membership
-     is `isVault`, written in the same call. All of them treat a vault figure
-     they cannot read as unknown, never as zero.
+     for (`isVault`), and any factory in `DEPLOYMENTS`: v1's and v2's alike.
+     The app lists, funds, closes and triggers vaults from every listed
+     factory, and creates only on the latest. The factory's vault list
+     (`vaultCount`, `vaultsPage`) is append-only and changes nothing about
+     trust: membership is `isVault`, written in the same call. All of them
+     treat a vault figure they cannot read as unknown, never as zero.
 
 ## Layout
 
@@ -239,18 +400,29 @@ on these too.
 packages/core       types + zod schemas (TxPlan is a signable intent, not a fire-once object)
 packages/chain      Multicall3 (pinnable to a block), httpRpc, SimulationProvider, TWAP oracle,
                     fx.ts (Chainlink's 16 currency feeds and USDC/USD, read in one call), a
-                    local-key signer (the keeper's)
+                    local-key signer (the keeper's), header.ts (a block header rebuilt as RLP
+                    and checked against the block's hash, and `eth_getProof`)
 packages/guard      static checks → simulation → oracle cross-check; tip, scheduled-buy
-                    and vault paths (the batch path included); second-opinion.ts (every
-                    test-run on two services, compared)
+                    and vault paths (the batch and `prove` paths included); second-opinion.ts
+                    (every test-run on two services, compared)
 packages/host       capability broker, runtimes/{native,quickjs}, KIND_SPECS (a row per kind)
 packages/router     split routing (host-side on purpose — it decides where money goes)
 packages/config     versioned SpdexConfig (v9) + migrations + presets + auto-buy plan edits
-packages/vault      the auto-buy vault: contracts/ (Solidity 0.8.33, unaudited; SpdexVaultFactory,
-                    SpdexDcaVault, SpdexVaultBatcher, VaultLimits), test/forge/ (forge fork tests),
-                    deployments.json (append-only release registry), src/artifacts.ts
-                    (generated — never hand-edit), src/index.ts (encoders, readVault, availability,
-                    findVaultsByOwner, the factory's list), src/fee.ts (the buy fee),
+packages/vault      the auto-buy vault: contracts/ (Solidity 0.8.33, unaudited, the current
+                    release, v2; SpdexVaultFactory, SpdexDcaVault, SpdexVaultBatcher (bound to no factory),
+                    VaultLimits,
+                    SpxHolderRegistry; vendor/optimism: Optimism's MIT trie and RLP verifier,
+                    pinned to a commit, only its import paths changed), releases/v1/ (the source
+                    v1 was deployed from, frozen, built by forge's `v1` profile), test/forge/
+                    (forge fork tests), test/fixtures/proofs (mainnet proofs for the registry's
+                    tests, recorded by scripts/record-proofs.mjs), deployments.json (append-only
+                    record: releases and batchers), src/artifacts.ts (generated — never hand-edit;
+                    every source prefixed, `SOURCES` with its features, the current source also
+                    unprefixed), src/releases.ts (a release's source, features, factory and
+                    batcher, by data), src/index.ts (encoders, readVault, availability, turns,
+                    findVaultsByOwner, the factories' lists), src/registry.ts (an address's
+                    eligibility, building, checking and pasting a proof, `encodeProve`; shared by
+                    the app and the keeper), src/fee.ts (the buy fee),
                     src/batcher.ts (encoders and decoders for the batcher), src/platform.ts
                     (Collective DCA: every listed vault's figures at one block, and which are
                     due now for Help run the network; host code); keeper-plan's pure
@@ -263,7 +435,8 @@ packages/vault      the auto-buy vault: contracts/ (Solidity 0.8.33, unaudited; 
 docker/keeper       the keeper's image and Compose file (keeper, report, and a fork-only profile);
                     docs/KEEPER.md runs it
 packages/module-sdk authoring kit + conformance suite (MIT; the rest is AGPL)
-packages/testing    anvil fixtures, fork helpers, headless EIP-1193 wallet
+packages/testing    anvil fixtures, fork helpers (src/vaultFork.ts: releases, the recorded holder,
+                    an eligible fresh key, imported by path), headless EIP-1193 wallet
 e2e-mainnet         the mainnet smoke suite: agent wallets, an allowlist and a spending limit
                     on every transaction, Playwright specs (docs/MAINNET-SMOKE.md); not a gate stage
 modules/            first-party modules; same interface as any stranger's
@@ -271,20 +444,26 @@ modules/            first-party modules; same interface as any stranger's
   tiplist-spx-community  kind: tiplist — no capabilities, no contracts
   tracker-pool-stats     kind: tracker — chain:read on three token contracts
   scheduler-dca          kind: scheduler — no capabilities, no contracts
-apps/web            Vite SPA; src/lib/dca: auto-buy runner, ledger, vault.ts (vault plans: reads,
-                    the four transactions, chain time) and factoryListSearch.ts (finding
-                    vaults by their owner() when log searches are refused);
+apps/web            Vite SPA; src/lib/dca: auto-buy runner, ledger, vault.ts (vault plans of
+                    either release: reads, the four transactions, Trigger now as `execute(owner)`
+                    on v2, chain time), factoryListSearch.ts (finding vaults by their owner()
+                    when log searches are refused) and advisory.ts (decision 31's registry
+                    notice: null until a build needs it);
                     src/components/dca: the auto-buy screens, driven by lib/dca/useAutoBuy.ts
                     lib/money + components/money: amounts typed in 17 currencies (input only:
                     parse, size, convert), the rates, number styles, the currency menu
                     lib/records + components/records: Your activity, its CSV and statement;
-                    lib/reminders: calendar files and the buy-due notification; lib/finality.ts
+                    lib/reminders: calendar files, the buy-due notification and the proof-lapse
+                    one (lapse.ts); lib/finality.ts
                     + components/trust: the Sent → Included → Final badge
                     lib/culture + components/culture: Welcome, Your stack, the "I bought" card,
                     the #receipt= view, saying lines, preset amounts
                     lib/network + components/network: Collective DCA, Help run the network
-                    (batch.ts: a batch of due vault buys from the person's wallet, private
-                    sending only), the second-opinion setting, and Trust and exits
+                    (batch.ts: a batch of due v2 vault buys from the person's wallet, private
+                    sending only, inside a community window for an eligible wallet only), its
+                    Community keeping fold (keeping.ts, CommunityKeeping.tsx: eligibility,
+                    Prove my SPX, Prove another address, paste a proof), the second-opinion
+                    setting, and Trust and exits
                     lib/links.ts: the two release addresses, build settings, never guessed;
                     lib/download.ts: every file the app hands over; src/no-requests.test.ts (rule 4)
 ```

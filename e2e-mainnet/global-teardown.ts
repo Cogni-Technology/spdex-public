@@ -11,7 +11,7 @@ import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { readVault } from "../packages/vault/src/index.js";
 import { runRecord } from "./budget.js";
-import { FACTORY, ethBalance, rpc } from "./chain.js";
+import { FACTORIES, ethBalance, rpc } from "./chain.js";
 import { AGENT_NAMES, RUNS_DIR, currentRun, eth } from "./settings.js";
 import { agentVaults, settleMined } from "./wallet.js";
 
@@ -52,8 +52,9 @@ export default async function globalTeardown(): Promise<void> {
 
   const open: string[] = [];
   try {
+    // Every release's factory: an earlier run's v1 vault left open is listed too.
     for (const vault of await agentVaults()) {
-      const state = await readVault(rpc, vault, { factory: FACTORY });
+      const state = await readVault(rpc, vault, { factories: FACTORIES });
       // Every buy made and nothing left is finished, not open.
       if (state !== null && !state.closed && state.status.wethBalance !== 0n) open.push(vault);
     }

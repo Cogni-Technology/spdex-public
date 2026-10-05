@@ -97,6 +97,9 @@ services:
       SPDEX_KEEPER_MAX_HEAD_LAG_SECONDS: "0"
       SPDEX_KEEPER_VAULTS: ${SPDEX_FORK_VAULTS:-}
       SPDEX_KEEPER_REWARD_TO: ${SPDEX_FORK_REWARD_TO:-}
+      # Never prove on a fork, whatever .env says: anvil can't prove the blocks it mines, and its "finalized"
+      # block is one of them. A fork's eligible holder is proven from recorded mainnet proofs by its tests.
+      SPDEX_KEEPER_PROVE: "0"
       SPDEX_KEEPER_KEY_FILE: /run/secrets/fork_key
     secrets: [fork_key]
     volumes:

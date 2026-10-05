@@ -2,6 +2,7 @@
 pragma solidity 0.8.33;
 
 import {IERC20Minimal, IUniswapV2PairMinimal, IUniswapV3OracleMinimal, IWETH9} from "./interfaces/External.sol";
+import {ISpxHolderRegistry} from "./interfaces/ISpxHolderRegistry.sol";
 import {OracleQuote} from "./libraries/OracleQuote.sol";
 import {Args, VaultArgs} from "./libraries/VaultArgs.sol";
 import {VaultLimits} from "./VaultLimits.sol";
@@ -19,18 +20,26 @@ struct Terms {
     address oraclePool;
     /// WETH (wei) spent on each buy.
     uint256 amountPerBuy;
-    /// Seconds between buy windows.
+    /// Seconds between buy slots: each slot allows one buy.
     uint256 interval;
     /// How many buys, at most. The vault can never spend more than
     /// `maxBuys × (amountPerBuy + keeperReward)`, and that is capped at `MAX_FUNDING`.
     uint256 maxBuys;
-    /// When the first window opens (unix seconds, chain time).
+    /// When the first slot opens (unix seconds, chain time).
     uint256 startAt;
-    /// WETH (wei) paid to whoever triggers a buy, from the vault's balance.
+    /// WETH (wei) paid for each buy, from the vault's balance, to the `rewardTo` whoever made
+    /// the buy named.
     uint256 keeperReward;
     /// The most a buy may pay above the oracle's price, in basis points: the better, for the
     /// owner, of the pool's 10-minute average and its price now.
     uint256 maxSlippageBps;
+    /// Seconds after each buy falls due during which its fee can be paid only to the owner
+    /// or to an address the SPX holder registry finds eligible: the community window.
+    uint256 communityWindow;
+    /// How many turns the window's first half is shared out in: 0 for none, the race every
+    /// eligible holder runs for the whole window; else 2 to `MAX_TURN_BUCKETS`, and for the
+    /// first half only the eligible addresses in each buy's bucket may be paid (see "Turns").
+    uint256 turnBuckets;
 }
 
 /// @title SpdexDcaVault — one auto-buy plan that runs with no spDEX page open
@@ -48,18 +57,19 @@ struct Terms {
 /// A contract cannot wake itself up; something has to send a transaction. So the "server
 /// of sorts" an auto-buy needs while no page is open is not a server at all. It is a
 /// contract that holds the plan's budget and *enforces the plan itself*, so that it does
-/// not matter who sends the transaction. The caller chooses only *when* — and only inside
-/// a window that is due — never how much, what, where to, or at what price. Once funded,
-/// no outside party ever signs for the owner's money: not spDEX, not a keeper, not a bot.
+/// not matter who sends the transaction. The caller chooses *when* — and only inside a
+/// slot that is due — and who receives the caller's own fee (`rewardTo`), never how much,
+/// what, where to, or at what price. Once funded, no outside party ever signs for the
+/// owner's money: not spDEX, not a keeper, not a bot.
 ///
 /// That is why `execute` is open to anyone and pays a small fixed reward. The reward makes
 /// triggering worth someone's while; it does not make anyone do it. A plan runs while
-/// somebody runs a keeper — `pnpm keeper`, an open spDEX tab's "Trigger now", or a
-/// stranger's bot that finds the reward worth its gas — and a window nobody triggers is
-/// skipped. None of them needs the owner's trust, and the owner needs none of theirs,
-/// because a buy that breaks any term reverts. A keeper that makes many vaults' buys in
-/// one transaction does it through `SpdexVaultBatcher`, which is one more caller of
-/// `execute` with no rights a direct caller lacks.
+/// somebody runs a keeper — `pnpm keeper`, an open spDEX tab's "Help run the network" or
+/// "Trigger now", or a stranger's bot that finds the reward worth its gas — and a slot
+/// nobody triggers is skipped. None of them needs the owner's trust, and the owner needs
+/// none of theirs, because a buy that breaks any term reverts. A keeper that makes many
+/// vaults' buys in one transaction does it through `SpdexVaultBatcher`, which is one more
+/// caller of `execute` with no rights a direct caller lacks.
 ///
 /// The Guard's promise moves on chain with it. The app refuses a swap that pays far more
 /// than a time-weighted price says it should; this vault refuses any buy that pays more
@@ -68,6 +78,71 @@ struct Terms {
 /// reference the app's oracle cross-check reads; the price now is there because an average
 /// lags, and a market that has just fallen back should not be bought at the stale average
 /// less the allowance.
+///
+/// ## Who is paid, and the community window
+///
+/// `execute` takes one argument, `rewardTo`: who receives the fee for this buy. It is the
+/// only thing about a buy its caller names, and it names nothing about the buy itself —
+/// the amount, the token, who receives what is bought, the market and the floor are the
+/// terms', exactly as they would be for any other `rewardTo`
+/// (`testFuzz_anyTwoAcceptedRewardTosMakeTheSameBuy`). v1 paid the caller instead; naming
+/// the recipient is what lets the vault check who is paid rather than who sent the
+/// transaction, so a keeper can sign with a hot key and be paid in a cold wallet, and a
+/// batcher in the middle no longer hides the real recipient.
+///
+/// For the first `communityWindow` seconds after a buy falls due, `rewardTo` must be the
+/// owner or an address the SPX holder registry (`registry`) finds eligible: an account, not
+/// a contract, proven to have held at least 690 SPX at the end of a recent block, that holds
+/// that much now. After the window, any address, as in v1. So the people who hold SPX and
+/// run a keeper, or a spDEX tab, get first claim on every buy's fee, and an outside bot
+/// earns only the buys still unmade when a window closes. A caller that names an eligible
+/// address it does not control pays that address, not itself, so naming one gains the
+/// caller nothing — unless that address's own key-holder shares the fee with whoever asks,
+/// which takes 690 SPX of their own, and is what the published concentration of window
+/// wins (decision 29 of `docs/V2_UPGRADE.md`) watches for. A contract could share it with
+/// anyone at all, whoever's SPX it held: Uniswap v2's pair `skim`s a fee paid to it to any
+/// caller. That is why the registry finds only accounts eligible.
+///
+/// The owner is always allowed, so "Trigger now" works inside the window; a buy paid back
+/// to its owner pays nobody else. Such a buy is not counted in `windowBuys`, which counts
+/// the buys the community made inside their windows. The exception is for whoever is paid,
+/// not whoever sends, so anyone may make a buy inside its window by paying the fee back to
+/// the owner (and a batch may, for a vault whose owner is its `rewardTo`). The sender gains
+/// nothing by it and pays the gas: what it keeps is v1's lever of choosing the moment
+/// within a slot (below), without the fee, and the power to take a buy from the community
+/// keepers at its own cost.
+///
+/// A buy falls due at `dueSince`: the later of the earliest moment the clock allows it
+/// (`nextBuyAt`) and the start of the slot it is in. `nextBuyAt` alone is in the past once
+/// a slot has been missed — gas above the fee, a floor that refused, a vault short of funds
+/// until a top-up — and measuring from it would open the first buy after a miss to anyone
+/// at once, exactly when a bot is waiting. Measured from the slot's start, every slot's buy
+/// gets its own first claim. `dueSince` is at most half an interval into its slot and the
+/// window at most a quarter of the interval (the factory's bound), so a window always ends
+/// inside the slot it started in, and leaves the rest of the slot open to anyone.
+///
+/// The registry decides only who may be paid during a window. It is asked with a fixed
+/// stipend (`ELIGIBILITY_GAS`), and an answer that is not exactly `true` — a revert, a
+/// registry that runs out of gas, or one that answers anything else — counts as "not
+/// eligible". So a broken registry can delay a buy only until its window ends, or until the
+/// owner triggers it; it can never stop a plan, and it never touches the vault's money.
+///
+/// ## Turns
+///
+/// A plan may share the first half of each window out in turns (`turnBuckets`, a term like
+/// the others). Every address falls in one of the plan's buckets (`bucketOf`: its hash,
+/// modulo the number of buckets), and each buy's slot draws one (`turnOf`: the hash of this
+/// vault and the slot). Until `dueSince + communityWindow / 2`, a `rewardTo` other than the
+/// owner must be eligible *and* in that bucket; for the rest of the window, any eligible
+/// address; after it, anyone. So a holder has first claim on about one buy in `turnBuckets`,
+/// a buy whose bucket nobody is keeping waits half a window for the rest of the community,
+/// and a bot that wants first claim on every buy needs an eligible address, with 690 SPX of
+/// its own, in every bucket.
+///
+/// It is in the contract from the first, unused: every vault the app creates has no turns
+/// (0) until decision 29 of `docs/V2_UPGRADE.md` calls for them — one `rewardTo` winning most
+/// window buys — when the app can start creating vaults with turns without anything new
+/// being deployed. A plan without turns pays one comparison for the feature.
 ///
 /// ## One contract, many clones
 ///
@@ -89,7 +164,8 @@ struct Terms {
 ///
 /// This contract itself refuses every call that concerns a plan (`NotAClone`): it has no
 /// terms, and someone who mistook it for a vault should be told so rather than answered
-/// with zeros. What it does still answer — its limits and `weth` — is true of every clone.
+/// with zeros. What it does still answer — its limits, `weth`, `registry` and
+/// `ELIGIBILITY_GAS` — is true of every clone.
 ///
 /// ## What it deliberately does not do
 ///
@@ -98,18 +174,19 @@ struct Terms {
 ///   vault's behaviour is fixed the moment it exists. The one way to stop a plan is
 ///   `close`, which returns everything to the owner; there is no pause because a pause is
 ///   a switch, and a switch is a thing someone has to be trusted with.
-/// - **No make-up buys, and no two buys close together.** Time is cut into windows of
-///   `interval` seconds from `startAt`, each window allows at most one buy, and a buy must
-///   also come at least half an interval after the last. A window nobody triggered is
+/// - **No make-up buys, and no two buys close together.** Time is cut into slots of
+///   `interval` seconds from `startAt`, each slot allows at most one buy, and a buy must
+///   also come at least half an interval after the last. A slot nobody triggered is
 ///   skipped, never made up later: a catch-up burst defeats the averaging and is exactly
 ///   what someone able to delay keepers would want to provoke. The spacing is there so that
-///   one push of the price cannot cover the last second of one window and the first of the
-///   next.
+///   one push of the price cannot cover the last second of one slot and the first of the
+///   next. (v1 called these slots windows; v2 keeps that word for the community window.)
 /// - **It never holds the token it buys.** Each swap pays out straight to the owner, and
 ///   the vault checks the owner received every unit the pair sent — so a fee-on-transfer
 ///   token is refused outright, even when its fee would fit inside the price floor.
 /// - **It pays keepers in WETH**, never with a raw ether call to an unknown address, so
-///   the one party that may be anyone cannot run code in the middle of a buy.
+///   the one party that may be anyone cannot run code in the middle of a buy. The registry
+///   is asked with `STATICCALL`, which can change nothing, and before anything moves.
 ///
 /// ## What it trusts, and what it checks
 ///
@@ -158,7 +235,7 @@ struct Terms {
 ///
 /// ## What a hostile keeper can do
 ///
-/// Choose the moment within a due window, and sandwich the buy: push the v2 price up to
+/// Choose the moment within a due slot, and sandwich the buy: push the v2 price up to
 /// just inside the floor, let the buy land, sell back. The floor is `maxSlippageBps` (at
 /// most 5%, `MAX_SLIPPAGE_BPS`) below the better of the pool's average and its price now,
 /// so that is what it can cost the owner — plus however far the pair sits below the pool
@@ -179,7 +256,7 @@ struct Terms {
 /// both block positions, and about 18 ETH if an arbitrageur takes the reversal
 /// (`test_oneBlockOnTheOraclePoolRefusesEveryBuyForTenMinutes`). The same push the other
 /// way lowers the floor for those ten minutes, which pays only through a sandwich on the
-/// deep pair, above. So on SPX the realistic harm is skipped windows, not lost funds.
+/// deep pair, above. So on SPX the realistic harm is skipped slots, not lost funds.
 ///
 /// The cheapest lever refuses one buy, not ten minutes of them. The floor takes the better,
 /// for the owner, of the average and the pool's price now, so pushing the price now the
@@ -189,13 +266,26 @@ struct Terms {
 /// about 275 ticks, about 0.75 WETH through the pool, and costs about 0.0045 ETH for the
 /// round trip: the pool's fee both ways
 /// (`test_pushingThePoolsPriceNowRefusesABuyForItsFeesAlone`). It moves none of the owner's
-/// money, and the same window buys once the push is undone; but a keeper that takes the
-/// early refusal as "wait for the next window" loses that window, and the owner that buy
+/// money, and the same slot buys once the push is undone; but a keeper that takes the
+/// early refusal as "wait for the next slot" loses that slot, and the owner that buy
 /// time. (`pnpm keeper` tries a refused vault again ten minutes later, at most twice a
-/// window, so as not to pay for the same refusal without end.)
+/// slot, so as not to pay for the same refusal without end.)
 ///
-/// It cannot redirect the output, buy twice in a window, or spend more than one buy's
-/// worth plus its reward.
+/// It cannot redirect the output, buy twice in a slot, or spend more than one buy's
+/// worth plus its reward. Naming `rewardTo` adds nothing to that list: inside a community
+/// window a hostile keeper that is not eligible cannot be paid at all, though it can still
+/// make the buy by paying the owner, and an eligible one can do exactly what any keeper
+/// could do in v1.
+///
+/// ## What the community window does not stop
+///
+/// The registry proves that an address held SPX when a block closed. Nothing on chain can
+/// prove that SPX held during a transaction is not borrowed, so the check at the moment of
+/// a buy can be met with a flash borrow: what eligibility really filters for is "held 690
+/// SPX at the end of a block in the last 30 days". A bot that buys 690 SPX and proves it is
+/// a community keeper like any holder, and inside a window the fastest eligible keeper
+/// wins. None of this reaches the owner's money: at worst a fee is paid to someone the
+/// window was meant to keep out, which is what every fee in v1 was open to.
 contract SpdexDcaVault is VaultLimits {
     uint256 private constant BPS = 10_000;
 
@@ -205,18 +295,36 @@ contract SpdexDcaVault is VaultLimits {
 
     /// The WETH every vault pays with.
     IWETH9 public immutable weth;
+    /// Who decides, inside a community window, whether a `rewardTo` may be paid: the SPX
+    /// holder registry the factory was deployed with. Ownerless and immutable, as this is;
+    /// another registry means another factory, at another address.
+    ISpxHolderRegistry public immutable registry;
     /// This contract's own address. Under a clone's `delegatecall`, `address(this)` is the
     /// clone; only a call made to this contract directly sees the two equal.
     address private immutable self;
 
+    /// The gas the registry's `isEligible` is given. Its honest answer reads one slot of its
+    /// own, the holder's code and the holder's SPX balance: two cold slots and two cold
+    /// accounts, about 11,200 gas inside the call from cold, 11,700 for an account that has
+    /// delegated (the registry's own account is the caller's to pay for, outside it). This is
+    /// almost nine times that, because nothing can raise it once a vault exists: a fork that
+    /// reprices cold reads (as EIP-2929 tripled them) past a smaller stipend would turn every
+    /// window of every vault into one only its owner can be paid in, for good. A buy is
+    /// charged only the gas the answer uses, so the headroom costs an honest buy nothing; and
+    /// the stipend still bounds what a registry that burns its gas can take from one, which
+    /// then counts as not eligible.
+    uint256 public constant ELIGIBILITY_GAS = 100_000;
+
     // ─── State ───────────────────────────────────────────────────────────────────
     // Each clone's own storage. Packed into one slot: every buy writes both counters, and
     // one storage write is a real share of a small buy's gas. `buysDone` never exceeds
-    // MAX_BUYS; a timestamp fits 64 bits for billions of years.
+    // MAX_BUYS, nor `windowBuys` `buysDone`; a timestamp fits 64 bits for billions of years.
+    // `windowBuys` joined the slot in v2, so counting it adds no storage write to a buy.
 
     uint32 private _buysDone;
     uint64 private _lastBuyAt;
     bool private _closed;
+    uint32 private _windowBuys;
     uint256 private _totalOut;
 
     /// The reentrancy lock, in transient storage: it only has to hold for one transaction,
@@ -231,7 +339,11 @@ contract SpdexDcaVault is VaultLimits {
     /// can be read from its logs alone. `floorOut` and `oracleDepth` are the floor and the
     /// oracle pool's depth this buy was checked against (`quote()` at that moment);
     /// `buyNumber` counts this vault's buys from 1, so a gap in it is a log someone's
-    /// endpoint dropped, which `slot` cannot show because windows legitimately go unbought.
+    /// endpoint dropped, which `slot` cannot show because slots legitimately go unbought.
+    /// `keeper` is the caller (an account, or the batcher); `rewardTo` is who was paid
+    /// `reward`; `dueSince` is when the buy fell due, so whether it was made inside its
+    /// community window (`block.timestamp < dueSince + communityWindow`) and by whom — the
+    /// owner, the community, or anyone after the window — can be read from the log alone.
     event Bought(
         uint256 indexed slot,
         uint256 amountIn,
@@ -240,7 +352,9 @@ contract SpdexDcaVault is VaultLimits {
         uint256 reward,
         uint256 floorOut,
         uint256 buyNumber,
-        uint256 oracleDepth
+        uint256 oracleDepth,
+        address indexed rewardTo,
+        uint256 dueSince
     );
     event Closed(uint256 amount);
     event Rescued(address indexed token, uint256 amount);
@@ -266,6 +380,14 @@ contract SpdexDcaVault is VaultLimits {
     error WethLockedUntilClosed();
     error TransferFailed(address token);
     error OnlyWeth();
+    /// `rewardTo` is the zero address, or this vault, which would pay its own fee to itself.
+    error BadRewardTo(address rewardTo);
+    /// Inside the community window, `rewardTo` is neither the owner nor eligible. Anyone may
+    /// be paid from `windowEndsAt`.
+    error NotEligible(address rewardTo, uint256 windowEndsAt);
+    /// Inside the first half of the window of a plan with turns, `rewardTo` is eligible but
+    /// not in this buy's bucket, `turn`. Any eligible address may be paid from `turnEndsAt`.
+    error NotYourTurn(address rewardTo, uint256 turn, uint256 turnEndsAt);
 
     /// Every function that changes state takes the lock, so a token, pair or owner contract
     /// that calls back mid-transaction finds every door shut rather than only some.
@@ -277,9 +399,11 @@ contract SpdexDcaVault is VaultLimits {
     }
 
     /// @dev Deployed by `SpdexVaultFactory`'s constructor, once. Nothing here is a plan's:
-    ///      each clone's terms are written into its code by `createVault`.
-    constructor(address weth_) {
+    ///      each clone's terms are written into its code by `createVault`. The factory
+    ///      checked that the registry has code.
+    constructor(address weth_, address registry_) {
         weth = IWETH9(weth_);
+        registry = ISpxHolderRegistry(registry_);
         self = address(this);
     }
 
@@ -317,22 +441,33 @@ contract SpdexDcaVault is VaultLimits {
     /// @dev The only stop there is. If the owner cannot receive ether (a contract that
     ///      refuses it), the same amount goes as WETH instead: never stranded. Callable
     ///      again after closing, to sweep anything that arrived since.
+    ///
+    ///      Nor can the unwrap strand it. WETH sends the ether with `transfer`'s 2,300-gas
+    ///      stipend, which a clone's `receive` fits in today (the proxy, a `delegatecall`
+    ///      here, two comparisons). A fork that repriced any of that past the stipend, as
+    ///      EIP-1884 did to contracts that relied on it, would make `withdraw` revert; were that
+    ///      fatal, every vault's `close` would revert with it and no owner could stop a plan
+    ///      ever again. So a failed unwrap is not an error: the budget then goes back as WETH.
+    ///      `Closed` reports what went back either way.
     function close() external nonReentrant {
         Args memory a = _terms();
         if (msg.sender != a.owner) revert Unauthorized();
         _closed = true;
 
         uint256 wrapped = weth.balanceOf(address(this));
-        if (wrapped != 0) weth.withdraw(wrapped);
-        uint256 amount = address(this).balance;
-        if (amount != 0) {
-            (bool sent,) = a.owner.call{value: amount}("");
+        uint256 asWeth = wrapped != 0 && !_unwrap(wrapped) ? wrapped : 0;
+        // The unwrapped budget, and any ether forced in (by a `selfdestruct`, say).
+        uint256 asEther = address(this).balance;
+        if (asEther != 0) {
+            (bool sent,) = a.owner.call{value: asEther}("");
             if (!sent) {
-                weth.deposit{value: amount}();
-                _transfer(address(weth), a.owner, amount);
+                weth.deposit{value: asEther}();
+                asWeth += asEther;
+                asEther = 0;
             }
         }
-        emit Closed(amount);
+        if (asWeth != 0) _transfer(address(weth), a.owner, asWeth);
+        emit Closed(asEther + asWeth);
     }
 
     /// @notice Send the owner any ERC-20 this vault holds by mistake.
@@ -349,17 +484,25 @@ contract SpdexDcaVault is VaultLimits {
 
     // ─── Anyone ──────────────────────────────────────────────────────────────────
 
-    /// @notice Make this window's buy, if it is due, and be paid `keeperReward` in WETH.
+    /// @notice Make this slot's buy, if it is due, and have `keeperReward` paid in WETH to
+    ///         `rewardTo`.
+    /// @param rewardTo Who receives this buy's fee. Inside the community window: the owner,
+    ///        or an address the registry finds eligible. After it: any address but zero and
+    ///        this vault.
     /// @return received What the owner actually received, measured at the owner.
-    /// @dev The caller decides only when. Everything else — the amount, the token, the
-    ///      recipient, the floor — is fixed by the terms and checked here.
-    function execute() external nonReentrant returns (uint256 received) {
+    /// @return reward What `rewardTo` was paid: `keeperReward`, every time.
+    /// @dev The caller decides when, and who receives the caller's own fee; nothing about
+    ///      the buy. Everything else — the amount, the token, the recipient of what is
+    ///      bought, the floor — is fixed by the terms and checked here.
+    function execute(address rewardTo) external nonReentrant returns (uint256 received, uint256 reward) {
         Args memory a = _terms();
         if (_closed) revert VaultClosed();
         if (block.timestamp < a.startAt) revert NotStarted(a.startAt);
+        uint256 dueSince;
         {
             uint256 nextBuyAt = _nextBuyAt(a);
             if (block.timestamp < nextBuyAt) revert TooSoon(nextBuyAt);
+            dueSince = _dueSince(a, nextBuyAt);
         }
         if (_buysDone >= a.maxBuys) revert NoBuysLeft();
         {
@@ -367,8 +510,30 @@ contract SpdexDcaVault is VaultLimits {
             uint256 balance = weth.balanceOf(address(this));
             if (balance < needed) revert InsufficientBalance(balance, needed);
         }
+        if (rewardTo == address(0) || rewardTo == address(this)) revert BadRewardTo(rewardTo);
 
-        // Effects before anything leaves the vault: this window is used, whatever follows.
+        // The community window, from when this buy fell due. Inside it the fee goes to the
+        // owner or to an eligible address — for the first half of a plan with turns, one in
+        // this buy's bucket. The registry is asked only when it has to be: a buy after its
+        // window, or paid back to its owner, never calls it. A buy the community makes
+        // inside its window is counted, in the storage slot the effects below write anyway:
+        // no extra storage write.
+        {
+            uint256 windowEndsAt = dueSince + a.communityWindow;
+            if (block.timestamp < windowEndsAt && rewardTo != a.owner) {
+                if (!_eligible(rewardTo)) revert NotEligible(rewardTo, windowEndsAt);
+                if (a.turnBuckets != 0) {
+                    uint256 turnEndsAt = dueSince + a.communityWindow / 2;
+                    if (block.timestamp < turnEndsAt) {
+                        uint256 turn = _turnOf(a, (dueSince - a.startAt) / a.interval);
+                        if (_bucketOf(a, rewardTo) != turn) revert NotYourTurn(rewardTo, turn, turnEndsAt);
+                    }
+                }
+                ++_windowBuys;
+            }
+        }
+
+        // Effects before anything leaves the vault: this slot is used, whatever follows.
         // Timestamps fit 64 bits for longer than the sun will shine.
         // forge-lint: disable-next-line(unsafe-typecast)
         _lastBuyAt = uint64(block.timestamp);
@@ -382,37 +547,42 @@ contract SpdexDcaVault is VaultLimits {
         // judged against.
         (uint256 floorOut, uint256 depth) = _floor(a);
         if (depth < MIN_ORACLE_DEPTH) revert OracleTooThin(depth, MIN_ORACLE_DEPTH);
-        uint256 spotOut = _spotOut(a);
-        if (spotOut < floorOut) revert PriceBelowFloor(spotOut, floorOut);
+        {
+            uint256 spotOut = _spotOut(a);
+            if (spotOut < floorOut) revert PriceBelowFloor(spotOut, floorOut);
 
-        // Pay the pair and have it pay the owner directly. The reserves were read in this
-        // same call, so the amount out is exactly what the pair's invariant allows.
-        uint256 before = IERC20Minimal(a.tokenOut).balanceOf(a.owner);
-        _transfer(address(weth), a.pair, a.amountPerBuy);
-        (uint256 out0, uint256 out1) = _wethIsToken0(a) ? (uint256(0), spotOut) : (spotOut, uint256(0));
-        IUniswapV2PairMinimal(a.pair).swap(out0, out1, a.owner, "");
+            // Pay the pair and have it pay the owner directly. The reserves were read in this
+            // same call, so the amount out is exactly what the pair's invariant allows.
+            uint256 before = IERC20Minimal(a.tokenOut).balanceOf(a.owner);
+            _transfer(address(weth), a.pair, a.amountPerBuy);
+            (uint256 out0, uint256 out1) = _wethIsToken0(a) ? (uint256(0), spotOut) : (spotOut, uint256(0));
+            IUniswapV2PairMinimal(a.pair).swap(out0, out1, a.owner, "");
 
-        // Measured, not assumed: a token that takes a fee on transfer, or lies about the
-        // amount, delivers less than the pair sent, and that must fail here rather than
-        // count as a buy — whether or not the shortfall would fit inside the floor, since a
-        // floor is an allowance for the market, not for the token.
-        uint256 afterward = IERC20Minimal(a.tokenOut).balanceOf(a.owner);
-        received = afterward > before ? afterward - before : 0;
-        if (received < spotOut) revert DeliveredShort(received, spotOut);
+            // Measured, not assumed: a token that takes a fee on transfer, or lies about the
+            // amount, delivers less than the pair sent, and that must fail here rather than
+            // count as a buy — whether or not the shortfall would fit inside the floor, since
+            // a floor is an allowance for the market, not for the token.
+            uint256 afterward = IERC20Minimal(a.tokenOut).balanceOf(a.owner);
+            received = afterward > before ? afterward - before : 0;
+            if (received < spotOut) revert DeliveredShort(received, spotOut);
+        }
 
         // Written after the swap because it is only known after it; the lock above is what
         // keeps a callback from observing or changing anything in between.
         _totalOut += received;
-        if (a.keeperReward != 0) _transfer(address(weth), msg.sender, a.keeperReward);
+        reward = a.keeperReward;
+        if (reward != 0) _transfer(address(weth), rewardTo, reward);
         emit Bought(
             (block.timestamp - a.startAt) / a.interval,
             a.amountPerBuy,
             received,
             msg.sender,
-            a.keeperReward,
+            reward,
             floorOut,
             buyNumber,
-            depth
+            depth,
+            rewardTo,
+            dueSince
         );
     }
 
@@ -436,8 +606,24 @@ contract SpdexDcaVault is VaultLimits {
             maxBuys: a.maxBuys,
             startAt: a.startAt,
             keeperReward: a.keeperReward,
-            maxSlippageBps: a.maxSlippageBps
+            maxSlippageBps: a.maxSlippageBps,
+            communityWindow: a.communityWindow,
+            turnBuckets: a.turnBuckets
         });
+    }
+
+    /// @notice The bucket `holder` is in on this plan: whose turn it is when a buy's slot
+    ///         draws this number (`turnOf`). 0 for a plan without turns, where every address
+    ///         is in the one bucket.
+    function bucketOf(address holder) external view returns (uint256) {
+        return _bucketOf(_terms(), holder);
+    }
+
+    /// @notice The bucket whose eligible holders have first claim on the buy made in slot
+    ///         `slot` (counted from `startAt`, as `Bought` counts it), for the first half of
+    ///         its community window. 0 for a plan without turns.
+    function turnOf(uint256 slot) external view returns (uint256) {
+        return _turnOf(_terms(), slot);
     }
 
     /// @notice Buys made so far.
@@ -446,7 +632,7 @@ contract SpdexDcaVault is VaultLimits {
         return _buysDone;
     }
 
-    /// @notice When the last buy was made, chain time; 0 before the first. Its window, and
+    /// @notice When the last buy was made, chain time; 0 before the first. Its slot, and
     ///         the earliest the next buy may come, both follow from it.
     function lastBuyAt() external view returns (uint64) {
         _notTheImplementation();
@@ -459,6 +645,14 @@ contract SpdexDcaVault is VaultLimits {
         return _closed;
     }
 
+    /// @notice Buys made inside their community window and paid to someone other than the
+    ///         owner: the buys SPX holders made first claim on. With `buysDone`, the share of
+    ///         this plan's buys the community made, read from state rather than from logs.
+    function windowBuys() external view returns (uint32) {
+        _notTheImplementation();
+        return _windowBuys;
+    }
+
     /// @notice Everything delivered to the owner so far, in `tokenOut`'s raw units, as
     ///         measured at the owner. With `buysDone` it gives a UI the average price
     ///         without reading logs.
@@ -468,7 +662,8 @@ contract SpdexDcaVault is VaultLimits {
     }
 
     /// @notice Everything a keeper or a page needs to decide cheaply whether `execute` would
-    ///         pass, except the price, which is `quote`'s.
+    ///         pass, except the price, which is `quote`'s, and whether a `rewardTo` is eligible,
+    ///         which is the registry's.
     /// @dev The oracle pool's depth is part of `due` because it is not a moment's question:
     ///      once liquidity leaves a pool, every buy is refused until it comes back, and a
     ///      status that went on saying "due" would have every reader offer a trigger that can
@@ -477,7 +672,7 @@ contract SpdexDcaVault is VaultLimits {
     ///      saying as such. The pool is read inside a `try`, so a pool that cannot answer a
     ///      ten-minute average right now makes the buy not due rather than this unreadable.
     /// @return due Every check `execute` makes except the price floor passes right now: not
-    ///         closed, a buy left, the window open and the last buy far enough back, the
+    ///         closed, a buy left, the slot open and the last buy far enough back, the
     ///         budget there, and the oracle pool answering with at least `MIN_ORACLE_DEPTH`.
     /// @return nextBuyAt The earliest moment the next buy may happen, by the clock alone
     ///         (at or before now when `due`; possibly so while not due, for want of budget or
@@ -486,18 +681,44 @@ contract SpdexDcaVault is VaultLimits {
     /// @return wethBalance The WETH held, in wei. Anyone can send a vault WETH, so this can
     ///         exceed what the plan needs, and even `MAX_FUNDING`; `close` returns all of it.
     /// @return funded Whether that covers the next buy and its reward.
+    /// @return dueSince When the next buy falls (or fell) due, the moment its community window
+    ///         is measured from: `nextBuyAt` until then; from then on, the later of `nextBuyAt`
+    ///         and the start of the slot the clock is in, exactly as `execute` works it out. 0
+    ///         when no buy is left.
+    /// @return windowEndsAt `dueSince + communityWindow`: until this moment the fee can be paid
+    ///         only to the owner or an eligible address; from it, to anyone. 0 when no buy is
+    ///         left.
+    /// @return turnEndsAt Until this moment a `rewardTo` other than the owner must also be in
+    ///         the bucket `turn`: `dueSince + communityWindow / 2` for a plan with turns,
+    ///         `dueSince` (no turn at all) for one without. 0 when no buy is left.
+    /// @return turn The bucket whose eligible holders have first claim on this buy until
+    ///         `turnEndsAt` (`turnOf` of the slot `dueSince` is in). 0 without turns.
     function status()
         external
         view
-        returns (bool due, uint256 nextBuyAt, uint256 buysLeft, uint256 wethBalance, bool funded)
+        returns (
+            bool due,
+            uint256 nextBuyAt,
+            uint256 buysLeft,
+            uint256 wethBalance,
+            bool funded,
+            uint256 dueSince,
+            uint256 windowEndsAt,
+            uint256 turnEndsAt,
+            uint256 turn
+        )
     {
         Args memory a = _terms();
         wethBalance = weth.balanceOf(address(this));
         funded = wethBalance >= a.amountPerBuy + a.keeperReward;
         buysLeft = _closed ? 0 : a.maxBuys - _buysDone;
-        if (buysLeft == 0) return (false, 0, 0, wethBalance, funded);
+        if (buysLeft == 0) return (false, 0, 0, wethBalance, funded, 0, 0, 0, 0);
 
         nextBuyAt = _nextBuyAt(a);
+        dueSince = block.timestamp < nextBuyAt ? nextBuyAt : _dueSince(a, nextBuyAt);
+        windowEndsAt = dueSince + a.communityWindow;
+        turnEndsAt = a.turnBuckets == 0 ? dueSince : dueSince + a.communityWindow / 2;
+        turn = _turnOf(a, (dueSince - a.startAt) / a.interval);
         // The pool last, and only when everything else says yes: it is the one read here
         // that costs real gas.
         due = funded && block.timestamp >= nextBuyAt && _oracleDeepEnough(a);
@@ -518,8 +739,9 @@ contract SpdexDcaVault is VaultLimits {
         spotOut = _spotOut(a);
     }
 
-    /// @notice Rewards paid to keepers so far, in wei. Every buy pays the same reward, so
-    ///         this is derived rather than stored.
+    /// @notice Rewards paid so far, in wei, to whichever `rewardTo` each buy named — the owner
+    ///         included, when the owner made the buy. Every buy pays the same reward, so this
+    ///         is derived rather than stored.
     function totalRewards() external view returns (uint256) {
         return uint256(_buysDone) * _terms().keeperReward;
     }
@@ -584,7 +806,7 @@ contract SpdexDcaVault is VaultLimits {
     }
 
     /// The earliest moment the next buy may happen: `startAt` before the first; after it,
-    /// the start of the window after the last buy's or half an interval after the last buy,
+    /// the start of the slot after the last buy's or half an interval after the last buy,
     /// whichever is later.
     function _nextBuyAt(Args memory a) private view returns (uint256) {
         uint256 last = _lastBuyAt;
@@ -592,6 +814,55 @@ contract SpdexDcaVault is VaultLimits {
         uint256 nextWindow = a.startAt + ((last - a.startAt) / a.interval + 1) * a.interval;
         uint256 spaced = last + a.interval / 2;
         return nextWindow > spaced ? nextWindow : spaced;
+    }
+
+    /// When the buy due now fell due: the later of `nextBuyAt` and the start of the slot the
+    /// clock is in. Only for a moment at or after `nextBuyAt` (which is at or after
+    /// `startAt`), so the subtraction cannot underflow.
+    function _dueSince(Args memory a, uint256 nextBuyAt) private view returns (uint256) {
+        // Dividing first is the point: it rounds the time down to the start of its slot.
+        // forge-lint: disable-next-line(divide-before-multiply)
+        uint256 slotStart = a.startAt + ((block.timestamp - a.startAt) / a.interval) * a.interval;
+        return nextBuyAt > slotStart ? nextBuyAt : slotStart;
+    }
+
+    /// Whether the registry says `holder` may be paid inside a community window. Asked with
+    /// `STATICCALL` and `ELIGIBILITY_GAS`, copying back one word at most: only a call that
+    /// succeeds and answers a whole word equal to 1 — `true`, exactly — counts. A revert, an
+    /// out-of-gas, a short answer or any other word is "not eligible" (decision 14 of
+    /// `docs/V2_UPGRADE.md`), so the worst a broken registry can do is delay a buy until its
+    /// window ends, for at most this stipend's gas.
+    function _eligible(address holder) private view returns (bool eligible) {
+        address target = address(registry);
+        bytes4 selector = ISpxHolderRegistry.isEligible.selector;
+        assembly ("memory-safe") {
+            // The 36 bytes of calldata, and the one word of answer, fit in scratch space
+            // (0x00 to 0x3f): nothing is allocated, and an answer of any length costs this
+            // vault one word's copy.
+            mstore(0x00, selector)
+            mstore(0x04, holder)
+            let ok := staticcall(ELIGIBILITY_GAS, target, 0x00, 0x24, 0x00, 0x20)
+            // `mload(0)` is the answer's first word only when a whole word came back.
+            eligible := and(ok, and(gt(returndatasize(), 0x1f), eq(mload(0x00), 1)))
+        }
+    }
+
+    /// The bucket `holder` is in: its hash, modulo the plan's buckets; 0 without turns.
+    function _bucketOf(Args memory a, address holder) private pure returns (uint256) {
+        return a.turnBuckets == 0 ? 0 : uint256(keccak256(abi.encode(holder))) % a.turnBuckets;
+    }
+
+    /// The bucket slot `slot` of this vault draws: the hash of the vault and the slot, modulo
+    /// the plan's buckets, so each vault's turns fall differently and no bucket is first on
+    /// every vault at once. 0 without turns.
+    function _turnOf(Args memory a, uint256 slot) private view returns (uint256) {
+        return a.turnBuckets == 0 ? 0 : uint256(keccak256(abi.encode(address(this), slot))) % a.turnBuckets;
+    }
+
+    /// WETH's `withdraw`, reporting whether it went through instead of reverting with it: see
+    /// `close`. The ether arrives through `receive` before this returns.
+    function _unwrap(uint256 amount) private returns (bool unwrapped) {
+        (unwrapped,) = address(weth).call(abi.encodeCall(IWETH9.withdraw, (amount)));
     }
 
     /// An ERC-20 transfer that also accepts tokens returning nothing, and refuses one that

@@ -1,6 +1,15 @@
 /**
- * Help run the network: the helper agent's page makes a due buy of a vault the
- * owner agent created, in one batch, sent privately, and is paid its buy fee.
+ * Help run the network: the holder agent's page (the helper, proven by
+ * `3-prove`) makes a due buy of a v2 vault the owner agent created, inside
+ * its community window, in one batch, sent privately, and is paid its buy fee.
+ *
+ * Inside the window only a community keeper can be paid, so an outside
+ * caller must lose to the holder agent. That is checked before the batch,
+ * with `eth_call`s and nothing spent: a fresh address that names itself as
+ * `rewardTo`, calling the vault directly or through the batcher, is refused
+ * `NotEligible` until the window's end. (On 2026-10-02 a v1 run's Help run
+ * vault was triggered by an outside account three blocks after it was
+ * created; this is what v2 changes.)
  *
  * Only this run's vault, ever. The panel lists every due vault it finds, and
  * on mainnet those are other people's; the spec unticks all but its own
@@ -18,8 +27,16 @@
  */
 
 import type { Page } from "@playwright/test";
+import { addressOfKey, generateSpendingKey } from "../packages/chain/src/index.js";
 import {
+  CURRENT_SOURCE,
+  DEFAULT_TURN_BUCKETS,
+  decodeBatchRevert,
+  decodeVaultError,
+  defaultCommunityWindow,
   encodeCreateVault,
+  encodeExecute,
+  encodeExecuteBatch,
   joinBatchLogs,
   modelBatchGas,
   termsProblems,
@@ -32,9 +49,9 @@ import {
 import { privateGasPrice } from "../apps/web/src/lib/submit.js";
 import { expect, openTile, seedConfig, test } from "../e2e/fixtures.js";
 import { BATCHER, FACTORY, SPX, WETH, chainTime, minedReceipt, rpc, settings, tokenBalance } from "./chain.js";
-import { currentRun, eth, gwei } from "./settings.js";
-import { closeOpenVaults, vaultOnChain } from "./vaults.js";
-import { MINED_WITHIN_MS, agents, pageWallet, sendAs, settleMined } from "./wallet.js";
+import { HOLDER, currentRun, eth, gwei } from "./settings.js";
+import { closeOpenVaults, eventIn, vaultOnChain } from "./vaults.js";
+import { MINED_WITHIN_MS, agents, pageWallet, requireHolderEligible, sendAs, settleMined } from "./wallet.js";
 
 type Hex = `0x${string}`;
 
@@ -74,7 +91,22 @@ async function tickOnly(page: Page, keep: ReadonlySet<string>): Promise<void> {
   throw new Error("the ticks never settled on this run's own vault");
 }
 
-test("makes this run's due vault buy, privately, and is paid exactly its buy fee", async ({ page, context }) => {
+/**
+ * What an outside caller gets for calling `to` with `data`, as an `eth_call`
+ * from `from`: its revert data, or a failure if it would go through.
+ */
+async function revertOf(from: Hex, to: Hex, data: Hex): Promise<Hex> {
+  try {
+    await rpc("eth_call", [{ from, to, data }, "latest"]);
+  } catch (error) {
+    const revert = (error as { data?: unknown }).data;
+    if (typeof revert === "string" && /^0x[0-9a-f]*$/i.test(revert)) return revert.toLowerCase() as Hex;
+    throw error;
+  }
+  throw new Error(`an outside caller's call to ${to} would go through`);
+}
+
+test("makes this run's due vault buy inside its community window, privately, and is paid exactly its buy fee", async ({ page, context }) => {
   const run = currentRun();
   // Said on the console too: the list reporter shows a skip, not its reason.
   const skip = (reason: string) => {
@@ -92,12 +124,36 @@ test("makes this run's due vault buy, privately, and is paid exactly its buy fee
   }
   expect(withinFeeCeiling(reward, amountPerBuy)).toBe(true);
 
-  const { owner, helper } = agents();
+  const { owner } = agents();
+  const helper = agents()[HOLDER];
+  await requireHolderEligible();
   const now = await chainTime();
-  const plan: VaultPlan = { marketIndex: 0n, amountPerBuy, interval: 3_600n, maxBuys: 1n, startAt: now, keeperReward: reward, maxSlippageBps: 300n };
+  // The app's default window for an hourly plan, 15 minutes: room for the page's whole round, inside it.
+  const plan: VaultPlan = {
+    marketIndex: 0n,
+    amountPerBuy,
+    interval: 3_600n,
+    maxBuys: 1n,
+    startAt: now,
+    keeperReward: reward,
+    maxSlippageBps: 300n,
+    communityWindow: defaultCommunityWindow(3_600n),
+    turnBuckets: DEFAULT_TURN_BUCKETS,
+  };
   expect(termsProblems(plan, now)).toEqual([]);
   const creation = await sendAs(owner, { to: FACTORY, data: encodeCreateVault(plan), value: vaultBudget(plan) }, "help run: create a vault due now");
   const vault = vaultsCreatedBy(FACTORY, creation.logs as RawLog[]).find((event) => event.owner === owner.address)!.vault.toLowerCase() as Hex;
+  const windowEndsAt = plan.startAt + plan.communityWindow;
+
+  // ── An outside caller loses: refused inside the window, directly or through the batcher ──
+  const outsider = addressOfKey(generateSpendingKey()).toLowerCase() as Hex;
+  const direct = decodeVaultError(await revertOf(outsider, vault, encodeExecute(outsider)));
+  expect(direct, "an outside caller's direct execute").toMatchObject({ name: "NotEligible" });
+  expect((direct!.args[0] as string).toLowerCase()).toBe(outsider);
+  expect(direct!.args[1]).toBe(windowEndsAt);
+  const batched = decodeBatchRevert([vault], await revertOf(outsider, BATCHER, encodeExecuteBatch([vault], outsider, 0n)));
+  expect(batched, "an outside caller's batch").toMatchObject({ kind: "NothingBought", bought: 0n });
+  expect(batched!.outcomes.map((o) => o.reasonName)).toEqual(["NotEligible"]);
 
   const wallet = await pageWallet(context, helper, "help run: batch of this run's vault", run.relayUrl);
   await seedConfig(page, { preset: "custom", submitter: { mode: "private", url: run.relayUrl } });
@@ -126,7 +182,13 @@ test("makes this run's due vault buy, privately, and is paid exactly its buy fee
   expect(runs).toHaveLength(1);
   expect(runs[0]!.triggered.map((t) => t.event.vault)).toEqual([vault]);
   expect(runs[0]!.batch).toMatchObject({ caller: helper.address, rewardTo: helper.address, bought: 1n, earned: reward });
+  // The vault paid the holder agent, inside the window: a community keeper's buy.
+  const bought = eventIn(receipt, vault, "Bought");
+  expect(bought).toMatchObject({ source: CURRENT_SOURCE, keeper: BATCHER, rewardTo: helper.address, reward, dueSince: plan.startAt });
+  const block = (await rpc("eth_getBlockByNumber", [receipt.blockNumber, false])) as { timestamp: string };
+  expect(BigInt(block.timestamp)).toBeLessThan(windowEndsAt);
   expect((await tokenBalance(WETH, helper.address)) - weth0).toBe(reward);
   expect(await tokenBalance(SPX, owner.address)).toBeGreaterThan(spx0);
-  expect((await vaultOnChain(vault)).buysDone).toBe(1n);
+  expect(await vaultOnChain(vault)).toMatchObject({ buysDone: 1n, windowBuys: 1n });
+  test.info().annotations.push({ type: "inside the community window", description: `${windowEndsAt - BigInt(block.timestamp)} s before it ended` });
 });

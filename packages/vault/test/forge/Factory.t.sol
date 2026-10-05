@@ -11,10 +11,11 @@ import {Market, SpdexVaultFactory} from "../../contracts/SpdexVaultFactory.sol";
 contract FactoryTest is ForkTest {
     /// The salt the factory is deployed with through the deterministic deployer. The same
     /// value is FACTORY_SALT in `packages/vault/src/artifacts.ts`, where it is derived as
-    /// keccak256("spdex.vault.factory.v1"); a change to either must change both. It did not
-    /// change with the clones: the constructor's arguments and the bytecode did, and either
-    /// alone moves the address.
-    bytes32 internal constant FACTORY_SALT = keccak256("spdex.vault.factory.v1");
+    /// keccak256("spdex.vault.factory.v2"); a change to either must change both. v1's was
+    /// keccak256("spdex.vault.factory.v1") (V1_FACTORY_SALT): a new release takes a new
+    /// salt, though its new bytecode and constructor arguments would each move the address
+    /// alone.
+    bytes32 internal constant FACTORY_SALT = keccak256("spdex.vault.factory.v2");
 
     function test_isVaultRecordsOnlyItsOwnVaults() public {
         Plan memory t = defaultPlan();
@@ -54,6 +55,9 @@ contract FactoryTest is ForkTest {
         Plan memory other = defaultPlan();
         other.amountPerBuy += 1;
         assertTrue(predict(owner, 2, other) != predict(owner, 2, t), "different terms, different address");
+        other = defaultPlan();
+        other.communityWindow += 1;
+        assertTrue(predict(owner, 2, other) != predict(owner, 2, t), "the window too: a second more, another vault");
     }
 
     function test_vaultCreatedCarriesOwnerVaultMarketTermsAndFunding() public {
@@ -64,12 +68,20 @@ contract FactoryTest is ForkTest {
             vm.recordLogs();
             vm.prank(owner);
             address vault = factory.createVault{value: value}(
-                t.marketIndex, t.amountPerBuy, t.interval, t.maxBuys, t.startAt, t.keeperReward, t.maxSlippageBps
+                t.marketIndex,
+                t.amountPerBuy,
+                t.interval,
+                t.maxBuys,
+                t.startAt,
+                t.keeperReward,
+                t.maxSlippageBps,
+                t.communityWindow,
+                t.turnBuckets
             );
             VmLog[] memory logs = vm.getRecordedLogs();
 
             bytes32 topic = keccak256(
-                "VaultCreated(address,address,uint256,(address,address,address,uint256,uint256,uint256,uint256,uint256,uint256),uint256)"
+                "VaultCreated(address,address,uint256,(address,address,address,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256),uint256)"
             );
             uint256 found;
             for (uint256 i; i < logs.length; i++) {
@@ -102,7 +114,15 @@ contract FactoryTest is ForkTest {
         made[0] = address(create(t));
         vm.prank(stranger);
         made[1] = factory.createVault(
-            t.marketIndex, t.amountPerBuy, t.interval, t.maxBuys, t.startAt, t.keeperReward, t.maxSlippageBps
+            t.marketIndex,
+            t.amountPerBuy,
+            t.interval,
+            t.maxBuys,
+            t.startAt,
+            t.keeperReward,
+            t.maxSlippageBps,
+            t.communityWindow,
+            t.turnBuckets
         );
         made[2] = address(create(t));
         // A clone made by hand is not the factory's, and is not listed.
@@ -153,7 +173,15 @@ contract FactoryTest is ForkTest {
         vm.prank(owner);
         vm.expectRevert(abi.encodeWithSelector(SpdexVaultFactory.SlippageOutOfRange.selector));
         factory.createVault(
-            t.marketIndex, t.amountPerBuy, t.interval, t.maxBuys, t.startAt, t.keeperReward, t.maxSlippageBps
+            t.marketIndex,
+            t.amountPerBuy,
+            t.interval,
+            t.maxBuys,
+            t.startAt,
+            t.keeperReward,
+            t.maxSlippageBps,
+            t.communityWindow,
+            t.turnBuckets
         );
         assertEq(factory.nonces(owner), 0, "a refused creation uses no nonce");
     }
@@ -173,7 +201,15 @@ contract FactoryTest is ForkTest {
             vm.prank(owner);
             vm.expectRevert(unknown);
             factory.createVault(
-                t.marketIndex, t.amountPerBuy, t.interval, t.maxBuys, t.startAt, t.keeperReward, t.maxSlippageBps
+                t.marketIndex,
+                t.amountPerBuy,
+                t.interval,
+                t.maxBuys,
+                t.startAt,
+                t.keeperReward,
+                t.maxSlippageBps,
+                t.communityWindow,
+                t.turnBuckets
             );
             vm.expectRevert(unknown);
             predict(owner, 0, t);
@@ -189,6 +225,8 @@ contract FactoryTest is ForkTest {
         assertEq(factory.implementation(), expected, "CREATE from the factory, nonce 1");
         assertGt(expected.code.length, 0, "deployed with the factory");
         assertEq(address(SpdexDcaVault(payable(expected)).weth()), WETH, "paying with the factory's WETH");
+        assertEq(address(SpdexDcaVault(payable(expected)).registry()), registry, "asking the factory's registry");
+        assertEq(factory.registry(), registry, "the factory's registry");
         assertEq(factory.weth(), WETH, "the factory's WETH");
         assertEq(factory.uniswapV2Factory(), V2_FACTORY, "Uniswap v2's factory");
         assertEq(factory.uniswapV3Factory(), V3_FACTORY, "Uniswap v3's factory");
@@ -196,10 +234,12 @@ contract FactoryTest is ForkTest {
 
     /// The deployment the app offers: through the standard deterministic deployer, with a
     /// fixed salt, so the address depends only on this bytecode — the vault's included — and
-    /// the constructor's arguments, the market list among them.
+    /// the constructor's arguments, the registry and the market list among them. The
+    /// fixture's registry was deployed the same way, so the address logged here is the one
+    /// `src/artifacts.ts` ships as `MAINNET_FACTORY`.
     function test_deployedThroughTheDeterministicDeployerLandsWhereExpected() public {
         bytes memory initCode = abi.encodePacked(
-            type(SpdexVaultFactory).creationCode, abi.encode(WETH, V2_FACTORY, V3_FACTORY, spxMarkets())
+            type(SpdexVaultFactory).creationCode, abi.encode(WETH, V2_FACTORY, V3_FACTORY, registry, spxMarkets())
         );
         address expected = address(
             uint160(
@@ -215,10 +255,11 @@ contract FactoryTest is ForkTest {
         assertEq(address(bytes20(returned)), expected, "the deployer reports the predicted address");
         SpdexVaultFactory deployed = SpdexVaultFactory(expected);
         assertEq(deployed.weth(), WETH, "a factory for mainnet WETH");
+        assertEq(deployed.registry(), registry, "asking this registry");
         (address tokenOut, address pair, address pool) = deployed.markets(0);
         assertTrue(tokenOut == SPX && pair == SPX_WETH_PAIR && pool == SPX_WETH_POOL, "with SPX's market");
         assertEq(deployed.marketCount(), 1, "and only that");
-        console.log("SpdexVaultFactory for mainnet WETH and SPX's market", expected);
+        console.log("SpdexVaultFactory for mainnet WETH, SPX's market and the registry: mainnet's", expected);
         console.log("its implementation", deployed.implementation());
 
         // Anyone may send it; sending it again cannot replace it. (A CREATE2 collision burns
@@ -226,11 +267,28 @@ contract FactoryTest is ForkTest {
         (ok,) = DETERMINISTIC_DEPLOYER.call{gas: 10_000_000}(abi.encodePacked(FACTORY_SALT, initCode));
         assertTrue(!ok, "a second deployment to the same address fails");
 
-        // Another list is another factory: the address commits to the markets.
+        // Another list is another factory: the address commits to the markets. So does another
+        // registry.
         Market[] memory none = new Market[](0);
-        bytes memory otherInit =
-            abi.encodePacked(type(SpdexVaultFactory).creationCode, abi.encode(WETH, V2_FACTORY, V3_FACTORY, none));
+        bytes memory otherInit = abi.encodePacked(
+            type(SpdexVaultFactory).creationCode, abi.encode(WETH, V2_FACTORY, V3_FACTORY, registry, none)
+        );
         assertTrue(keccak256(otherInit) != keccak256(initCode), "a different list is different init code");
+        otherInit = abi.encodePacked(
+            type(SpdexVaultFactory).creationCode, abi.encode(WETH, V2_FACTORY, V3_FACTORY, WETH, spxMarkets())
+        );
+        assertTrue(keccak256(otherInit) != keccak256(initCode), "a different registry is different init code");
+    }
+
+    /// The registry must be a contract. A vault's `STATICCALL` to an address with no code
+    /// succeeds with no answer, which it counts as "not eligible": a mistyped registry would
+    /// quietly shut every holder out of every window rather than fail. So it is refused when
+    /// the factory is deployed, where the mistake can be named.
+    function test_aRegistryWithNoCodeIsRefused() public {
+        vm.expectRevert(abi.encodeWithSelector(SpdexVaultFactory.NotARegistry.selector));
+        deployFactoryWith(stranger, spxMarkets());
+        vm.expectRevert(abi.encodeWithSelector(SpdexVaultFactory.NotARegistry.selector));
+        deployFactoryWith(address(0), spxMarkets());
     }
 
     function predict(address creator, uint256 nonce, Plan memory p) internal view returns (address) {
@@ -243,7 +301,9 @@ contract FactoryTest is ForkTest {
             p.maxBuys,
             p.startAt,
             p.keeperReward,
-            p.maxSlippageBps
+            p.maxSlippageBps,
+            p.communityWindow,
+            p.turnBuckets
         );
     }
 
@@ -260,9 +320,11 @@ contract FactoryTest is ForkTest {
             uint64(p.startAt),
             uint32(p.interval),
             uint16(p.maxBuys),
-            uint16(p.maxSlippageBps)
+            uint16(p.maxSlippageBps),
+            uint32(p.communityWindow),
+            uint8(p.turnBuckets)
         );
-        assertEq(args.length, 112, "112 bytes of args");
+        assertEq(args.length, 117, "117 bytes of args");
         bytes memory initCode = abi.encodePacked(
             hex"61",
             uint16(0x2d + args.length),

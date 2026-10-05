@@ -55,6 +55,21 @@ describe("noticeFor", () => {
     expect(noticeFor(malformed, null).text).toBe("Nothing was sent. This didn't match your vault or its plan (the contract, the amount or the terms).");
   });
 
+  /** A v2 vault's refusal of a fee named for someone who may not be paid it inside the window, in words. */
+  it("explains a v2 vault's community-window refusal in the vault's own terms", () => {
+    const word = (v: bigint) => v.toString(16).padStart(64, "0");
+    const refused = new VaultTxRefused({
+      level: "rejected",
+      signable: false,
+      // NotEligible(address rewardTo, uint256 windowEndsAt)
+      violations: [{ code: "SIMULATION_REVERTED", message: `execution reverted: 0x5863fc24${word(0xbbn)}${word(1_000n)}` }],
+      warnings: [],
+    });
+    expect(noticeFor(refused, null).text).toBe(
+      "Nothing was sent. Inside its community window, a buy's fee can be paid only to a community keeper (an account proven to hold 690 SPX) or the vault's owner.",
+    );
+  });
+
   it("says a vault transaction refused because the second opinion didn't answer waits for both services, never a fault", () => {
     const refused = new VaultTxRefused({
       level: "rejected",

@@ -6,9 +6,10 @@
  * other half: that the factory's count is what `nonces(owner)` really says,
  * that the owner topic the search filters on is the one the factory really
  * indexes, and that what comes back is exactly the vaults the owner created,
- * at the addresses the factory put them. Every address is fresh, the fork's
- * clock is never touched, and the vaults are created empty: nothing is left
- * funded for a keeper to find.
+ * at the addresses the factory put them — on this build's factory and on
+ * v1's, each searched with its own release's `VaultCreated`. Every address is
+ * fresh, the fork's clock is never touched, and the vaults are created empty:
+ * nothing is left funded for a keeper to find.
  *
  * Requires a fork: `pnpm anvil:fork`.
  */
@@ -16,11 +17,14 @@
 import { beforeAll, describe, expect, it } from "vitest";
 import type { Address, Hex } from "@spdex/core";
 import { addressOfKey, generateSpendingKey, httpRpc, prepareTransaction, signPrepared, type JsonRpc } from "@spdex/chain";
+import { encodeFunctionData } from "viem";
 import {
   MAINNET_DEPLOYMENT,
+  V1_FACTORY_ABI,
+  V1_MAINNET_FACTORY,
+  VAULT_EVENT_TOPICS,
   VAULT_LIMITS,
   VAULT_LOGS_FROM_BLOCK,
-  deployFactoryCall,
   encodeCreateVault,
   factoryAddress,
   findVaultsByOwner,
@@ -29,6 +33,7 @@ import {
   vaultsCreatedBy,
   type VaultPlan,
 } from "../../src/index.js";
+import { ensureRelease } from "./fork.js";
 
 const FORK_URL = process.env["SPDEX_FORK_URL"] ?? "http://127.0.0.1:8545";
 const CHAIN_ID = Number(process.env["SPDEX_FORK_CHAIN_ID"] ?? "690069");
@@ -90,12 +95,9 @@ describe("finding an owner's vaults on the fork", () => {
 
   beforeAll(async () => {
     expect(Number(BigInt((await rpc("eth_chainId", [])) as string))).toBe(CHAIN_ID);
-    if (((await rpc("eth_getCode", [factory, "latest"])) as string) === "0x") {
-      // The vault integration test deploys it too; whichever runs first does.
-      const deployer = await freshAccount(ETHER);
-      const call = deployFactoryCall();
-      await send(deployer.key, call.to, call.data, call.value);
-    }
+    // The other suites deploy them too; whichever runs first does.
+    await ensureRelease("v2");
+    await ensureRelease("v1");
     owner = await freshAccount(ETHER / 10n);
   });
 
@@ -121,6 +123,8 @@ describe("finding an owner's vaults on the fork", () => {
         startAt: BigInt(latest.timestamp),
         keeperReward: 0n,
         maxSlippageBps: 100n,
+        communityWindow: 75n,
+        turnBuckets: 0n,
       };
       const receipt = await send(owner.key, factory, encodeCreateVault(plan));
       const [created] = vaultsCreatedBy(factory, receipt.logs);
@@ -150,6 +154,25 @@ describe("finding an owner's vaults on the fork", () => {
     const head = BigInt((await rpc("eth_blockNumber", [])) as string);
     const found = await findVaultsByOwner(rpc, factory, owner.address, { newestBlock: head, maxRange: head - made[1]!.block + 1n });
     expect(found).toEqual({ vaults: [made[1]!.vault], expected: 2n, complete: false, searchedFrom: made[1]!.block });
+  });
+
+  it("finds the same owner's v1 vault on v1's factory, by v1's topic, and none of its v2 vaults there", async () => {
+    const latest = (await rpc("eth_getBlockByNumber", ["latest", false])) as { timestamp: string };
+    const args = [0n, ETHER / 1_000n, VAULT_LIMITS.MIN_INTERVAL, 1n, BigInt(latest.timestamp), 0n, 100n] as const;
+    const receipt = await send(owner.key, V1_MAINNET_FACTORY, encodeFunctionData({ abi: V1_FACTORY_ABI, functionName: "createVault", args }));
+    const [created] = vaultsCreatedBy(V1_MAINNET_FACTORY, receipt.logs);
+    expect(created).toMatchObject({ source: "v1", owner: owner.address.toLowerCase() });
+    expect(receipt.logs.find((log) => log.address.toLowerCase() === V1_MAINNET_FACTORY)!.topics[0]).toBe(VAULT_EVENT_TOPICS.v1.VaultCreated);
+
+    const endpoint = watched();
+    const onV1 = await findVaultsByOwner(endpoint.rpc, V1_MAINNET_FACTORY, owner.address, { oldestBlock: VAULT_LOGS_FROM_BLOCK });
+    expect(onV1).toMatchObject({ vaults: [created!.vault], expected: 1n, complete: true });
+    // This build's factory still has the owner's two, and they are not v1's.
+    expect(await findVaultsByOwner(rpc, factory, owner.address, { oldestBlock: VAULT_LOGS_FROM_BLOCK })).toMatchObject({
+      vaults: [made[1]!.vault, made[0]!.vault],
+      expected: 2n,
+      complete: true,
+    });
   });
 
   it("another owner's search finds none of them", async () => {

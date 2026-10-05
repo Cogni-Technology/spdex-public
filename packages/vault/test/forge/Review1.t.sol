@@ -131,7 +131,7 @@ contract Review1Test is ForkTest {
         token.arm(pair, 2_000_000);
 
         // What the keeper sees before it signs: due, inside the floor, and a call that works.
-        (bool due,,,,) = vault.status();
+        (bool due,,,,,,,,) = vault.status();
         (uint256 spotOut, uint256 floorOut,) = vault.quote();
         assertTrue(due && spotOut >= floorOut, "whyNotNow() returns null");
 
@@ -139,7 +139,7 @@ contract Review1Test is ForkTest {
         vmr.txGasPrice(0);
         vm.prank(keeper);
         uint256 g = gasleft();
-        (bool simulated,) = address(vault).call{gas: 40_000_000}(abi.encodeCall(SpdexDcaVault.execute, ()));
+        (bool simulated,) = address(vault).call{gas: 40_000_000}(abi.encodeCall(SpdexDcaVault.execute, (keeper)));
         uint256 estimate = g - gasleft();
         assertTrue(simulated, "the keeper's eth_call and eth_estimateGas succeed");
         vmr.revertToState(snapshot);
@@ -154,14 +154,14 @@ contract Review1Test is ForkTest {
         vmr.txGasPrice(fee);
         vm.prank(keeper);
         g = gasleft();
-        (bool mined,) = address(vault).call{gas: limit}(abi.encodeCall(SpdexDcaVault.execute, ()));
+        (bool mined,) = address(vault).call{gas: limit}(abi.encodeCall(SpdexDcaVault.execute, (keeper)));
         uint256 burnt = g - gasleft();
         assertTrue(!mined, "the real transaction reverts");
         assertGe(burnt, (limit * 95) / 100, "having used (almost) the whole limit");
         assertEq(vault.buysDone(), 0, "no buy counted");
         assertEq(vault.lastBuyAt(), 0, "and the window is still open");
         assertEq(wethOf(keeper), 0, "no reward");
-        (due,,,,) = vault.status();
+        (due,,,,,,,,) = vault.status();
         assertTrue(due, "so the next keeper pass sees the same due vault and pays again");
 
         console.log("keeper gas limit per attempt", limit);
@@ -217,6 +217,7 @@ contract Review1Test is ForkTest {
     function test_oneBlockOnTheOraclePoolRefusesEveryBuyForTenMinutes() public {
         Plan memory t = defaultPlan(); // 3% floor, 0.01 ETH a buy
         t.interval = 300;
+        t.communityWindow = defaultWindow(300);
         SpdexDcaVault vault = createFunded(t);
         (uint256 spot0, uint256 floor0,) = vault.quote();
         console.log("before: spot / floor (bps)", (spot0 * 10_000) / floor0);
@@ -236,7 +237,7 @@ contract Review1Test is ForkTest {
         assertNear(oneWay, 18 ether, 1500, "about 18 ETH if an arbitrageur takes the reversal");
         vm.prank(keeper);
         vm.expectPartialRevert(SpdexDcaVault.PriceBelowFloor.selector);
-        vault.execute();
+        vault.execute(keeper);
 
         // Still refused ten minutes on, while the pushed 12 seconds are all still inside the window...
         vm.warp(start + 600);
@@ -249,7 +250,7 @@ contract Review1Test is ForkTest {
 
         // Two 300-second windows passed with no buy; they are skipped, not made up.
         vm.prank(keeper);
-        vault.execute();
+        vault.execute(keeper);
         assertEq(vault.buysDone(), 1, "one buy where three windows opened");
     }
 
@@ -300,7 +301,7 @@ contract Review1Test is ForkTest {
         }
         vm.prank(keeper);
         vm.expectPartialRevert(SpdexDcaVault.PriceBelowFloor.selector);
-        vault.execute();
+        vault.execute(keeper);
 
         // Straight back, in the same block: WETH in, to the starting price.
         IV3PoolTest(SPX_WETH_POOL).swap(address(this), true, int256(1_000 ether), start, "");
@@ -315,10 +316,10 @@ contract Review1Test is ForkTest {
         assertNear(cost, 0.0045 ether, 2000, "for about 0.0045 ETH: the pool's fee both ways");
         assertLt(cost * 20, 0.17 ether, "far below the 0.17 ETH of holding the average over a boundary");
         assertEq(vault.buysDone(), 0, "nothing bought, nothing of the owner's moved");
-        (bool due,,,,) = vault.status();
+        (bool due,,,,,,,,) = vault.status();
         assertTrue(due, "and the window is still open");
         vm.prank(keeper);
-        vault.execute();
+        vault.execute(keeper);
         assertEq(vault.buysDone(), 1, "once the push is undone, the same window buys");
     }
 
@@ -382,7 +383,15 @@ contract Review1Test is ForkTest {
             else hi = mid;
         }
 
+        // A keeper that holds SPX, paid the reward: the sandwicher's best case. Inside a
+        // community window only an eligible one can be paid; one that is not can still make
+        // the buy by naming the owner as `rewardTo`, and does the same sandwich without the
+        // reward, so it loses more.
         address sandwicher = fresh("sandwicher");
+        makeEligible(sandwicher);
+        // Whatever SPX it holds to be eligible is its own, not the sandwich's: only what the
+        // front-run bought is sold back.
+        uint256 spxHeld = spxOf(sandwicher);
         vm.deal(sandwicher, lo);
         address[] memory path = new address[](2);
         path[0] = WETH;
@@ -391,17 +400,19 @@ contract Review1Test is ForkTest {
         IV2RouterTest(V2_ROUTER).swapExactETHForTokens{value: lo}(0, path, sandwicher, block.timestamp);
 
         vm.prank(sandwicher);
-        uint256 received = vault.execute();
+        (uint256 received,) = vault.execute(sandwicher);
 
-        // Sell every SPX back through the pair directly.
-        uint256 spx = spxOf(sandwicher);
-        (uint112 reserveWeth, uint112 reserveSpx,) = IV2PairTest(SPX_WETH_PAIR).getReserves();
-        uint256 inWithFee = spx * 997;
-        uint256 wethOut = (inWithFee * reserveWeth) / (uint256(reserveSpx) * 1000 + inWithFee);
-        vm.prank(sandwicher);
-        IERC20Test(SPX).transfer(SPX_WETH_PAIR, spx);
-        vm.prank(sandwicher);
-        IV2PairTestSwap(SPX_WETH_PAIR).swap(wethOut, 0, sandwicher, "");
+        // Sell every SPX the front-run bought back through the pair directly.
+        {
+            uint256 spx = spxOf(sandwicher) - spxHeld;
+            (uint112 reserveWeth, uint112 reserveSpx,) = IV2PairTest(SPX_WETH_PAIR).getReserves();
+            uint256 inWithFee = spx * 997;
+            uint256 wethOut = (inWithFee * reserveWeth) / (uint256(reserveSpx) * 1000 + inWithFee);
+            vm.prank(sandwicher);
+            IERC20Test(SPX).transfer(SPX_WETH_PAIR, spx);
+            vm.prank(sandwicher);
+            IV2PairTestSwap(SPX_WETH_PAIR).swap(wethOut, 0, sandwicher, "");
+        }
 
         uint256 back = wethOf(sandwicher); // the reward, plus the sale
         uint256 ownerLossBps = ((honestOut - received) * 10_000) / honestOut;

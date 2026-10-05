@@ -10,6 +10,8 @@
   "scripts": { "typecheck": "tsc --noEmit -p tsconfig.json" },
   "dependencies": {
     "@spdex/core": "workspace:*",
-    "@spdex/chain": "workspace:*"
+    "@spdex/chain": "workspace:*",
+    "@spdex/vault": "workspace:*",
+    "viem": "^2.56.8"
   }
 }

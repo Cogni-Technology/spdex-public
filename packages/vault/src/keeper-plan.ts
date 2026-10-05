@@ -11,8 +11,9 @@
 
 import type { Address } from "@spdex/core";
 import type { PreparedFees } from "@spdex/chain";
-import { BATCHER_LIMITS } from "./artifacts.js";
-import { BATCH_FIRST_BUY_EXTRA_GAS, BATCH_FIXED_GAS, BATCH_PER_BUY_GAS, FEE_TIP_REFERENCE, buyFee } from "./fee.js";
+import { BATCHER_LIMITS, CURRENT_SOURCE, DEPLOYMENTS, type SourceId } from "./artifacts.js";
+import { BATCH_FIRST_BUY_EXTRA_GAS, BATCH_FIXED_GAS, FEE_TIP_REFERENCE, SOURCE_BUYS } from "./fee.js";
+import type { VaultRelease } from "./index.js";
 
 const BPS = 10_000n;
 const GWEI = 1_000_000_000n;
@@ -81,10 +82,17 @@ export interface KeeperPolicy {
   refusalRetrySeconds: bigint;
   /** Paid refusals in one window before the vault rests until the next. */
   maxPaidRefusalsPerWindow: number;
-  /** A head older than this, by the wall clock, is stale (0: never). */
+  /** A head older than this by the wall clock, or dated this much ahead of it, is stale (0: never). */
   maxHeadLagSeconds: bigint;
   /** Below this much ether the keeper warns, and unwraps its rewards if it holds them. */
   minEth: bigint;
+  /**
+   * Below this many days of runway — the key's ether over its last week's
+   * spend — the keeper warns (`low_runway`); 0 never warns. A keeper paid at
+   * a cold `rewardTo` earns nothing back into its hot key, so its gas money
+   * only runs down, and its operator tops it up by hand (decision 18).
+   */
+  minRunwayDays: number;
   /** How long a trapped vault stays trapped, chain time. */
   trapSeconds: bigint;
   /** The longest sleep between ticks. */
@@ -126,6 +134,7 @@ export const DEFAULT_KEEPER_POLICY: KeeperPolicy = {
   maxPaidRefusalsPerWindow: 2,
   maxHeadLagSeconds: 120n,
   minEth: ETHER / 100n,
+  minRunwayDays: 7,
   trapSeconds: 604_800n,
   intervalSeconds: 60,
   discoverySeconds: 300n,
@@ -198,6 +207,115 @@ export function deadlineOf(terms: Clock, window: BuyWindow, policy: KeeperPolicy
   return window.windowEnd - margin;
 }
 
+// ─── The community window ─────────────────────────────────────────────────────
+//
+// v2's vaults give SPX holders first claim on each buy's fee: from the moment a
+// buy falls due (`dueSince`) and for the plan's `communityWindow` seconds, the
+// fee may be paid only to the vault's owner or to an address the SPX holder
+// registry finds eligible; from the window's end, to anyone (docs/V2_UPGRADE.md,
+// "How a buy works"). These are the vault's own arithmetic (`_dueSince` and
+// `status()` in contracts/SpdexDcaVault.sol), to the second, so the keeper, the
+// app's Help run the network and Collective DCA all judge a window exactly as
+// the vault will. `test/forge/Window.t.sol` pins the contract's edges; the unit
+// tests here pin the same edges against these.
+//
+// "Window" alone keeps its meaning in this file — the buy slot a buy is made in
+// (`windowOf`, `BuyWindow`) — and the new thing is always the community window.
+// A v1 vault has none: its terms carry `communityWindow: null`, and every
+// helper here answers accordingly.
+
+type CommunityClock = Clock & { maxBuys: bigint; communityWindow: bigint | null };
+type TurnClock = CommunityClock & { turnBuckets: bigint | null };
+
+/**
+ * The last part of a community window in which an eligible keeper stops
+ * waiting patiently and bids the urgent tip (decision 19): two minutes…
+ */
+export const COMMUNITY_URGENT_SECONDS = 120n;
+
+/** …or, for a window shorter than eight minutes, its last quarter. */
+export const COMMUNITY_URGENT_SHORT_BELOW = 480n;
+
+/**
+ * The start of the buy slot `now` falls in: `startAt + ⌊(now − startAt) /
+ * interval⌋ × interval`, the vault's own rounding; `startAt` itself before the
+ * plan starts.
+ */
+export function slotStartAt(terms: Clock, now: bigint): bigint {
+  if (now <= terms.startAt) return terms.startAt;
+  return terms.startAt + ((now - terms.startAt) / terms.interval) * terms.interval;
+}
+
+/**
+ * When the vault's next buy falls (or fell) due, as `status()` reports it at
+ * `now`: `earliestBuyAt` while the clock doesn't allow it yet; from then on the
+ * later of that and the start of the slot `now` is in, so that the first buy
+ * after a missed slot gets a window of its own rather than one that ended long
+ * ago (decision 10). Null when the plan has no buy left (the vault reports 0).
+ *
+ * For a v1 vault this is when its buy fell due too; v1 simply opens it to
+ * anyone at once.
+ */
+export function dueSinceAt(terms: Clock & { maxBuys: bigint }, buysDone: bigint, lastBuyAt: bigint, now: bigint): bigint | null {
+  const earliest = earliestBuyAt(terms, buysDone, lastBuyAt);
+  if (earliest === null) return null;
+  if (now < earliest) return earliest;
+  const slotStart = slotStartAt(terms, now);
+  return earliest > slotStart ? earliest : slotStart;
+}
+
+/**
+ * The first second at which the fee of the buy due at `now` can be paid to
+ * anyone: `dueSince + communityWindow`, as `status()` reports `windowEndsAt`.
+ * The vault refuses an ineligible `rewardTo` while `block.timestamp` is below
+ * it, strictly, so this second itself is already open. Null for a v1 vault,
+ * which has no window, and when no buy is left.
+ */
+export function communityWindowEndsAt(terms: CommunityClock, buysDone: bigint, lastBuyAt: bigint, now: bigint): bigint | null {
+  if (terms.communityWindow === null) return null;
+  const dueSince = dueSinceAt(terms, buysDone, lastBuyAt, now);
+  return dueSince === null ? null : dueSince + terms.communityWindow;
+}
+
+/**
+ * Whether a buy made at `now` would be made inside its community window: due
+ * (the clock allows it) and before the window's end — exactly when the vault
+ * asks the registry about a `rewardTo` other than the owner. False for a v1
+ * vault, for a plan with no buy left, and before the buy is due, when the
+ * vault refuses every caller anyway (`TooSoon`).
+ */
+export function inCommunityWindow(terms: CommunityClock, buysDone: bigint, lastBuyAt: bigint, now: bigint): boolean {
+  const earliest = earliestBuyAt(terms, buysDone, lastBuyAt);
+  const endsAt = communityWindowEndsAt(terms, buysDone, lastBuyAt, now);
+  return earliest !== null && endsAt !== null && now >= earliest && now < endsAt;
+}
+
+/**
+ * The moment inside a community window from which an eligible keeper bids the
+ * urgent tip (decision 19): `COMMUNITY_URGENT_SECONDS` before the window ends,
+ * or its last quarter when the window is shorter than
+ * `COMMUNITY_URGENT_SHORT_BELOW` (18 seconds of a 5-minute plan's 75). The
+ * window's end is a deadline: after it, any bot may take the buy and its fee.
+ */
+/**
+ * When the turn of the buy due at `now` ends, for a plan with turns
+ * (`turnBuckets` 2 or more): `dueSince + communityWindow / 2`, the vault's own
+ * figure. Until then, inside the window, only an eligible `rewardTo` in the
+ * slot's bucket may be paid (`onTurn` in index.ts says whether one is; the
+ * hash is not this module's to work out). Null for a plan without turns, a
+ * vault with no window, and one with no buy left.
+ */
+export function turnEndsAtOf(terms: TurnClock, buysDone: bigint, lastBuyAt: bigint, now: bigint): bigint | null {
+  if (terms.communityWindow === null || terms.turnBuckets === null || terms.turnBuckets === 0n) return null;
+  const dueSince = dueSinceAt(terms, buysDone, lastBuyAt, now);
+  return dueSince === null ? null : dueSince + terms.communityWindow / 2n;
+}
+
+export function urgentFrom(windowEndsAt: bigint, communityWindow: bigint): bigint {
+  const tail = communityWindow < COMMUNITY_URGENT_SHORT_BELOW ? communityWindow / 4n : COMMUNITY_URGENT_SECONDS;
+  return windowEndsAt - tail;
+}
+
 // ─── Waiting for a cheap block ────────────────────────────────────────────────
 
 /** The `pct` percentile of `values` by nearest rank; null for no values. */
@@ -237,21 +355,35 @@ export function cheapTarget(
   return percentile(recent, pct);
 }
 
-export type SendReason = "cheap" | "deadline" | "short-interval" | "now";
+/**
+ * Why a batch was sent: a cheap block, a deadline (a slot's, or the last
+ * minutes of a community window), a short plan, `sendWhen` "now", or a buy
+ * inside its community window that this keeper may be paid for ("window").
+ */
+export type SendReason = "cheap" | "deadline" | "short-interval" | "now" | "window";
 
 /**
  * Whether this vault alone justifies sending a batch now, and why; null when
  * it can wait. Short-interval plans go as soon as due: waiting minutes for a
  * cheap block rarely finds one and turns most sends into dearer deadline sends.
+ *
+ * A buy inside its community window that this keeper may take
+ * (`inCommunityWindow`: its `rewardTo` is eligible, or is the vault's owner)
+ * goes as soon as it is due too, at the patient tip: the window is when a
+ * community keeper is paid ahead of everyone else, and it is short, so
+ * waiting in it for a cheap block would mostly hand the buy to whoever is
+ * open after it. A standby keeper (`sendWhen` "deadline") still waits, for
+ * the window's urgent tail, which arrives here as `urgent`.
  */
 export function shouldSend(
-  vault: { urgent: boolean; shortInterval: boolean; target: bigint | null },
+  vault: { urgent: boolean; shortInterval: boolean; target: bigint | null; inCommunityWindow?: boolean },
   next: bigint,
   policy: KeeperPolicy,
 ): SendReason | null {
   if (policy.sendWhen === "now") return "now";
   if (vault.urgent) return "deadline";
   if (policy.sendWhen === "deadline") return null;
+  if (vault.inCommunityWindow === true) return "window";
   if (vault.shortInterval) return "short-interval";
   if (vault.target !== null && next <= vault.target) return "cheap";
   return null;
@@ -275,6 +407,12 @@ export interface BatchCandidate {
   deadline: bigint;
   /** The subsidy it received in the last 24 hours. */
   subsidised24h: bigint;
+  /**
+   * The release whose factory made it, for the fee spDEX proposed for its
+   * size when it was made (`v1BuyFee` for v1); absent, this build's. Help run
+   * the network serves v2 alone and leaves it out.
+   */
+  release?: VaultRelease;
 }
 
 export interface SelectedVault extends BatchCandidate {
@@ -315,14 +453,24 @@ export function economicFeePerGas(next: bigint, tip: bigint, policy: KeeperPolic
   return fee + tip;
 }
 
-const buyGas = (c: { firstBuy: boolean }): bigint => BATCH_PER_BUY_GAS + (c.firstBuy ? BATCH_FIRST_BUY_EXTRA_GAS : 0n);
+/** The source a candidate's release was built from; the current one when it names none, or one the record lacks. */
+const sourceOf = (c: { release?: VaultRelease }): SourceId =>
+  (c.release === undefined ? undefined : DEPLOYMENTS.find((d) => d.id === c.release)?.source) ?? CURRENT_SOURCE;
 
 /**
- * A batch's gas by the constants alone: its fixed gas and each buy's
- * (`BatchSelection.modelGas`). The app prices "Help run the network" with it
- * before a test-run has measured the batch.
+ * One buy's gas in a batch, by its source's measurement (`SOURCE_BUYS`): v1's
+ * later buy is 106,000, v2's 110,000 (an in-window buy, which asks the
+ * registry); a first buy costs the same 51,000 more in both.
  */
-export function modelBatchGas(vaults: readonly { firstBuy: boolean }[]): bigint {
+const buyGas = (c: { firstBuy: boolean; release?: VaultRelease }): bigint =>
+  SOURCE_BUYS[sourceOf(c)].perBuyGas + (c.firstBuy ? BATCH_FIRST_BUY_EXTRA_GAS : 0n);
+
+/**
+ * A batch's gas by the constants alone: its fixed gas and each buy's, by its
+ * release (`BatchSelection.modelGas`). The app prices "Help run the network"
+ * with it before a test-run has measured the batch.
+ */
+export function modelBatchGas(vaults: readonly { firstBuy: boolean; release?: VaultRelease }[]): bigint {
   return vaults.reduce((sum, c) => sum + buyGas(c), BATCH_FIXED_GAS);
 }
 
@@ -337,9 +485,11 @@ const scaled = (gas: bigint, ratioPpm: bigint): bigint => (gas * ratioPpm + RATI
  * covers the difference. A vault whose fee falls short of its own gas rides
  * along when the others' surplus or the subsidy covers it, but only if it is
  * large enough and slow enough to be worth helping and pays the fee spDEX
- * proposes for its size: a vault that set itself a token fee pays its own way
- * or waits. Those are served oldest first, so a flood of new vaults cannot
- * crowd out the ones that were there first.
+ * proposed for its size when it was made — `v1BuyFee` for a v1 vault, whose
+ * fee was set by v1's rule and can never change, `buyFee` for this build's: a
+ * vault that set itself a token fee pays its own way or waits. Those are
+ * served oldest first, so a flood of new vaults cannot crowd out the ones that
+ * were there first.
  *
  * The subsidy is booked vault by vault: each is booked at most its own
  * shortfall (its gas and its share of the fixed gas, less its fee) and at most
@@ -402,7 +552,7 @@ export function selectBatch(input: {
     c.amountPerBuy >= policy.subsidyMinBuy &&
     c.interval >= policy.subsidyMinInterval &&
     c.amountPerBuy > 0n &&
-    c.reward >= buyFee(c.amountPerBuy).reward;
+    c.reward >= SOURCE_BUYS[sourceOf(c)].proposedFee(c.amountPerBuy).reward;
   const lossOf = (batch: readonly SelectedVault[]) => clampZero(fixedCost - batch.reduce((sum, c) => sum + c.marginWei, 0n));
 
   /**
@@ -506,16 +656,26 @@ export const PER_VAULT_GAS_LIMIT_LATER = 127_000n;
 export const PER_VAULT_GAS_LIMIT_FIRST = 178_000n;
 
 /**
+ * What the batcher must have left before it attempts a vault given
+ * `gasPerVault`: that gas after the 63/64 rule, rounded up, and its
+ * `ATTEMPT_OVERHEAD`. 460,000 at the least gas, `MIN_EXECUTE_GAS`, which is
+ * also v1's batcher's fixed `MIN_GAS_PER_ATTEMPT`.
+ */
+export function minGasPerAttempt(gasPerVault: bigint = BATCHER_LIMITS.MIN_EXECUTE_GAS): bigint {
+  return gasPerVault + (gasPerVault + 62n) / 63n + BATCHER_LIMITS.ATTEMPT_OVERHEAD;
+}
+
+/**
  * The gas limit a batch is signed with — never `eth_estimateGas`'s. The
  * batcher catches each vault's failure, so an estimate settles on the least
  * gas at which the transaction succeeds: enough for the first vaults, with the
  * rest silently not tried. Instead: setup, each vault's figure, and a tail of
- * `MIN_GAS_PER_ATTEMPT` so the batcher's precheck lets the last vault through
- * with its whole cap. Unused gas is refunded.
+ * `minGasPerAttempt` so the batcher's precheck lets the last vault through
+ * with its whole `gasPerVault`. Unused gas is refunded.
  */
-export function batchGasLimit(vaults: readonly { firstBuy: boolean }[]): bigint {
+export function batchGasLimit(vaults: readonly { firstBuy: boolean }[], gasPerVault: bigint = BATCHER_LIMITS.MIN_EXECUTE_GAS): bigint {
   const perVault = vaults.reduce((sum, v) => sum + (v.firstBuy ? PER_VAULT_GAS_LIMIT_FIRST : PER_VAULT_GAS_LIMIT_LATER), 0n);
-  return BATCH_SETUP_GAS_LIMIT + perVault + BATCHER_LIMITS.MIN_GAS_PER_ATTEMPT;
+  return BATCH_SETUP_GAS_LIMIT + perVault + minGasPerAttempt(gasPerVault);
 }
 
 /**

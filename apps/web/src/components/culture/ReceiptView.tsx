@@ -77,14 +77,17 @@ export interface ReceiptViewProps extends TilePanelProps {
    * whose SPX, paid out in their own swaps, counts as bought from a market.
    */
   finder: PoolFinder;
-  /** The vault factory on this chain, or null where there is none; only its word makes a sender a vault. */
-  factory: Address | null;
+  /**
+   * Every release's vault factory on this chain (`VAULT_FACTORIES`), or none
+   * where there are no vaults; only their word makes a sender a vault.
+   */
+  factories: readonly Address[];
   onClose(): void;
 }
 
 type ViewState = { kind: "reading" } | { kind: "read"; outcome: ReceiptOutcome } | { kind: "error"; reason: string };
 
-export function ReceiptView({ target, rpc, configChainId, finder, factory, onClose, open, onSummary }: ReceiptViewProps): JSX.Element {
+export function ReceiptView({ target, rpc, configChainId, finder, factories, onClose, open, onSummary }: ReceiptViewProps): JSX.Element {
   useTileSummary(onSummary, { text: shortAddress(target.hash) });
   const otherChain = target.chainId !== configChainId;
   const [state, setState] = useState<ViewState>({ kind: "reading" });
@@ -107,14 +110,15 @@ export function ReceiptView({ target, rpc, configChainId, finder, factory, onClo
     if (otherChain || pools === null) return;
     let live = true;
     setState({ kind: "reading" });
-    verifyReceipt(rpc, { hash: target.hash, spxPools: pools, factory }).then(
+    verifyReceipt(rpc, { hash: target.hash, spxPools: pools, factories }).then(
       (outcome) => live && setState({ kind: "read", outcome }),
       (error: unknown) => live && setState({ kind: "error", reason: error instanceof Error ? error.message : String(error) }),
     );
     return () => {
       live = false;
     };
-  }, [rpc, target.hash, pools, factory, otherChain, attempt]);
+    // `factories` may be a new array on each render; the addresses say what it holds.
+  }, [rpc, target.hash, pools, factories.join(","), otherChain, attempt]);
 
   const explorer = explorerUrl(target.chainId, target.hash);
   const body = (
@@ -222,7 +226,7 @@ function Outcome({ outcome, rpc, target }: { outcome: ReceiptOutcome; rpc: JsonR
       </ul>
       {outcome.vaults === "unavailable" ? (
         <p className="spdex-field__hint" data-testid="receipt-vaults-unread">
-          spDEX couldn&apos;t ask the vault factory about this transaction just now, so no delivery is credited to a vault.
+          spDEX couldn&apos;t ask its vault factories about this transaction just now, so no delivery is credited to a vault.
         </p>
       ) : null}
       <BlockLine verb="Succeeded" block={outcome.block} time={outcome.time} />

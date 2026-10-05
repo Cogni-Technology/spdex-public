@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { NATIVE_TOKEN, TOKENS } from "@spdex/chain";
 import type { Address, Hex } from "@spdex/core";
 import { CSV_COLUMNS, csvCell, csvFileName, machineAmount, recordsCsv, utcDate } from "./csv.js";
-import type { RecordRow } from "./types.js";
+import type { RecordRow, VaultBuyFacts } from "./types.js";
 
 const ME = "0xab5801a7d398351b8be11c439e05c5b3259aec9b" as Address;
 const SPX = TOKENS.SPX.address.toLowerCase() as Address;
@@ -127,6 +127,34 @@ describe("the CSV", () => {
       expect(at(column), column).toBe("");
     }
     expect([at("bought_token"), at("bought_amount")]).toEqual(["WETH", "0.0005"]);
+  });
+
+  it("says who made each vault buy in four columns after the first twenty, blank where unknown or not a vault buy", () => {
+    expect(CSV_COLUMNS.slice(0, 20)).toEqual([
+      "date_utc", "date_source", "kind", "network", "account", "sold_token", "sold_amount", "sold_measured", "bought_token", "bought_amount",
+      "bought_measured", "buy_fee_eth", "network_fee_eth", "value_usd_at_time", "value_local_at_time", "local_currency", "value_source", "plan", "tx_hash", "block",
+    ]);
+    expect(CSV_COLUMNS.slice(20)).toEqual(["made_by", "caller", "fee_paid_to", "due_since_utc"]);
+    const KEEPER = "0x4444444444444444444444444444444444444444" as Address;
+    const BATCHER = "0x5dff93903e3d2de06b8d729413500a938444bf1d" as Address;
+    const tail = (r: RecordRow) => cells(recordsCsv([r], "USD"))[1]!.slice(20);
+    const vault = (vaultBuy: VaultBuyFacts) => row({ kind: "vault-buy", vaultBuy });
+    // v2: who called, who was paid, and when it fell due, checksummed and in UTC.
+    expect(tail(vault({ caller: BATCHER, rewardTo: KEEPER, dueSince: T - 60, maker: "community" }))).toEqual([
+      "community-keeper",
+      "0x5DFf93903e3D2dE06b8d729413500A938444Bf1D",
+      "0x4444444444444444444444444444444444444444",
+      "2025-09-17T21:48:23Z",
+    ]);
+    expect(tail(vault({ caller: KEEPER, rewardTo: KEEPER, dueSince: T, maker: "open" }))[0]).toBe("anyone-after-window");
+    expect(tail(vault({ caller: ME, rewardTo: ME, dueSince: T, maker: "owner" }))[0]).toBe("you");
+    expect(tail(vault({ caller: KEEPER, rewardTo: ME, dueSince: T, maker: "returned" }))[0]).toBe("fee-returned-to-you");
+    // Who made it unknown (the window unread): blank, never a guess.
+    expect(tail(vault({ caller: KEEPER, rewardTo: KEEPER, dueSince: T, maker: null }))[0]).toBe("");
+    // v1: who called, and nothing its log doesn't say.
+    expect(tail(vault({ caller: KEEPER, rewardTo: null, dueSince: null, maker: "caller" }))).toEqual(["keeper", "0x4444444444444444444444444444444444444444", "", ""]);
+    // A swap, a tip, a plan buy: blank.
+    for (const kind of ["swap", "tip", "plan-buy"] as const) expect(tail(row({ kind }))).toEqual(["", "", "", ""]);
   });
 
   it("never lets a plan name run as a formula, and quotes what needs quoting", () => {

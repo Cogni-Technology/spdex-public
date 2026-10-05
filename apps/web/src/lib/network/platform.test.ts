@@ -29,11 +29,13 @@ const {
   readFailedText,
   readMoreLabel,
   vaultIdentities,
+  windowShareFigure,
 } = await import("./platform.js");
 
 const ETHER = 10n ** 18n;
 const SPX = "0xe0f63a424a4439cbe457d80e4f4b51ad25b2c56c" as Address;
 const FACTORY = "0xe4a1410a9ee0833d41e7514306e65ad729b7199e" as Address;
+const V2_FACTORY = "0x164080e374f3a924245c3a99fbadbd2c98ed48eb" as Address;
 const address = (n: number): Address => `0x${n.toString(16).padStart(40, "0")}` as Address;
 
 function terms(overrides: Partial<VaultTerms> = {}): VaultTerms {
@@ -47,30 +49,56 @@ function terms(overrides: Partial<VaultTerms> = {}): VaultTerms {
     startAt: 0n,
     keeperReward: ETHER / 10_000n,
     maxSlippageBps: 200n,
+    communityWindow: null,
+    turnBuckets: null,
     ...overrides,
   };
 }
 
+/** A v1 vault: no community window, no window count. */
 function vault(n: number, overrides: Partial<PlatformVault> = {}): PlatformVault {
-  return { vault: address(0x1000 + n), owner: address(0xa0 + (n % 2)), terms: terms(), closed: false, buysDone: 3n, totalOut: 123_456_789_012n, wethBalance: ETHER / 50n, ...overrides };
+  return {
+    vault: address(0x1000 + n),
+    release: "v1",
+    owner: address(0xa0 + (n % 2)),
+    terms: terms(),
+    closed: false,
+    buysDone: 3n,
+    totalOut: 123_456_789_012n,
+    wethBalance: ETHER / 50n,
+    windowBuys: null,
+    ...overrides,
+  };
 }
 
-function readOf(vaults: PlatformVault[], extra: { count?: bigint; listed?: number; unreadable?: Address[] } = {}): PlatformRead {
+/** A v2 vault: a 30-minute window, and `windowBuys` of its buys made by SPX holders inside it. */
+function v2Vault(n: number, buysDone: bigint, windowBuys: bigint, overrides: Partial<PlatformVault> = {}): PlatformVault {
+  return vault(n, { release: "v2", terms: terms({ communityWindow: 1_800n, turnBuckets: 0n }), buysDone, windowBuys, ...overrides });
+}
+
+type Extra = { count?: bigint; listed?: number; unreadable?: Address[] };
+
+function deployment(release: "v1" | "v2", vaults: PlatformVault[], extra: Extra = {}): PlatformRead["deployments"][number] {
   return {
-    block: 26_001_248n,
-    requests: 13,
-    deployments: [
-      {
-        id: "v1",
-        factory: FACTORY,
-        state: "read",
-        count: extra.count ?? BigInt(vaults.length + (extra.unreadable?.length ?? 0)),
-        listed: extra.listed ?? vaults.length + (extra.unreadable?.length ?? 0),
-        unreadable: extra.unreadable ?? [],
-        vaults,
-      },
-    ],
+    id: release,
+    release,
+    factory: release === "v1" ? FACTORY : V2_FACTORY,
+    state: "read",
+    count: extra.count ?? BigInt(vaults.length + (extra.unreadable?.length ?? 0)),
+    listed: extra.listed ?? vaults.length + (extra.unreadable?.length ?? 0),
+    unreadable: extra.unreadable ?? [],
+    vaults,
   };
+}
+
+/** v1's factory alone, as before v2's was read. */
+function readOf(vaults: PlatformVault[], extra: Extra = {}): PlatformRead {
+  return { block: 26_001_248n, requests: 13, deployments: [deployment("v1", vaults, extra)] };
+}
+
+/** Both factories, oldest first, as `readPlatform` reads them. */
+function readBoth(v1: PlatformVault[], v2: PlatformVault[], extra: { v1?: Extra; v2?: Extra } = {}): PlatformRead {
+  return { block: 26_001_248n, requests: 16, deployments: [deployment("v1", v1, extra.v1), deployment("v2", v2, extra.v2)] };
 }
 
 function figures(read: PlatformRead) {
@@ -98,7 +126,7 @@ describe("the tiles", () => {
     expect(byId["owners"]!.hint).toBe("addresses, not people");
     expect(byId["eth"]!.figure).toEqual({ short: "0.16", exact: null, atLeast: false });
     expect(byId["fees"]!.figure).toEqual({ short: "0.0016", exact: null, atLeast: false });
-    expect(byId["fees"]!.hint).toBe("to whoever made each buy");
+    expect(byId["fees"]!.hint).toBe("to whoever made each buy, or a wallet they named");
     const text = JSON.stringify(tiles) + JSON.stringify(collectiveRows(figures(readOf([vault(0)]))));
     expect(text).not.toMatch(/[$€£¥]|USD|EUR/);
   });
@@ -143,9 +171,53 @@ describe("the rows", () => {
     expect(rows.map((r) => [r.id, r.label, r.hint])).toEqual([
       ["committed", "Budget committed", "for buys still to come"],
       ["held", "Still held by open vaults", "finished ones not yet closed included, and WETH anyone sent them"],
+      ["window", "v2 buys paid to community keepers", "inside each buy's community window"],
       [`other-${other}`, "Delivered on another market (0x0000…beef)", "vaults buying a token other than SPX"],
     ]);
-    expect(rows[2]!.figure.short).toBe("42 base units");
+    expect(rows[3]!.figure.short).toBe("42 base units");
+  });
+});
+
+describe("both factories, and SPX holders' share of v2 buys", () => {
+  const share = (summary: ReturnType<typeof figures>) => collectiveRows(summary).find((r) => r.id === "window") ?? null;
+
+  it("adds v1's and v2's vaults into every total", () => {
+    const summary = figures(readBoth([vault(0, { buysDone: 4n })], [v2Vault(1, 6n, 2n)]));
+    expect(collectiveTiles(summary).find((t) => t.id === "buys")!.figure).toEqual({ short: "10", exact: null, atLeast: false });
+    expect(summary.made).toBe(2n);
+  });
+
+  it("shows the share of v2 buys SPX holders made inside their window, with the counts a tap away", () => {
+    const row = share(figures(readBoth([vault(0, { buysDone: 40n })], [v2Vault(1, 3n, 2n), v2Vault(2, 7n, 3n)])));
+    expect(row).toEqual({
+      id: "window",
+      label: "v2 buys paid to community keepers",
+      figure: { short: "50%", exact: "5 of 10 v2 buys", atLeast: false },
+      hint: "inside each buy's community window",
+    });
+    // Rounded down, and never shown as 0% when some were.
+    expect(share(figures(readBoth([], [v2Vault(1, 3n, 2n)])))!.figure.short).toBe("66%");
+    expect(share(figures(readBoth([], [v2Vault(1, 1_000n, 1n)])))!.figure.short).toBe("less than 1%");
+    // A true none is a true 0%.
+    expect(share(figures(readBoth([], [v2Vault(1, 4n, 0n)])))!.figure).toEqual({ short: "0%", exact: "0 of 4 v2 buys", atLeast: false });
+  });
+
+  it("says none yet while no v2 buy has been made: 0 of 0 is no share", () => {
+    expect(share(figures(readBoth([vault(0)], [])))!.figure).toEqual({ short: "none yet", exact: null, atLeast: false });
+    expect(share(figures(readBoth([vault(0)], [v2Vault(1, 0n, 0n)])))!.figure.short).toBe("none yet");
+    // Before v2's factory is read at all, there are no v2 buys either.
+    expect(share(figures(readOf([vault(0)])))!.figure.short).toBe("none yet");
+  });
+
+  it("leaves the row out, never shows a share or a zero, while any v2 vault is unread or unreadable", () => {
+    expect(share(figures(readBoth([], [v2Vault(1, 3n, 2n)], { v2: { unreadable: [address(0x99)] } })))).toBeNull();
+    expect(share(figures(readBoth([], [v2Vault(1, 3n, 2n)], { v2: { count: 5n, listed: 1 } })))).toBeNull();
+    // A v2 vault whose window count is unknown is unknown, not none.
+    expect(share(figures(readBoth([], [v2Vault(1, 3n, 2n), v2Vault(2, 3n, 0n, { windowBuys: null })])))).toBeNull();
+    // A v1 vault that couldn't be read says nothing about v2's buys.
+    expect(share(figures(readBoth([vault(0)], [v2Vault(1, 4n, 1n)], { v1: { unreadable: [address(0x98)] } })))!.figure.short).toBe("25%");
+    const unknown = figures(readBoth([], [v2Vault(1, 3n, 2n)], { v2: { unreadable: [address(0x99)] } }));
+    expect(windowShareFigure(unknown)).toBeNull();
   });
 });
 
@@ -168,18 +240,19 @@ describe("the notes", () => {
   it("offer the rest of the vaults with what that costs, only when some weren't read", () => {
     expect(readMoreLabel(figures(readOf([vault(0)])))).toBeNull();
     expect(readMoreLabel(figures(readOf([vault(0)], { count: 8n, listed: 1 })))).toBe("Read the other 7 vaults (up to 2 more reads)");
+    // Each costed as a v2 vault, the dearer to read: a ceiling whichever factory lists it.
     expect(readMoreLabel(figures(readOf([vault(0)], { count: 7_001n, listed: 1 })))).toBe(
-      "Read 5,000 more of the other 7,000 vaults (up to 155 more reads)",
+      "Read 5,000 more of the other 7,000 vaults (up to 180 more reads)",
     );
   });
 
   it("name the network, and put what the service said in the refusal", () => {
     expect(notOfferedText(11155111)).toBe("Vaults aren't offered on Sepolia test network.");
-    expect(notDeployedText(1)).toBe("The vault factory isn't deployed on Ethereum, so there's no vault activity to read here.");
+    expect(notDeployedText(1)).toBe("spDEX's vault factories aren't deployed on Ethereum, so there's no vault activity to read here.");
     expect(readFailedText(new Error("eth_call: header not found."))).toBe(
-      "Couldn't read the factory's list (eth_call: header not found). Nothing is shown rather than a guess.",
+      "Couldn't read a factory's list (eth_call: header not found). Nothing is shown rather than a guess.",
     );
-    expect(readFailedText(new Error("x".repeat(400)))).toMatch(/^Couldn't read the factory's list \(x{159}…\)/);
+    expect(readFailedText(new Error("x".repeat(400)))).toMatch(/^Couldn't read a factory's list \(x{159}…\)/);
   });
 });
 

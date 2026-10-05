@@ -370,38 +370,53 @@ next section.
 
 **Set and forget** is a vault: a small contract you create for the plan, which
 holds the plan's budget and makes each buy when someone triggers it, with or
-without spDEX open. Whoever sends the transaction for a due buy is paid the
-vault's **buy fee**, fixed when you create it: a fixed amount for network
-fees plus 10% of that, never more than 0.69% of the buy. It buys SPX only, paid with
-ETH. It is **unaudited**, and you can put at most 0.5 ETH into one. On the
-fork that is play money; the steps are the same on Ethereum.
+without spDEX open. Whoever makes a due buy names who is paid its **buy fee**,
+fixed when you create the vault: a fixed amount for network fees plus 0.25% of
+the buy, never more than 0.69% of the buy. For the first minutes after each
+buy falls due (its **community window**, 30 minutes by default), the fee can
+go only to an SPX holder who makes the buy, or back to you; after that,
+anyone can make it. It buys SPX only, paid with ETH. It is **unaudited**, and
+you can put at most 0.5 ETH into one. On the fork that is play money; the
+steps are the same on Ethereum.
+
+This build makes v2 vaults, the release with the community window. v1
+vaults, the first release's, have no window, pay whoever makes their buy,
+and go on working as they always have.
 
 ### Coming from an earlier build
 
-This build's factory is at a new address, so it doesn't vouch for vaults an
-earlier build's factory made, and the app won't offer **Close and withdraw**
-for them. If your fork holds one, close it with the earlier build before
-switching, or restart the fork (`pnpm anvil:fork`), which forgets every vault
-along with everything else. On a fork it is play money either way.
+This build's factory is at a new address, and it creates every new vault
+there. It still vouches for vaults made by the factory of any release listed
+in `packages/vault/deployments.json`, v1's included, so if your fork holds
+vaults an earlier build made on v1's factory
+(`0xe4a1410a9ee0833d41e7514306e65ad729b7199e`), their cards stay, with **Close
+and withdraw**, **Trigger now** and top-ups. Only a vault from a factory no
+release lists, an in-between development build's, loses them: close it with
+that build before switching, or restart the fork (`pnpm anvil:fork`), which
+forgets every vault along with everything else. On a fork it is play money
+either way.
 
 ### Set up vaults on the fork
 
-Every vault is a copy made by one shared factory contract. Once someone has
-deployed the factory, it sits at the same address on Ethereum and on the fork,
-`0xe4a1410a9ee0833d41e7514306e65ad729b7199e`. A freshly started fork has none,
-so the first time:
+Every vault is a copy made by one shared factory contract, which asks one
+shared SPX holder registry who may be paid inside a community window. This
+source deploys both to fixed addresses, the same on Ethereum and on the fork:
+the registry to `0x2c7f732a453fe0a4a65f36ac564ff16007b5610d` and the factory
+to `0x164080e374f3a924245c3a99fbadbd2c98ed48eb`. Neither is on Ethereum until
+v2's release (`docs/RELEASE.md`), and a freshly started fork has neither, so
+the first time:
 
 1. **Buy SPX** → **Recurring**, and under **How each buy is made** choose
    **Set and forget**
 2. A banner reads **Vaults aren't set up on this network yet**. It shows the
-   factory's address and what deploying it costs, in one transaction anyone
-   can send. Click **Set up vaults on this network** and confirm in your
-   wallet
+   factory's address and what deploying it costs. Click **Set up vaults on
+   this network** and confirm in your wallet. The registry goes first when it
+   isn't there yet, since the factory refuses to be deployed without it
 
-Nobody owns the factory, and it lands at the same address whoever sends it, so
-all you are paying for is its gas. Before your wallet opens, spDEX checks that
-the deployment would pass the factory's own checks on SPX's markets right
-now. One of those checks is that SPX's v3 pool and v2 pair agree on the price
+Nobody owns the registry or the factory, and each lands at the same address
+whoever sends it, so all you are paying for is gas. Before your wallet opens,
+spDEX checks that the deployment would pass the factory's own checks on SPX's
+markets right now. One of those checks is that SPX's v3 pool and v2 pair agree on the price
 within 2%, and on a fork nothing brings them back together after a large
 trade. So set up vaults before trying the 50 ETH swap above, or restart the
 fork first. If a check fails, spDEX doesn't offer the deployment; it shows
@@ -421,27 +436,38 @@ floor for as long as the fork's prices stay pushed, and the card says so.
    if it would get more than that below the 10-minute average price, or below
    the price now if that is better for you. The allowance is fixed once the
    vault exists
-4. Read the **Cost** line. It gives the network fee for the one confirmation,
+4. Read the line about who may earn the plan's fee: SPX holders can earn it
+   for the first minutes after each buy falls due, then anyone can. The
+   window is 30 minutes, or a quarter of the interval when that is shorter:
+   75 seconds for a five-minute plan. In Expert you can choose it: 1, 5, 15,
+   30 or 60 minutes, or a quarter of the interval, with any choice longer
+   than a quarter of the interval greyed out. Shorter, your buy happens sooner
+   when no holder is online; longer, holders have more time to earn your fee.
+   Like the allowance, it is fixed once the vault exists
+5. Read the **Cost** line. It gives the network fee for the one confirmation,
    then the **Buy fee**: in your currency when spDEX knows a price, in ETH, and
-   as a share of the buy, never rounded down — `0.01` ETH a buy pays 0.0000873
-   ETH, shown as 0.88% — with the rule that set it. The summary box says what
+   as a share of the buy, never rounded down — `0.01` ETH a buy pays 0.0000439
+   ETH, shown as 0.44% — with the rule that set it. The summary box says what
    goes in: every buy plus every buy's fee
-5. Click **Create and fund vault**. Your wallet asks once: that one transaction
+6. Click **Create and fund vault**. Your wallet asks once: that one transaction
    creates the vault and sends the whole budget into it
 
 The buy fee depends only on the amount, never on today's network fees, so two
-identical plans pay the same. Try a few amounts and watch the notes under the
-choice:
+identical plans pay the same: 0.0000189 ETH for one batched buy's network
+cost, plus 0.25% of the buy, at most 0.69% (`packages/vault/src/fee.ts`). Try
+a few amounts and watch the notes under the choice:
 
 - under about 0.0015 ETH a buy, **Buys this small may be skipped**: the fee,
   0.69% of the buy, is less than a buy costs in network fees even when fees
   are low, so a keeper makes it only if it chooses to pay the difference
-- under about 0.003 ETH, **Small buys depend on low network fees**: the fee
-  is held at 0.69%, less than the fixed amount larger buys pay, so it covers
-  a keeper's cost only while fees stay low
-- from there up, every buy pays the same 0.00002013 ETH, a smaller share the
-  larger the buy; when network fees are very low the form says that
-  confirming each buy yourself costs less than the fee
+- under about 0.0027 ETH, **Small buys depend on low network fees**: the
+  fee, held at 0.69%, is less than the network cost it is meant to cover, so
+  it covers a keeper's cost only while fees stay low
+- up to about 0.0043 ETH the fee is still 0.69% of the buy, less than the
+  network cost and 0.25% that larger buys pay; from there up it is exactly
+  that, growing with the buy, a smaller share the larger it is
+- at any size, when network fees are very low, the form says that confirming
+  each buy yourself costs less than the fee
 - under 0.000001 ETH it refuses the plan
 
 Keep each buy at 0.001 ETH or more on the fork, and your own keeper (below)
@@ -457,8 +483,11 @@ The plan appears in the **Auto-buys** tile, marked **Unaudited**:
 - **Vault** (its address, with **Copy**), **Holds** (what it has left, and how
   many buys that covers), **Buy fee** and **Price allowance**
 - **History**, read from the vault's own logs when you open it. Each buy says
-  who triggered it — **you**, an address, or **in a batch** when a keeper made
-  it through the batcher — and what they were paid
+  who made it — you, a community keeper inside its window, or whoever made
+  it after the window — and who was paid what ("triggered by a community
+  keeper, paid 0x… its … WETH buy fee"). A buy someone else made with its fee
+  paid back to you says so: inside the window anyone may make a buy that
+  pays its owner. A v1 vault's history reads as it always has
 - **Close and withdraw**, **Delete**, and a line saying why there is no pause.
   A vault holding less than every buy it has left, with their fees, also
   offers to top it up: **Fund … ETH** when it can't cover its next buy, **Add
@@ -469,20 +498,31 @@ The plan appears in the **Auto-buys** tile, marked **Unaudited**:
   exactly what the confirmation sends. With no allowance this browser kept from
   the form, pick one: the card doesn't choose it for you
 
-With **First buy** left at now, the first buy is due at once, and the card
-shows **Buy 1 is due — waiting for a keeper**. Anyone can trigger it and be
-paid its buy fee. **Trigger now** makes you the keeper: your wallet pays the
-network fee, and the buy fee comes back to you as WETH. The banner gives both
-figures. When the network fee is more than the buy fee, it says so, and
-**Trigger now** is no longer the main button: a keeper triggering the buy
-costs you less.
+When a buy falls due, the card says it is waiting for a keeper, and for how
+long holders have first claim: **Community window until 14:32, then open to
+anyone.** Until then only an SPX holder's keeper can be paid for the buy;
+after it, anyone can. **Trigger now** works inside the window too: it makes
+the buy naming you as the one paid (`execute` with your own address), so your
+wallet pays the network fee and the buy fee comes back to you as WETH. The
+banner gives both figures. When the network fee is more than the buy fee, it
+says so, and **Trigger now** is no longer the main button: a keeper making
+the buy costs you less.
+
+A v1 vault's card, from an earlier build, is as it was: no window, and
+**Trigger now** pays whoever sends it, which is you.
 
 ### Watch a buy with spDEX closed
 
-This is what a vault is for. On Ethereum a stranger's keeper may trigger each
-buy for its fee, many vaults at a time through the batcher. On your fork
-nobody else is watching, so run a keeper yourself. It needs Node 22.15 or
-later. `docs/KEEPER.md` has everything it can do.
+This is what a vault is for. On Ethereum an SPX holder's keeper may make each
+buy inside its community window, and anyone's after it, many vaults at a time
+through the batcher. On your fork nobody else is watching, so run a keeper
+yourself. It needs Node 22.15 or later. `docs/KEEPER.md` has everything it can
+do.
+
+A keeper you start on the fork is never a community keeper: its fresh key
+holds no SPX, and the fork can't prove a block it mined. So below it names
+you, the vault's owner, as the one paid, which a v2 vault always allows:
+it makes your buys inside their windows, and the fees come back to you.
 
 1. Give the keeper a key of its own, with ether for gas. Don't use an anvil
    test key: those accounts pass on any ether they receive (see above)
@@ -493,8 +533,9 @@ later. `docs/KEEPER.md` has everything it can do.
    ```
 
 2. Deploy the batcher, once per fork. Anyone may, and it lands at
-   `0xc5ce65451dd5fc99d08eb18440b06f2bcca3c5a0` whoever sends it. It needs the
-   factory, so set up vaults first (above):
+   `0xd1f8327aa8398997bd88165f420412c703ebfed0` whoever sends it (the batcher
+   every release from v2 on shares, at the address this source deploys to).
+   It is bound to no factory, so it needs nothing deployed before it:
 
    ```bash
    SPDEX_KEEPER_RPC_URL=http://127.0.0.1:8545 SPDEX_KEEPER_KEY=0xTheKeeperKey pnpm keeper --deploy-batcher
@@ -504,13 +545,18 @@ later. `docs/KEEPER.md` has everything it can do.
    chain is deployed`, whether it deployed the batcher or found it there
 
 3. Create a vault with a five-minute interval, as above, and close the spDEX
-   tab
-4. Run one tick of the keeper, limited to your vault:
+   tab. Its first buy falls due about 105 seconds after you create it, not at
+   once: spDEX starts a plan whose community window is under three minutes
+   that much later, so that a creation slow to sign and land still leaves its
+   first buy a minute of first claim. Wait that long, and on the fork let a
+   block come after it (step 6 shows how), before the next step
+4. Run one tick of the keeper, limited to your vault and paying your wallet:
 
    ```bash
    SPDEX_KEEPER_SEND_WHEN=now SPDEX_KEEPER_RPC_URL=http://127.0.0.1:8545 \
    SPDEX_KEEPER_CONFIRMATIONS=1 SPDEX_KEEPER_MAX_HEAD_LAG_SECONDS=0 \
-   SPDEX_KEEPER_VAULTS=0xYourVault SPDEX_KEEPER_KEY=0xTheKeeperKey pnpm keeper --once
+   SPDEX_KEEPER_VAULTS=0xYourVault SPDEX_KEEPER_REWARD_TO=0xYourWallet \
+   SPDEX_KEEPER_KEY=0xTheKeeperKey pnpm keeper --once
    ```
 
    `SEND_WHEN=now` sends as soon as a buy is due, rather than waiting for a
@@ -519,12 +565,16 @@ later. `docs/KEEPER.md` has everything it can do.
    block is days behind your clock. It prints one JSON line per record:
    `start`, `vault_found` with your vault's terms, `batch_sent`, then
    `batch_mined` with the transaction's `hash`, its `gasUsed`, and `earnedWei`,
-   your vault's buy fee, paid to the keeper's address (set
-   `SPDEX_KEEPER_REWARD_TO` to send it elsewhere). The same lines go to a daily
-   file in `.keeper/690069/`, beside its state. Add `--dry-run` to see what it
-   would do without signing
-5. Open spDEX again. **Buys made** reads 1 of 3, and **History** shows the buy
-   **triggered in a batch**, with the fee it paid
+   your vault's buy fee, paid by the vault to your wallet. The same lines go to
+   a daily file in `.keeper/690069/`, beside its state. Add `--dry-run` to see
+   what it would do without signing.
+
+   Leave `SPDEX_KEEPER_REWARD_TO` out and the keeper is its own `rewardTo`,
+   which the vault pays only once the window is over: inside it, the keeper
+   logs `skip` `holders-first` and leaves the buy for when the window ends,
+   which on the fork also takes a block after its end (step 6)
+5. Open spDEX again. **Buys made** reads 1 of 3, and **History** shows the buy,
+   made through the batcher inside its window, with its fee paid back to you
 6. For the second buy, run the same command without `--once` and leave it
    running. **The fork makes a block only when a transaction arrives**, and a
    vault judges "due" by the latest block's time, so on an idle fork the next
@@ -538,7 +588,8 @@ later. `docs/KEEPER.md` has everything it can do.
 
    That mines one empty block at the fork's current time, without moving its
    clock. Any transaction does the same, a swap or `pnpm dev:fund` for
-   instance. The keeper's next tick triggers the buy
+   instance. The keeper's next tick makes the buy. A community window ends
+   the same way: only once some block's time is past it
 
 The fork's clock started at the pinned block's time, days behind your
 computer's, and runs at normal speed from there. The keeper's records carry
@@ -550,14 +601,58 @@ host networking (rootful Docker on Linux). Put the keeper's key in
 `docker/keeper/secrets/fork_key` (`chmod 400` it), then from `docker/keeper`:
 
 ```bash
-SPDEX_FORK_VAULTS=0xYourVault docker compose --profile fork run --rm keeper-fork --once
+SPDEX_FORK_VAULTS=0xYourVault SPDEX_FORK_REWARD_TO=0xYourWallet docker compose --profile fork run --rm keeper-fork --once
 ```
 
 The `fork` profile refuses to start without that allowlist, sends as soon as a
 buy is due, deploys the batcher itself if it is missing, and uses no mainnet
-setting; `docs/KEEPER.md` ("Trying it on the local fork") has the rest.
+setting; `SPDEX_FORK_REWARD_TO` is its name for `SPDEX_KEEPER_REWARD_TO`.
+`docs/KEEPER.md` ("Trying it on the local fork") has the rest.
 `pnpm keeper:smoke`, from the repository root, runs the whole round trip with
 fresh keys and checks it.
+
+### Help run the network, and community keeping
+
+Community keepers make other people's buys and are paid for each one;
+holding 690 SPX is the entry bar. **Help run the network**, at the foot of
+the page, is the way to do it from a tab: once, when pressed, it makes the due
+v2 buys of anyone's vaults from your own wallet, and they pay your wallet.
+
+It sends only privately, so with MetaMask on the fork it asks you to turn
+private sending on (see "What you will not be able to test"). With a wallet
+that can sign privately, **See which buys are due** lists them. A buy still
+inside its community window is offered only to an eligible wallet, and your
+fork wallet isn't one, so for that buy it shows when holders' first claim
+ends ("SPX holders have first claim until 14:32"), how far the wallet is from
+the bar ("You hold 0 of the 690 SPX."), what community keepers are, and a
+link to "Becoming a community keeper" when the build says where its source
+is, with no button to make the buy. That holds for your own vaults' buys too:
+**Trigger now** on their cards makes those. Once the window is over, and on the fork a
+block has come after it, the same buy is offered to you as to anyone.
+
+At its foot, **Community keeping** works without private sending, and reads
+nothing until you open it. Open it with your wallet connected:
+
+1. It says whether the wallet is eligible, until when, and how much SPX it
+   holds against the 690. Swap ETH for 690 SPX or more (above) and look
+   again: it holds enough now, and still isn't eligible. Holding is checked at
+   the moment of each buy; proving that the wallet held the SPX when a block
+   closed is a separate step, once a month.
+2. **Prove my SPX** proves the `finalized` block, which on the fork is 64
+   blocks behind the head: while fewer than 64 blocks have been mined since
+   the fork started, a real mainnet block, at which your fresh wallet held no
+   SPX; after that, a block the fork mined, which nothing can be proven
+   against. So on the fork your own proof can't be made. Before a wallet's
+   first proof, the panel says what proving makes public: worth reading
+   before doing it on Ethereum.
+3. **Prove another address** and **Paste a proof** are folds below it: the
+   first proves any address from this wallet, so a holder's cold wallet never
+   needs a browser; the second is for a network service that refuses
+   `eth_getProof`.
+
+`docs/KEEPER.md`, "Becoming a community keeper", is the rest: the three
+steps on Ethereum, what proving costs and publishes, and what the 690-SPX bar
+does and doesn't filter.
 
 ### Close it
 
@@ -572,8 +667,9 @@ list.
 A vault doesn't need spDEX to remember it. Delete its card, reset or replace
 your settings, or open spDEX in another browser, and the vault still holds its
 budget and buys whenever triggered. spDEX finds it again from the chain: with
-your wallet connected, it asks the vault factory how many vaults you have
-created and reads the factory's logs for them.
+your wallet connected, it asks each listed release's vault factory, v1's and
+v2's, how many vaults you have created there and reads that factory's logs
+for them.
 
 1. Create a vault as above, then **Delete** its card. The card warns that the
    vault still holds WETH; click **Delete anyway**.
@@ -597,17 +693,22 @@ query may cover, so spDEX narrows its queries, stops after 40, and then says
 **k of your N vaults aren't shown here** rather than pretending there are no
 more: the factory's count says how many exist. A network service that serves
 older records (your own node does) or a block explorer can find the rest; the
-note gives the vault factory's address to look for.
+note gives every release's vault factory address to look for, v2's first.
 
 ### What a vault will not do
 
 - **Buy without a keeper.** Nobody promises to trigger a buy. A buy time
   nobody triggers is skipped, never made up later, and the plan ends later
+- **Hurry its community window.** When no SPX holder's keeper is about, a due
+  buy waits out its window (at most an hour, at most a quarter of the
+  interval), then anyone can make it; **Trigger now** makes it at any time,
+  paid back to you
 - **Pause.** Its terms are fixed in its code. **Close and withdraw** is the
   only stop, and it is final
-- **Change.** The amount, the timing, the allowance and the buy fee are all
-  fixed when the vault is created. A later release's fee reaches only vaults
-  created after it
+- **Change.** The amount, the timing, the allowance, the community window and
+  the buy fee are all fixed when the vault is created. A later release's fee
+  reaches only vaults created after it, and there is no moving a v1 vault to
+  v2: close it and start a new plan
 - **Take more than 0.5 ETH.** The form refuses a plan whose buys and their
   buy fees add up to more
 - **Buy anything but SPX, or pay with anything but ETH.** The factory's list of
@@ -649,8 +750,8 @@ forgets every transaction — your trades and `dev:fund` included — but the
 browser still remembers the plans. Delete them, or clear this site's data, to
 start from nothing.
 
-A restarted fork also forgets the vault factory, the batcher and every vault
-on it, along with what they held and bought. A vault plan's card then says
+A restarted fork also forgets the SPX holder registry, the vault factory, the
+batcher and every vault on it, along with what they held and bought. A vault plan's card then says
 there is no vault at its address; delete the plan. The first vault on the new
 fork needs **Set up vaults on this network** again, and a keeper needs `pnpm
 keeper --deploy-batcher` again. A keeper's state in `.keeper/690069/` belongs
@@ -676,3 +777,12 @@ stays, and the question says so.
   locally you always supply your own. See `docs/RPC-RUNBOOK.md`
 - **Strangers' keepers.** Nobody else watches your fork, so a vault's buys
   happen only when you press **Trigger now** or run `pnpm keeper`
+- **Being a community keeper.** Proving needs a block whose state the fork
+  can show truly, and the fork can't prove a block it mined; your fresh
+  wallet held no SPX at any block before them. So no wallet of yours is
+  eligible on the fork, Help run the network offers you a v2 buy only once
+  its window is over, and a keeper you run makes buys inside their windows
+  only by paying their owner (above). The repository's tests reach the
+  eligible paths with proofs recorded from mainnet instead
+  (`docs/DEVELOPMENT.md`, "Proofs, and how long a fork stays useful for
+  them")

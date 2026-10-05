@@ -8,3 +8,4 @@ export * from "./permit2.js";
 export * from "./fx.js";
 export * from "./ens.js";
 export * from "./tipList.js";
+export * from "./header.js";

@@ -16,9 +16,11 @@
  *   switch someone has to be trusted with. "Close and withdraw" is the only
  *   stop, and the card says so in one line where Pause would be.
  * - **Trigger now.** A due buy waits for a keeper; the person may be theirs,
- *   paying the network fee and collecting the buy fee (as WETH) like anyone
- *   else would. The button is there only while a read says the buy would go
- *   through, which is what the Guard's simulation will see.
+ *   paying the network fee and getting the buy fee back (as WETH). On a v2
+ *   vault it names the owner as who is paid, which its community window never
+ *   refuses; on a v1 vault it pays whoever sends it, as it always did. The
+ *   button is there only while a read says the buy would go through, which is
+ *   what the Guard's simulation will see.
  * - **Someone else's vault is read-only.** A plan that arrived in a link can
  *   point at a vault another wallet owns: it is shown, never funded, closed or
  *   triggered from here.
@@ -32,6 +34,7 @@ import { useId, useState } from "react";
 import { Banner, Brand, Button, Disclosure, Pill, Progress, Row, Stat, Term, Toggle } from "@spdex/ui";
 import { NATIVE_TOKEN } from "@spdex/chain";
 import type { DcaPlan } from "@spdex/core";
+import { LATEST_RELEASE, sourceOfRelease } from "@spdex/vault";
 import { ethText, tokenLabel } from "../../lib/dca/format.js";
 import { VAULT_FACTORY_ACTIVITY, type AutoBuy, type AutoBuyDeps } from "../../lib/dca/useAutoBuy.js";
 import {
@@ -53,12 +56,17 @@ import type { MoneyView } from "../../lib/money/convert.js";
 import { moneyView, useRatesNeeded } from "../../lib/money/rates.js";
 import { networkLabel } from "../../lib/networks.js";
 import { AddressText, CopyButton, Dotted, InfoTerm, NoticeBanner, TxRef } from "./common.js";
+import { RegistryAdvisory } from "../network/RegistryAdvisory.js";
 import {
   allowanceText,
   closeConfirmText,
+  communityWindowLine,
+  communityWindowLiveText,
   deployFee,
   dueText,
   factoryDeployMillions,
+  feeTipFor,
+  keeperTipFor,
   ownerText,
   retryFeeNote,
   retryPayeeText,
@@ -73,6 +81,7 @@ import {
   vaultLine,
   vaultRewardText,
   vaultTermsTail,
+  vaultTurnsLine,
   createSendsText,
 } from "./vaultCopy.js";
 import { formatCount } from "../../lib/money/format.js";
@@ -94,18 +103,27 @@ function figuresOf(state: VaultPlanState): (VaultFigures & { kind: "active" | "s
 /**
  * A sentence with its first "keeper" (or "Keepers") explained on hover, as
  * every vault note's is: the word a newcomer won't know, where it first
- * appears. A sentence without one is shown as it is.
+ * appears. A sentence without one is shown as it is. `tip` is the word's
+ * explanation, a v2 vault's by default (`keeperTip`).
  */
-export function WithKeeperTerm({ text }: { text: string }) {
+export function WithKeeperTerm({ text, tip = VAULT_TIPS.keeper }: { text: string; tip?: string }) {
   const match = /\b[Kk]eepers?\b/.exec(text);
   if (match === null) return <>{text}</>;
   return (
     <>
       {text.slice(0, match.index)}
-      <Term tip={VAULT_TIPS.keeper}>{match[0]}</Term>
+      <Term tip={tip}>{match[0]}</Term>
       {text.slice(match.index + match[0].length)}
     </>
   );
+}
+
+/**
+ * What "keeper" means on a vault's card, by what its release's source can do:
+ * a v1 vault has no community window and pays whoever triggers it.
+ */
+export function keeperTip(release: VaultFigures["release"] | undefined): string {
+  return release === undefined ? VAULT_TIPS.keeper : keeperTipFor(sourceOfRelease(release).id);
 }
 
 /** "Unaudited", beside every place a vault is offered or shown. */
@@ -202,7 +220,8 @@ export function VaultPlanCard({ plan, autoBuy, deps }: { plan: DcaPlan; autoBuy:
   const [chosen, setChosen] = useState<number | null>(null);
   const retry = creatable ? autoBuy.vaultRetryFor(plan.id, chosen) : null;
   const costs = creatable ? autoBuy.vaultCostsFor(BigInt(plan.amountPerBuy), plan.maxBuys) : null;
-  const retryReady = retry !== null && retry.maxSlippageBps !== null && retry.keeperReward !== null && retry.fund !== null;
+  const retryReady =
+    retry !== null && retry.maxSlippageBps !== null && retry.keeperReward !== null && retry.fund !== null && retry.communityWindow !== null;
   const createSends = creatable ? createSendsText(retry, costs) : null;
   const gap = support.kind === "available" ? support.availability.marketGapBps : null;
   const gapWide =
@@ -251,12 +270,20 @@ export function VaultPlanCard({ plan, autoBuy, deps }: { plan: DcaPlan; autoBuy:
       >
         {line}
       </p>
+      {figures !== null && vaultTurnsLine(figures.turnBuckets) !== null ? (
+        <p className="spdex-dca-hint" data-testid="dca-vault-turns">
+          {vaultTurnsLine(figures.turnBuckets)}
+        </p>
+      ) : null}
+      {/* Decision 31's notice, on a v2 vault or one about to be created: nothing unless a build sets it. */}
+      <RegistryAdvisory release={figures?.release ?? (creatable || state.kind === "creating" ? LATEST_RELEASE : null)} testId="dca-vault-advisory" />
       {activity?.notice ? <NoticeBanner notice={activity.notice} onDismiss={() => autoBuy.clearNotice(plan.id)} /> : null}
 
       {due ? (
         <DueBanner
           figures={figures}
           autoBuy={autoBuy}
+          chainNow={chainNow}
           money={money}
           mine={mine}
           block={figures.mine === null ? "Connect the wallet that owns this vault to trigger it from here." : block}
@@ -284,10 +311,19 @@ export function VaultPlanCard({ plan, autoBuy, deps }: { plan: DcaPlan; autoBuy:
             testId="dca-vault-create"
             disabled={support.kind !== "available" || createBlock !== null || busy !== null || !retryReady}
             onClick={() => {
-              if (retry === null || retry.maxSlippageBps === null || retry.keeperReward === null || retry.fund === null) return;
+              if (
+                retry === null ||
+                retry.maxSlippageBps === null ||
+                retry.keeperReward === null ||
+                retry.fund === null ||
+                retry.communityWindow === null
+              ) {
+                return;
+              }
               void autoBuy.createVault(plan.id, {
                 maxSlippageBps: retry.maxSlippageBps,
                 keeperReward: retry.keeperReward,
+                communityWindow: retry.communityWindow,
                 fund: retry.fund,
               });
             }}
@@ -374,7 +410,9 @@ function sentence(text: string): string {
 /**
  * A due buy waits for a keeper — that is the plan working, not a fault, so the
  * banner is calm. The person may trigger it themselves: their wallet pays the
- * network fee, as any keeper's does, and the vault pays them the buy fee. Both
+ * network fee, as any keeper's does, and the vault pays them the buy fee. On a
+ * v2 vault, while the buy is inside its community window, one line says until
+ * when SPX holders have first claim (`communityWindowLiveText`). Both
  * figures are given the way the form gave the fee, dollars first, so they can
  * be weighed. When the fee is less than the network fee, it says so — "comes
  * back to you" would otherwise read as money back on what is a net cost — and
@@ -384,6 +422,7 @@ function sentence(text: string): string {
 function DueBanner({
   figures,
   autoBuy,
+  chainNow,
   money,
   mine,
   block,
@@ -392,6 +431,8 @@ function DueBanner({
 }: {
   figures: VaultFigures;
   autoBuy: AutoBuy;
+  /** Chain time now, carried forward (`autoBuy.chainNow`); null when unknown. */
+  chainNow: number | null;
   money: MoneyView | undefined;
   mine: boolean;
   block: string | null;
@@ -402,18 +443,25 @@ function DueBanner({
   const gas = triggerGasCost(autoBuy.fees, firstBuy);
   const buyFee = figures.terms.keeperReward;
   const costsMore = triggerCostText(autoBuy.fees, buyFee, firstBuy);
+  // A v2 buy inside its community window: who may be paid for it until when.
+  const window = communityWindowLiveText(figures, chainNow, autoBuy.now);
   return (
     <Banner
       tone="ok"
       title={
         <>
           Buy {formatCount(figures.buysDone + 1)} is due — waiting for a{" "}
-          <Term tip={VAULT_TIPS.keeper}>keeper</Term>
+          <Term tip={keeperTip(figures.release)}>keeper</Term>
         </>
       }
       testId="dca-vault-due"
     >
       <p className="spdex-dca-line">{dueText(buyFee, gas, money)}</p>
+      {window !== null ? (
+        <p className="spdex-dca-hint" data-testid="dca-vault-window">
+          {window}
+        </p>
+      ) : null}
       {costsMore !== null ? (
         <p className="spdex-dca-hint" data-testid="dca-vault-trigger-cost">
           {costsMore}
@@ -443,20 +491,26 @@ function DueBanner({
  * isn't on this chain yet. Deploying it is one transaction anyone can send,
  * and it lands at the same address whoever sends it — nobody owns what it
  * creates, so there is nothing to trust in who pressed the button. It costs
- * gas, about 3.6 million, and that is said before the wallet opens.
+ * gas, about 3.9 million, and 1.8 million more where the SPX holder registry
+ * the factory needs isn't there yet either, and that is said before the
+ * wallet opens.
  */
 export function VaultFactorySetup({ autoBuy, deps, testId }: { autoBuy: AutoBuy; deps: AutoBuyDeps; testId: string }) {
   const support = autoBuy.vaultSupport;
   const activity = autoBuy.activity[VAULT_FACTORY_ACTIVITY];
   const busy = activity?.busy ?? null;
-  const fee = deployFee(autoBuy.fees.kind === "ok" ? autoBuy.fees.fees : null);
+  // The factory needs the SPX holder registry deployed first: where it is
+  // missing too, the setup is two transactions, and the figure is both.
+  const registryMissing = support.kind === "deployable" && support.availability.registryDeployed === false;
+  const fee = deployFee(autoBuy.fees.kind === "ok" ? autoBuy.fees.fees : null, registryMissing);
   const block = walletBlock(deps, autoBuy);
   if (support.kind !== "deployable") return null;
   return (
     <Banner tone="warn" title="Vaults aren't set up on this network yet" testId={testId}>
       <p className="spdex-dca-line">
         Vaults are copies of one shared factory, not yet on {networkLabel(deps.config.chainId)}. Anyone can deploy it
-        once: about {factoryDeployMillions()} million gas{fee === null ? "" : `, ${ethText(fee, 6)} ETH at today's fees`}.
+        once{registryMissing ? ", after the SPX holder registry it uses (2 transactions)" : ""}: about{" "}
+        {factoryDeployMillions(registryMissing)} million gas{fee === null ? "" : `, ${ethText(fee, 6)} ETH at today's fees`}.
       </p>
       <p className="spdex-dca-line">
         <AddressText address={support.factory} />
@@ -540,7 +594,11 @@ function VaultFacts({ plan, state, money }: { plan: DcaPlan; state: VaultPlanSta
         />
       ) : null}
       <Row label={<Term tip={VAULT_TIPS.weth}>Holds</Term>} value={<Dotted text={vaultHoldsText(figures)} />} testId="dca-vault-balance" />
-      <Row label={<Term tip={VAULT_TIPS.fee}>Buy fee</Term>} value={<Dotted text={vaultRewardText(figures, money)} />} testId="dca-vault-reward" />
+      <Row
+        label={<Term tip={feeTipFor(figures.source)}>Buy fee</Term>}
+        value={<Dotted text={vaultRewardText(figures, money)} />}
+        testId="dca-vault-reward"
+      />
       <Row
         label="Price allowance"
         testId="dca-vault-allowance"
@@ -593,6 +651,11 @@ function RetryTerms({ plan, retry, onChoose }: { plan: DcaPlan; retry: VaultRetr
       <p className="spdex-dca-hint" data-testid="dca-vault-retry-payee">
         {retryPayeeText()}
       </p>
+      {retry.communityWindow !== null ? (
+        <p className="spdex-dca-hint" data-testid="dca-vault-retry-window">
+          {communityWindowLine(retry.communityWindow)}
+        </p>
+      ) : null}
       {note !== null ? (
         <p className={`spdex-dca-hint${note.testId === "dca-vault-retry-small" ? " spdex-dca-hint--warn" : ""}`} data-testid={note.testId}>
           <WithKeeperTerm text={note.text} />
@@ -862,6 +925,24 @@ function VaultDetails({
               <Row label="First window" value={at(Number(figures.terms.startAt))} />
               <Row label="Buy fee (keeperReward)" value={`${figures.terms.keeperReward} wei of WETH`} />
               <Row label="Price allowance" value={`${figures.terms.maxSlippageBps} bps`} />
+              <Row label="Release" value={figures.release} testId="dca-vault-release" />
+              {figures.communityWindow !== null ? (
+                <>
+                  <Row label="Community window" value={`${formatCount(figures.communityWindow)} s`} />
+                  {figures.turnBuckets !== null ? (
+                    <Row
+                      label="Turns in the window's first half"
+                      value={figures.turnBuckets === 0 ? "none" : `${formatCount(figures.turnBuckets)} groups`}
+                      testId="dca-vault-turns-row"
+                    />
+                  ) : null}
+                  <Row label="Community window ends" value={figures.windowEndsAt === null ? "none" : at(figures.windowEndsAt)} />
+                  <Row
+                    label="Buys in the community window, paid to community keepers"
+                    value={figures.windowBuys === null ? "unknown" : formatCount(figures.windowBuys)}
+                  />
+                </>
+              ) : null}
               <Row label="Buys done" value={formatCount(figures.buysDone)} />
               <Row label="Closed" value={figures.closed ? "yes" : "no"} />
               <Row label="Holds" value={`${figures.balance} wei of WETH`} />

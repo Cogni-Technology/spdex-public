@@ -11,7 +11,15 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { recommendedConfig } from "@spdex/config";
 import { CONTRACTS, TOKENS } from "@spdex/chain";
 import type { SpdexConfig } from "@spdex/core";
-import { MAINNET_BATCHER, MAINNET_FACTORY, MAINNET_IMPLEMENTATION } from "@spdex/vault";
+import {
+  MAINNET_BATCHER,
+  MAINNET_FACTORY,
+  MAINNET_IMPLEMENTATION,
+  MAINNET_REGISTRY,
+  V1_MAINNET_BATCHER,
+  V1_MAINNET_FACTORY,
+  V1_MAINNET_IMPLEMENTATION,
+} from "@spdex/vault";
 import { Engine } from "../engine.js";
 import { buildTipPlan } from "../tips.js";
 import { KNOWN_CONTRACTS, knownContract, REFUSED_TIP_RECIPIENTS } from "./contracts.js";
@@ -31,6 +39,10 @@ describe("KNOWN_CONTRACTS", () => {
     expect(knownContract(MAINNET_FACTORY)).toBe("the vault factory");
     expect(knownContract(MAINNET_BATCHER)).toBe("the vault batcher");
     expect(knownContract(MAINNET_IMPLEMENTATION)).toBe("the vault contract");
+    expect(knownContract(MAINNET_REGISTRY)).toBe("the SPX holder registry");
+    expect(knownContract(V1_MAINNET_FACTORY)).toBe("the v1 vault factory");
+    expect(knownContract(V1_MAINNET_BATCHER)).toBe("the v1 vault batcher");
+    expect(knownContract(V1_MAINNET_IMPLEMENTATION)).toBe("the v1 vault contract");
     expect(REFUSED_TIP_RECIPIENTS).toHaveLength(KNOWN_CONTRACTS.size);
   });
 });

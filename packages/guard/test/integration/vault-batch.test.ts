@@ -5,18 +5,25 @@
  * as the app sends it: signed at the exact gas limit and price the Guard
  * checked, then handed to the relay (here the fork) as a raw transaction.
  *
- * Owner A creates two vaults, due at once: one large enough that its buy fee
- * covers a batch's network fee at the fork's price, and one too small to. B
- * reads what is due (`readDueCandidates`), selects with the keeper's own rule
- * (`selectBatch`, private, no loss) — which leaves the small one out —
+ * Owner A creates two v2 vaults, due at once: one large enough that its buy
+ * fee covers a batch's network fee at the fork's price, and one too small to.
+ * B reads what is due (`readDueCandidates`), selects with the keeper's own
+ * rule (`selectBatch`, private, no loss) — which leaves the small one out —
  * test-runs the batch at its gas limit to size `minRewards`, has the Guard
- * check it, and sends it. B is paid the fee and A the SPX. A asking for more
- * than the batch earns is refused before anything is signed.
+ * check it, and sends it. Each vault pays B its fee directly, naming B as
+ * `rewardTo` in its `Bought`, and A gets the SPX. A asking for more than the
+ * batch earns is refused before anything is signed.
  *
- * The shared fork's clock is never touched: each vault starts at the chain's
- * own time. Only A's own vaults are ever put in a batch or closed, whatever
- * else the factory lists. The factory and the batcher are deployed first if
- * the fork doesn't have them yet, from a fresh address.
+ * B is a fresh key, no SPX holder, so the buys must be past their community
+ * windows: each vault's window is the shortest the factory allows (a minute)
+ * on a half-hourly plan that started two minutes before the chain's own time,
+ * so its first slot's window has closed and most of the slot is left open to
+ * anyone. The shared fork's clock is never touched. Only A's own
+ * vaults are ever put in a batch or closed, whatever else the factory lists.
+ * The registry, the factory and the batcher are deployed first if the fork
+ * doesn't have them yet, from a fresh address. Each vault in the batch comes
+ * with the claim the app would hand over (owner, nonce, terms, release),
+ * which the Guard proves against its address before it simulates anything.
  *
  * Requires a fork: `pnpm anvil:fork`.
  */
@@ -33,8 +40,7 @@ import {
   batchGasLimit,
   buyFee,
   feeCeiling,
-  deployBatcherCall,
-  deployFactoryCall,
+  deployReleaseCalls,
   encodeClose,
   encodeCreateVault,
   encodeExecuteBatch,
@@ -48,7 +54,7 @@ import {
   type RawLog,
   type VaultPlan,
 } from "@spdex/vault";
-import { VaultGuard, type VaultBatchIntent, type VaultBatchTxPlan } from "../../src/vault.js";
+import { VaultGuard, type VaultBatchIntent, type VaultBatchTxPlan, type VaultClaim } from "../../src/vault.js";
 import { SecondOpinionPair } from "../../src/second-opinion.js";
 
 /** The environment, read without Node's types, which this package does not carry. */
@@ -108,52 +114,63 @@ describe("a batch of someone else's due buys, from a fresh wallet", () => {
   let large: Address;
   let small: Address;
   const vaults: Address[] = [];
+  /** What the app reads about each vault and hands the Guard to prove it: owner, nonce, terms, release. */
+  const claims = new Map<Address, VaultClaim>();
+  const claimsOf = (list: readonly Address[]): VaultClaim[] => list.map((v) => claims.get(v)!);
 
   async function createVault(amountPerBuy: bigint, startAt: bigint, keeperReward = buyFee(amountPerBuy).reward): Promise<Address> {
     const plan: VaultPlan = {
       marketIndex: 0n,
       amountPerBuy,
-      interval: VAULT_LIMITS.MIN_INTERVAL,
+      // Half-hourly: under the hour the keeper's rule asks of a vault whose fee
+      // others' fees may carry (`subsidyMinInterval`), so each pays its own way.
+      interval: 1_800n,
       maxBuys: 2n,
       startAt,
       keeperReward,
       maxSlippageBps: 300n,
+      communityWindow: VAULT_LIMITS.MIN_COMMUNITY_WINDOW,
+      turnBuckets: 0n,
     };
     const receipt = await send(owner.key, MAINNET_FACTORY, encodeCreateVault(plan), vaultBudget(plan));
     const [created] = vaultsCreatedBy(MAINNET_FACTORY, receipt.logs);
     if (!created) throw new Error("no VaultCreated from the factory");
+    // A fresh owner's vaults take nonces 0, 1, … in the order they are made.
+    claims.set(created.vault, { address: created.vault, owner: created.owner, nonce: BigInt(vaults.length), terms: created.terms, release: "v2" });
     vaults.push(created.vault);
     return created.vault;
   }
 
   beforeAll(async () => {
     expect(Number(BigInt((await rpc("eth_chainId", [])) as string))).toBe(CHAIN_ID);
-    if (!(await hasCode(MAINNET_FACTORY)) || !(await hasCode(MAINNET_BATCHER))) {
-      // Whichever fork test runs first deploys them; a deployment that loses the race reverts, and the code is there.
-      const deployer = await freshAccount(ETHER);
-      for (const [call, at] of [
-        [deployFactoryCall(), MAINNET_FACTORY],
-        [deployBatcherCall(MAINNET_FACTORY), MAINNET_BATCHER],
-      ] as const) {
-        if (await hasCode(at)) continue;
-        const tx = await prepareTransaction(rpc, { from: deployer.address, to: call.to, data: call.data, value: 0n, chainId: CHAIN_ID });
-        const { raw, hash } = await signPrepared(deployer.key, tx);
-        await rpc("eth_sendRawTransaction", [raw]);
-        await receiptOf(hash);
-      }
+    // Whichever fork test runs first deploys them, registry first; a
+    // deployment that loses the race reverts, and the code is there.
+    let deployer: { key: Hex; address: Address } | null = null;
+    for (const call of deployReleaseCalls("v2")) {
+      if (await hasCode(call.address)) continue;
+      deployer ??= await freshAccount(ETHER);
+      const tx = await prepareTransaction(rpc, { from: deployer.address, to: call.to, data: call.data, value: 0n, chainId: CHAIN_ID }).catch(() => null);
+      if (tx === null) continue;
+      const { raw, hash } = await signPrepared(deployer.key, tx);
+      await rpc("eth_sendRawTransaction", [raw]);
+      await receiptOf(hash);
     }
     expect(await hasCode(MAINNET_FACTORY)).toBe(true);
     expect(await hasCode(MAINNET_BATCHER)).toBe(true);
 
     owner = await freshAccount(2n * ETHER);
     helper = await freshAccount(ETHER / 10n);
-    const latest = (await rpc("eth_getBlockByNumber", ["latest", false])) as { timestamp: string };
-    // Chain time, never the wall clock: the next block is at or after it, so the first buy is due.
+    // Chain time, never the wall clock, as the next block will have it: the fork mines only when
+    // sent a transaction, and its idle head lags the time it keeps (anvil's pending block carries
+    // the next one's). Two minutes before it, so the first buy is due and its one-minute community
+    // window over, and the rest of the half-hour's slot open to anyone.
+    const latest = (await rpc("eth_getBlockByNumber", ["pending", false])) as { timestamp: string };
     // The fork charges about 1 gwei, several times what the fee spDEX proposes is priced for, so no
     // buy at that fee pays for a batch of one here. The large vault's owner set the most a fee can be,
-    // 0.69% of a 0.2 ETH buy (0.00138 ETH), which does; the small one's 0.69% of 0.001 ETH does not.
-    large = await createVault(ETHER / 5n, BigInt(latest.timestamp), feeCeiling(ETHER / 5n));
-    small = await createVault(ETHER / 1_000n, BigInt(latest.timestamp));
+    // 0.69% of a 0.2 ETH buy (0.00138 ETH), which does; the small one's fee for 0.001 ETH does not.
+    const startAt = BigInt(latest.timestamp) - 120n;
+    large = await createVault(ETHER / 5n, startAt, feeCeiling(ETHER / 5n));
+    small = await createVault(ETHER / 1_000n, startAt);
   });
 
   afterAll(async () => {
@@ -164,12 +181,14 @@ describe("a batch of someone else's due buys, from a fresh wallet", () => {
   it("reads both as due, chooses only the one whose fee covers the network fee, and the Guard verifies it with a second opinion; the wallet sends it and is paid", async () => {
     // 1. What is due, read at one block, as the app does.
     const head = BigInt((await rpc("eth_blockNumber", [])) as string);
-    const read = await readPlatform(rpc, { block: head, deployments: [{ id: "v1", factory: MAINNET_FACTORY }] });
+    const read = await readPlatform(rpc, { block: head, deployments: [{ id: "v2", factory: MAINNET_FACTORY }] });
     const due = await readDueCandidates(rpc, read, { block: head });
     // Other vaults on the shared fork are read, never batched: only this file's own go further.
     const mine = due.filter((c) => c.vault === large || c.vault === small);
     expect(mine.map((c) => c.vault).sort()).toEqual([large, small].sort());
     expect(mine.every((c) => c.owner === owner.address.toLowerCase() && c.firstBuy && c.spotOut >= c.floorOut)).toBe(true);
+    // Past their community windows: a wallet that isn't an SPX holder may be paid for them.
+    expect(mine.every((c) => !c.inWindow)).toBe(true);
 
     // 2. One price, read once: the one signed.
     const gasPrice = BigInt((await rpc("eth_gasPrice", [])) as string);
@@ -205,7 +224,18 @@ describe("a batch of someone else's due buys, from a fresh wallet", () => {
     expect(earned).toBeGreaterThanOrEqual(minRewards);
 
     // 5. The Guard, with a second opinion from the same fork under another host name.
-    const intent: VaultBatchIntent = { version: 1, action: "batch", chainId: CHAIN_ID, account: helper.address, vaults: list, rewardTo: helper.address, minRewards, gasLimit, gasPrice };
+    const intent: VaultBatchIntent = {
+      version: 1,
+      action: "batch",
+      chainId: CHAIN_ID,
+      account: helper.address,
+      vaults: list,
+      claims: claimsOf(list),
+      rewardTo: helper.address,
+      minRewards,
+      gasLimit,
+      gasPrice,
+    };
     const plan: VaultBatchTxPlan = {
       version: 1,
       intent,
@@ -220,6 +250,7 @@ describe("a batch of someone else's due buys, from a fresh wallet", () => {
 
     // 6. Sent as the private path sends it: signed at exactly the checked gas and price, then sent raw.
     const wethBefore = await balanceOf(TOKENS.WETH.address, helper.address);
+    const batcherWethBefore = await balanceOf(TOKENS.WETH.address, MAINNET_BATCHER);
     const spxBefore = await balanceOf(TOKENS.SPX.address, owner.address);
     const nonce = Number(BigInt((await rpc("eth_getTransactionCount", [helper.address, "pending"])) as string));
     const tx: PreparedTransaction = {
@@ -238,11 +269,14 @@ describe("a batch of someone else's due buys, from a fresh wallet", () => {
     expect(BigInt(receipt.status)).toBe(1n);
 
     const [mined] = joinBatchLogs(receipt.logs, (a) => a === MAINNET_BATCHER);
-    expect(mined!.batch).toMatchObject({ caller: helper.address.toLowerCase(), rewardTo: helper.address.toLowerCase(), bought: 1n, swept: 0n });
+    expect(mined!.batch).toMatchObject({ source: "v2", caller: helper.address.toLowerCase(), rewardTo: helper.address.toLowerCase(), bought: 1n });
     expect(mined!.batch!.earned).toBeGreaterThanOrEqual(minRewards);
+    // Paid by the vault directly, every wei of it: nothing passed through the batcher.
     expect((await balanceOf(TOKENS.WETH.address, helper.address)) - wethBefore).toBe(mined!.batch!.earned);
+    expect(await balanceOf(TOKENS.WETH.address, MAINNET_BATCHER)).toBe(batcherWethBefore);
     const bought = receipt.logs.map((l) => decodeVaultEvent(l)).find((e) => e?.name === "Bought");
     expect(bought?.name === "Bought" && bought.emitter === large).toBe(true);
+    expect(bought).toMatchObject({ source: "v2", keeper: MAINNET_BATCHER, rewardTo: helper.address.toLowerCase() });
     const out = bought?.name === "Bought" ? bought.amountOut : 0n;
     expect(out).toBeGreaterThan(0n);
     expect((await balanceOf(TOKENS.SPX.address, owner.address)) - spxBefore).toBe(out);
@@ -254,7 +288,18 @@ describe("a batch of someone else's due buys, from a fresh wallet", () => {
     const list = [small];
     const gasLimit = batchGasLimit([{ firstBuy: true }]);
     const minRewards = buyFee(ETHER / 1_000n).reward + 1n;
-    const intent: VaultBatchIntent = { version: 1, action: "batch", chainId: CHAIN_ID, account: helper.address, vaults: list, rewardTo: helper.address, minRewards, gasLimit, gasPrice };
+    const intent: VaultBatchIntent = {
+      version: 1,
+      action: "batch",
+      chainId: CHAIN_ID,
+      account: helper.address,
+      vaults: list,
+      claims: claimsOf(list),
+      rewardTo: helper.address,
+      minRewards,
+      gasLimit,
+      gasPrice,
+    };
     const plan: VaultBatchTxPlan = {
       version: 1,
       intent,

@@ -1,13 +1,18 @@
 /**
  * A vault's whole life on the local fork, through the TypeScript layer the app
- * and the keeper use: deploy the factory the way the app offers to (through the
- * deterministic deployer, if it is not there yet — the phase-5a factory may
- * still be on the fork at its old address; nothing refers to it any more),
- * predict where a vault will land, create it from a fresh address with part of
- * its budget in the same transaction, find it exactly there with exactly the
- * code predicted and in the factory's list, top it up, let one keeper tick buy
- * it through the batcher, and close it. A second vault is bought the way
- * "Trigger now" buys one: a direct `execute` from a fresh address.
+ * and the keeper use: deploy the SPX holder registry and the factory the way
+ * the app offers to (through the deterministic deployer, registry first, if
+ * they are not there yet), predict where a vault will land, create it from a
+ * fresh address with part of its budget in the same transaction, find it
+ * exactly there with exactly the code predicted and in the factory's list, top
+ * it up, let one keeper tick buy it through the batcher once its community
+ * window is over, and close it. A second vault, inside its window, refuses a
+ * stranger who names itself and is bought the way "Trigger now" buys one: a
+ * direct `execute(owner)`, here from a fresh address. Vaults made with turns
+ * work out their buckets and turns as the TypeScript does, and refuse an
+ * eligible holder off its turn exactly when `onTurn` says. A v1 vault, made on
+ * v1's frozen factory, still reads, buys for whoever calls it, funds and
+ * closes.
  *
  * The forge tests (`test/forge`) prove the contract's rules on a fork of their
  * own, with time moved freely. This proves the other half: that what the
@@ -18,11 +23,13 @@
  * agree with `readVault` about one vault.
  *
  * The shared fork's clock is never touched. Its blocks carry wall-clock time,
- * so the plan is given the shortest interval with its first window already
- * nearly over: one buy lands in it, and the test checks the next is refused
- * until half an interval after it. A second buy would mean waiting that out in
- * real time (150 seconds), so later buys, and every timing edge, are the forge
- * tests' to prove, where time can be moved. Every address is fresh:
+ * so the plan is given the shortest interval with its first slot already
+ * nearly over, and so its 75-second community window long over: one buy lands
+ * in it, from a keeper paying an address that never proved anything, and the
+ * test checks the next is refused until half an interval after it. A second
+ * buy would mean waiting that out in real time (150 seconds), so later buys,
+ * and every timing edge, are the forge tests' to prove, where time can be
+ * moved (`test/forge/Window.t.sol`). Every address is fresh:
  * anvil's default accounts carry an EIP-7702 delegation inherited from mainnet
  * (see modules/venue-uniswap-v2's native test) and are shared by every suite.
  *
@@ -49,10 +56,22 @@ import {
   MAINNET_BATCHER,
   MAINNET_DEPLOYMENT,
   MAINNET_FACTORY,
+  MAINNET_REGISTRY,
+  V1_FACTORY_ABI,
+  V1_MAINNET_FACTORY,
   VAULT_ABI,
   VAULT_LIMITS,
   batcherAddress,
   buyFee,
+  buyMaker,
+  communityWindowEndsAt,
+  decodeVaultError,
+  defaultCommunityWindow,
+  deployRegistryCall,
+  encodeExecuteV1,
+  encodeTrigger,
+  v1BuyFee,
+  vaultCommunityWindow,
   decodeBatcherEvent,
   decodeVaultEvent,
   deployBatcherCall,
@@ -76,10 +95,16 @@ import {
   vaultRuntimeCode,
   vaultsCreatedBy,
   whyNotNow,
+  DEFAULT_TURN_BUCKETS,
+  bucketOf,
+  onTurn,
+  turnEndsAtOf,
+  turnOf,
   type VaultPlan,
   type VaultTerms,
 } from "../../src/index.js";
 import { keeperConfig, keeperTick, newKeeperState, type KeeperState } from "../../src/keeper.js";
+import { HOLDER, ensureHolderProven, ensureRelease, revertOf } from "./fork.js";
 
 const FORK_URL = process.env["SPDEX_FORK_URL"] ?? "http://127.0.0.1:8545";
 const CHAIN_ID = Number(process.env["SPDEX_FORK_CHAIN_ID"] ?? "690069");
@@ -172,6 +197,8 @@ describe("a vault's life on the fork, through @spdex/vault", () => {
   let plan: VaultPlan;
   let terms: VaultTerms;
   let vault: Address;
+  /** A second vault, bought inside its community window by a direct `execute(owner)`. */
+  let directVault: Address;
   /** The keeper's state across ticks, as `pnpm keeper` keeps it in its state file. */
   let keeperState: KeeperState;
   /**
@@ -202,35 +229,54 @@ describe("a vault's life on the fork, through @spdex/vault", () => {
     keeperState = newKeeperState({ chainId: CHAIN_ID, keeper: keeper.address });
   });
 
-  it("finds the factory, deploying it through the deterministic deployer if it is absent", async () => {
+  it("finds the registry and the factory, deploying them through the deterministic deployer if they are absent, registry first", async () => {
     expect(factory).toBe(MAINNET_FACTORY);
-    if (((await rpc("eth_getCode", [factory, "latest"])) as string) === "0x") {
+    const hasCode = async (address: Address) => ((await rpc("eth_getCode", [address, "latest"])) as string) !== "0x";
+    /** Another suite may deploy it first, even between the check and the send: the code is there either way. */
+    const deploy = async (call: { to: Address; data: Hex; value: bigint }, at: Address, what: string) => {
+      const deployer = await freshAccount(ETHER);
+      try {
+        gas[what] = BigInt((await send(deployer.key, call.to, call.data, call.value)).gasUsed);
+      } catch {
+        // Refused at the estimate: deployed in between.
+      }
+      expect(await hasCode(at)).toBe(true);
+    };
+    if (!(await hasCode(MAINNET_REGISTRY))) {
+      // Neither is there: the app says the registry goes first, and can't judge the factory's deployment yet.
+      expect(await vaultAvailability(rpc)).toMatchObject({ available: false, factoryDeployed: false, registryDeployed: false, factoryDeployable: null });
+      const call = deployRegistryCall();
+      expect(call.registry).toBe(MAINNET_REGISTRY);
+      await deploy(call, MAINNET_REGISTRY, "deploy registry");
+    }
+    if (!(await hasCode(factory))) {
       // Not offered yet: the app would say why, and offer this transaction — having
       // simulated it, since through the deployer a refusal would say nothing.
-      expect(await vaultAvailability(rpc)).toMatchObject({ available: false, factoryDeployed: false, factoryDeployable: true });
-      const deployer = await freshAccount(ETHER);
+      expect(await vaultAvailability(rpc)).toMatchObject({ available: false, factoryDeployed: false, registryDeployed: true, factoryDeployable: true });
       const call = deployFactoryCall();
       expect(call.factory).toBe(factory);
-      const receipt = await send(deployer.key, call.to, call.data, call.value);
-      gas["deploy factory"] = BigInt(receipt.gasUsed);
+      await deploy(call, factory, "deploy factory");
     }
-    expect(await rpc("eth_getCode", [factory, "latest"])).not.toBe("0x");
     expect((await factoryView<string>(factory, "weth")).toLowerCase()).toBe(WETH);
+    expect((await factoryView<string>(factory, "registry")).toLowerCase()).toBe(MAINNET_REGISTRY);
     expect(await factoryView<bigint>(factory, "marketCount")).toBe(1n);
     const market = await factoryView<readonly [string, string, string]>(factory, "markets", [0n]);
     expect(market.map((a) => a.toLowerCase())).toEqual([SPX, SPX_WETH_PAIR, SPX_WETH_POOL]);
     expect((await factoryView<string>(factory, "implementation")).toLowerCase()).toBe(implementationAddress(factory));
   });
 
-  it("finds the factory's batcher, deploying it the same way if it is absent", async () => {
-    // Anyone may deploy it, once: its address commits to its code and its factory.
-    expect(batcherAddress(factory)).toBe(MAINNET_BATCHER);
+  it("finds the batcher, deploying it the same way if it is absent", async () => {
+    // Anyone may deploy it, once: its address commits to its code and WETH's, and to no factory.
+    expect(batcherAddress(WETH)).toBe(MAINNET_BATCHER);
     if (((await rpc("eth_getCode", [MAINNET_BATCHER, "latest"])) as string) === "0x") {
       const deployer = await freshAccount(ETHER);
-      const call = deployBatcherCall(factory);
+      const call = deployBatcherCall();
       expect(call.batcher).toBe(MAINNET_BATCHER);
-      const receipt = await send(deployer.key, call.to, call.data, call.value);
-      gas["deploy batcher"] = BigInt(receipt.gasUsed);
+      try {
+        gas["deploy batcher"] = BigInt((await send(deployer.key, call.to, call.data, call.value)).gasUsed);
+      } catch {
+        // Deployed by another suite in between: the code says.
+      }
     }
     expect(await rpc("eth_getCode", [MAINNET_BATCHER, "latest"])).not.toBe("0x");
   });
@@ -266,6 +312,7 @@ describe("a vault's life on the fork, through @spdex/vault", () => {
       available: true,
       factory,
       factoryDeployed: true,
+      registryDeployed: true,
       market: { index: 0, tokenOut: SPX, pair: SPX_WETH_PAIR, oraclePool: SPX_WETH_POOL },
       factoryDeployable: null,
       marketHealthy: true,
@@ -291,12 +338,18 @@ describe("a vault's life on the fork, through @spdex/vault", () => {
       interval: VAULT_LIMITS.MIN_INTERVAL,
       maxBuys: 3n,
       // Chain time, never the wall clock: the vault judges time by blocks. The
-      // first window closes FIRST_WINDOW_LEFT seconds after this block.
+      // first slot closes FIRST_WINDOW_LEFT seconds after this block, and its
+      // community window, which opened at startAt, closed long before.
       startAt: BigInt(block.timestamp) - VAULT_LIMITS.MIN_INTERVAL + FIRST_WINDOW_LEFT,
-      // The buy fee the app proposes: one batched buy's network cost and a tenth more, at most 0.69%.
+      // The buy fee the app proposes: one batched buy's network cost and 0.25% of it, at most 0.69%.
       keeperReward: buyFee(amountPerBuy).reward,
       maxSlippageBps: 300n,
+      // A quarter of the five-minute interval: 75 seconds.
+      communityWindow: defaultCommunityWindow(VAULT_LIMITS.MIN_INTERVAL),
+      // No turns, as every plan the app creates.
+      turnBuckets: DEFAULT_TURN_BUCKETS,
     };
+    expect(plan.communityWindow).toBe(75n);
     terms = termsOfPlan(plan);
 
     // Where it will be, before it exists: computed here, and asked of the factory.
@@ -313,6 +366,8 @@ describe("a vault's life on the fork, through @spdex/vault", () => {
       plan.startAt,
       plan.keeperReward,
       plan.maxSlippageBps,
+      plan.communityWindow,
+      plan.turnBuckets,
     ]);
     expect(asked.toLowerCase()).toBe(predicted);
     expect(await rpc("eth_getCode", [predicted, "latest"])).toBe("0x");
@@ -327,6 +382,7 @@ describe("a vault's life on the fork, through @spdex/vault", () => {
     expect(others).toEqual([]);
     if (!created) throw new Error("no VaultCreated from the factory in the receipt");
     expect(created.emitter).toBe(factory);
+    expect(created.source).toBe("v2");
     expect(created.owner).toBe(owner.address);
     expect(created.marketIndex).toBe(0n);
     expect(created.terms).toEqual(terms);
@@ -364,12 +420,29 @@ describe("a vault's life on the fork, through @spdex/vault", () => {
     expect(before - (await ethBalance(owner.address))).toBe(vaultBudget(terms) - firstBuy + feePaid(receipt));
     expect(await ethBalance(vault)).toBe(0n);
 
-    const state = await readVault(rpc, vault, { factory });
+    // Asked of every release's factory, as the app asks: this build's vouches for it.
+    const state = await readVault(rpc, vault);
     expect(state).not.toBeNull();
+    expect(state!.release).toBe("v2");
+    expect(state!.source).toBe("v2");
     expect(state!.owner).toBe(owner.address);
     expect(state!.terms).toEqual(terms);
     expect(state!.fromFactory).toBe(true);
-    expect(state!.status).toMatchObject({ due: true, funded: true, buysLeft: 3n, wethBalance: vaultBudget(terms) });
+    expect(state!.factory).toBe(factory);
+    expect(state!.windowBuys).toBe(0n);
+    // Due from its start, and its 75-second community window long over: open to anyone.
+    expect(state!.status).toMatchObject({
+      due: true,
+      funded: true,
+      buysLeft: 3n,
+      wethBalance: vaultBudget(terms),
+      dueSince: plan.startAt,
+      windowEndsAt: plan.startAt + 75n,
+      // No turns: none to wait for, and every address in the one bucket.
+      turnEndsAt: plan.startAt,
+      turn: 0n,
+    });
+    expect(vaultCommunityWindow(state!)).toEqual({ dueSince: plan.startAt, endsAt: plan.startAt + 75n, inWindow: false });
     expect(state!.quote).not.toBeNull();
     expect(state!.quote!.spotOut).toBeGreaterThanOrEqual(state!.quote!.floorOut);
     // The vault's clock, read in the same batch: the latest block's, not the wall clock's.
@@ -391,7 +464,7 @@ describe("a vault's life on the fork, through @spdex/vault", () => {
     expect(await factoryView<bigint>(factory, "MAX_MARKET_GAP_BPS")).toBe(FACTORY_LIMITS.MAX_MARKET_GAP_BPS);
   });
 
-  it("one keeper tick buys it through the batcher, and the fee lands at rewardTo", async () => {
+  it("one keeper tick buys it through the batcher after its window, and the vault pays the fee straight to rewardTo", async () => {
     const before = await readVault(rpc, vault);
     const spxBefore = await balanceOf(SPX, owner.address);
     const result = await tick();
@@ -406,30 +479,53 @@ describe("a vault's life on the fork, through @spdex/vault", () => {
     const received = (await balanceOf(SPX, owner.address)) - spxBefore;
     expect(received).toBeGreaterThanOrEqual(before!.quote!.floorOut);
     expect(await balanceOf(SPX, vault)).toBe(0n);
-    // The vault paid its caller, the batcher, which passed every wei on to
-    // rewardTo in the same transaction and kept nothing; the keeper's hot key got none.
+    // The vault paid rewardTo itself — an address that never proved anything,
+    // its window being over — and no WETH passed through the batcher; the
+    // keeper's hot key got none.
     expect(await balanceOf(WETH, rewardTo)).toBe(terms.keeperReward);
     expect(await balanceOf(WETH, MAINNET_BATCHER)).toBe(0n);
     expect(await balanceOf(WETH, keeper.address)).toBe(0n);
 
     // The receipt says the same, joined by log index: the vault's Bought names
-    // the batcher as its caller, and the batcher's Triggered follows it.
+    // the batcher as its caller and rewardTo as the one paid, and the
+    // batcher's Triggered follows it.
     const receipt = (await rpc("eth_getTransactionReceipt", [mined.hash])) as Receipt;
     const vaultEvents = receipt.logs.map(decodeVaultEvent);
     const batcherEvents = receipt.logs.map((log) => decodeBatcherEvent(MAINNET_BATCHER, log));
     const at = vaultEvents.findIndex((event) => event?.name === "Bought");
     const bought = vaultEvents[at] as Extract<ReturnType<typeof decodeVaultEvent>, { name: "Bought" }>;
-    expect(bought).toMatchObject({ emitter: vault, keeper: MAINNET_BATCHER, amountIn: terms.amountPerBuy, amountOut: received, reward: terms.keeperReward, buyNumber: 1n });
+    expect(bought).toMatchObject({
+      emitter: vault,
+      source: "v2",
+      keeper: MAINNET_BATCHER,
+      rewardTo,
+      amountIn: terms.amountPerBuy,
+      amountOut: received,
+      reward: terms.keeperReward,
+      buyNumber: 1n,
+      dueSince: plan.startAt,
+    });
+    const block = (await rpc("eth_getBlockByNumber", [receipt.blockNumber, false])) as { timestamp: string };
+    expect(buyMaker({ ...bought, owner: owner.address, at: BigInt(block.timestamp), communityWindow: terms.communityWindow })).toBe("open");
     expect(bought.amountOut).toBeGreaterThanOrEqual(bought.floorOut);
     expect(bought.oracleDepth).toBeGreaterThanOrEqual(VAULT_LIMITS.MIN_ORACLE_DEPTH);
     expect(batcherEvents[at + 1]).toMatchObject({ name: "Triggered", vault, received });
-    expect(batcherEvents.find((event) => event?.name === "Batch")).toMatchObject({ caller: keeper.address, rewardTo, bought: 1n, earned: terms.keeperReward, swept: 0n });
+    expect(batcherEvents.find((event) => event?.name === "Batch")).toMatchObject({
+      source: "v2",
+      caller: keeper.address,
+      rewardTo,
+      bought: 1n,
+      earned: terms.keeperReward,
+      swept: 0n,
+    });
 
     const after = await readVault(rpc, vault);
     expect(after!.buysDone).toBe(1n);
     expect(after!.totalOut).toBe(received);
     expect(after!.totalRewards).toBe(terms.keeperReward);
     expect(after!.status.due).toBe(false);
+    // Made after its window: not the community's.
+    expect(after!.windowBuys).toBe(0n);
   });
 
   it("the next tick leaves it alone until half an interval after the buy, and says when", async () => {
@@ -447,23 +543,154 @@ describe("a vault's life on the fork, through @spdex/vault", () => {
     expect(result.upcoming).toEqual([{ vault, nextBuyAt: spaced }]);
   });
 
-  it("a due buy triggered directly, as Trigger now does, stays inside EXECUTE_GAS and pays its caller", async () => {
-    // Its own vault, due at once: the first vault's next window is minutes away.
+  it("inside its community window, refuses a stranger who names itself, and says until when", async () => {
+    // Its own vault, due at once, with a 15-minute window: inside it for the rest of this file.
     const latest = await mineNow();
-    const direct: VaultPlan = { ...plan, maxBuys: 1n, startAt: BigInt(latest.timestamp) };
+    const direct: VaultPlan = { ...plan, interval: 3_600n, communityWindow: 900n, maxBuys: 1n, startAt: BigInt(latest.timestamp) };
     const created = vaultsCreatedBy(factory, (await send(owner.key, factory, encodeCreateVault(direct), vaultBudget(direct))).logs)[0]!;
-    const caller = await freshAccount(ETHER / 10n);
+    directVault = created.vault;
+    const state = (await readVault(rpc, directVault))!;
+    expect(state.status).toMatchObject({ due: true, dueSince: direct.startAt, windowEndsAt: direct.startAt + 900n });
+    expect(vaultCommunityWindow(state)).toEqual({ dueSince: direct.startAt, endsAt: direct.startAt + 900n, inWindow: true });
+    // The TypeScript arithmetic agrees with the vault's, at the vault's own time.
+    expect(communityWindowEndsAt(created.terms, 0n, 0n, state.chainTime!)).toBe(state.status.windowEndsAt);
 
-    const receipt = await send(caller.key, created.vault, encodeExecute());
+    const stranger = await freshAccount(ETHER / 10n);
+    const refused = decodeVaultError(await revertOf({ from: stranger.address, to: directVault, data: encodeExecute(stranger.address) }));
+    expect(refused).toEqual({ name: "NotEligible", args: [expect.stringMatching(new RegExp(stranger.address.slice(2), "i")), direct.startAt + 900n] });
+    // Paying the vault itself, or nobody, is refused inside the window and out.
+    expect(decodeVaultError(await revertOf({ from: stranger.address, to: directVault, data: encodeExecute(directVault) }))).toMatchObject({ name: "BadRewardTo" });
+  });
+
+  it("a due buy triggered directly, paying the owner as Trigger now does, stays inside EXECUTE_GAS, even sent by someone else", async () => {
+    const caller = await freshAccount(ETHER / 10n);
+    const ownerWeth = await balanceOf(WETH, owner.address);
+    // Trigger now's calldata: execute(owner), which the window never refuses.
+    const data = encodeTrigger({ release: "v2", owner: owner.address });
+    expect(data).toBe(encodeExecute(owner.address));
+    const receipt = await send(caller.key, directVault, data);
     // The dearest buy there is: a plan's first, which writes its slots from zero.
     gas["execute (first buy, direct)"] = BigInt(receipt.gasUsed);
     expect(BigInt(receipt.gasUsed)).toBeLessThanOrEqual(EXECUTE_GAS);
-    const bought = receipt.logs.map(decodeVaultEvent).find((event) => event?.name === "Bought");
-    expect(bought).toMatchObject({ emitter: created.vault, keeper: caller.address, reward: direct.keeperReward, buyNumber: 1n });
-    expect(await balanceOf(WETH, caller.address)).toBe(direct.keeperReward);
-    // One buy was all it had: it is done, and holds nothing more.
-    expect((await readVault(rpc, created.vault))!.status).toMatchObject({ due: false, buysLeft: 0n });
-    expect(await balanceOf(WETH, created.vault)).toBe(0n);
+    const bought = receipt.logs.map(decodeVaultEvent).find((event) => event?.name === "Bought") as Extract<ReturnType<typeof decodeVaultEvent>, { name: "Bought" }>;
+    const terms = (await readVault(rpc, directVault))!.terms;
+    expect(bought).toMatchObject({ emitter: directVault, keeper: caller.address, rewardTo: owner.address, reward: terms.keeperReward, buyNumber: 1n });
+    // The fee came back to the owner, and the caller got nothing for its gas.
+    expect((await balanceOf(WETH, owner.address)) - ownerWeth).toBe(terms.keeperReward);
+    expect(await balanceOf(WETH, caller.address)).toBe(0n);
+    const block = (await rpc("eth_getBlockByNumber", [receipt.blockNumber, false])) as { timestamp: string };
+    // Not the owner's doing, though the owner was paid: "returned".
+    expect(buyMaker({ ...bought, owner: owner.address, sender: caller.address, at: BigInt(block.timestamp), communityWindow: 900n })).toBe("returned");
+    // One buy was all it had: it is done, holds nothing more, and none of its buys was the community's.
+    const state = (await readVault(rpc, directVault))!;
+    expect(state.status).toMatchObject({ due: false, buysLeft: 0n, dueSince: null, windowEndsAt: null });
+    expect(state.windowBuys).toBe(0n);
+    expect(await balanceOf(WETH, directVault)).toBe(0n);
+  });
+
+  it("a vault with turns works out buckets and turns as the TypeScript does, and refuses an eligible holder off its turn exactly when onTurn says", async () => {
+    await ensureHolderProven();
+    // Two buckets: the one eligible address the fork has, HOLDER, is on a vault's turn about half the time.
+    // Vaults are made until it has been both on and off: each its own, due at once, inside the first half of its window.
+    const outcomes = new Set<boolean>();
+    const stranger = await freshAccount(ETHER / 10n);
+    for (let made = 0; made < 12 && outcomes.size < 2; made++) {
+      const latest = await mineNow();
+      const turned: VaultPlan = { ...plan, interval: 3_600n, communityWindow: 900n, maxBuys: 1n, startAt: BigInt(latest.timestamp), turnBuckets: 2n };
+      const created = vaultsCreatedBy(factory, (await send(owner.key, factory, encodeCreateVault(turned), vaultBudget(turned))).logs)[0]!;
+      expect(created.terms.turnBuckets).toBe(2n);
+      const v = created.vault;
+      const view = async (functionName: "bucketOf" | "turnOf", arg: Address | bigint) =>
+        decodeFunctionResult({
+          abi: VAULT_ABI,
+          functionName,
+          data: (await rpc("eth_call", [{ to: v, data: encodeFunctionData({ abi: VAULT_ABI, functionName, args: [arg] as never }) }, "latest"])) as Hex,
+        });
+      // The vault's own hashes are the TypeScript's.
+      expect(await view("bucketOf", HOLDER)).toBe(bucketOf(HOLDER, 2n));
+      expect(await view("bucketOf", stranger.address)).toBe(bucketOf(stranger.address, 2n));
+      for (const slot of [0n, 1n, 7n]) expect(await view("turnOf", slot)).toBe(turnOf(v, slot, 2n));
+
+      const state = (await readVault(rpc, v))!;
+      expect(state.status).toMatchObject({ due: true, dueSince: turned.startAt, turnEndsAt: turned.startAt + 450n, turn: turnOf(v, 0n, 2n) });
+      expect(turnEndsAtOf(created.terms, 0n, 0n, state.chainTime!)).toBe(state.status.turnEndsAt);
+      const now = state.chainTime!;
+      expect(now < turned.startAt + 450n).toBe(true);
+
+      const expected = onTurn({ vault: v, owner: owner.address, rewardTo: HOLDER, terms: created.terms, dueSince: turned.startAt, now });
+      outcomes.add(expected);
+      let refusal: { name: string; args: readonly unknown[] } | null = null;
+      try {
+        await rpc("eth_call", [{ from: stranger.address, to: v, data: encodeExecute(HOLDER) }, "latest"]);
+      } catch (error) {
+        refusal = decodeVaultError((error as { data?: string }).data ?? "0x");
+      }
+      if (expected) {
+        // On its turn: past the window's checks. (The market, not the turn, could still refuse it.)
+        expect(refusal?.name ?? "bought", "an eligible holder on its turn").not.toMatch(/^(NotYourTurn|NotEligible)$/);
+      } else {
+        expect(refusal).toEqual({ name: "NotYourTurn", args: [expect.stringMatching(new RegExp(HOLDER.slice(2), "i")), turnOf(v, 0n, 2n), turned.startAt + 450n] });
+      }
+      // The owner may always be paid, and a stranger is no holder: the window's own rules, turn or not.
+      expect(onTurn({ vault: v, owner: owner.address, rewardTo: owner.address, terms: created.terms, dueSince: turned.startAt, now })).toBe(true);
+      expect(decodeVaultError(await revertOf({ from: stranger.address, to: v, data: encodeExecute(stranger.address) }))).toMatchObject({ name: "NotEligible" });
+      // Done with it: closed, so it holds nothing.
+      await send(owner.key, v, encodeClose());
+    }
+    expect([...outcomes].sort()).toEqual([false, true]);
+  });
+
+  it("a v1 vault, made on v1's frozen factory, still reads, buys for whoever calls it, takes a top-up and closes", async () => {
+    const v1 = await ensureRelease("v1");
+    expect(v1.factory).toBe(V1_MAINNET_FACTORY);
+    const latest = await mineNow();
+    const v1Owner = await freshAccount(ETHER);
+    const amountPerBuy = ETHER / 100n;
+    const v1Plan = { ...plan, maxBuys: 2n, startAt: BigInt(latest.timestamp), keeperReward: v1BuyFee(amountPerBuy).reward };
+    const args = [v1Plan.marketIndex, v1Plan.amountPerBuy, v1Plan.interval, v1Plan.maxBuys, v1Plan.startAt, v1Plan.keeperReward, v1Plan.maxSlippageBps] as const;
+    const v1Terms = { ...termsOfPlan(v1Plan), communityWindow: null, turnBuckets: null };
+    // Where it will be: computed here for v1's layout, and asked of v1's factory.
+    const predicted = predictVault({ factory: V1_MAINNET_FACTORY, owner: v1Owner.address, nonce: 0n, terms: v1Terms });
+    const asked = decodeFunctionResult({
+      abi: V1_FACTORY_ABI,
+      functionName: "predictVault",
+      data: (await rpc("eth_call", [
+        { to: V1_MAINNET_FACTORY, data: encodeFunctionData({ abi: V1_FACTORY_ABI, functionName: "predictVault", args: [v1Owner.address, 0n, ...args] }) },
+        "latest",
+      ])) as Hex,
+    });
+    expect(asked.toLowerCase()).toBe(predicted);
+
+    const firstBuy = v1Plan.amountPerBuy + v1Plan.keeperReward;
+    const receipt = await send(v1Owner.key, V1_MAINNET_FACTORY, encodeFunctionData({ abi: V1_FACTORY_ABI, functionName: "createVault", args }), firstBuy);
+    const [created] = vaultsCreatedBy(V1_MAINNET_FACTORY, receipt.logs);
+    expect(created).toMatchObject({ source: "v1", vault: predicted, owner: v1Owner.address, terms: v1Terms, funded: firstBuy });
+    expect(await rpc("eth_getCode", [predicted, "latest"])).toBe(vaultRuntimeCode(implementationAddress(V1_MAINNET_FACTORY), v1Owner.address, v1Terms));
+
+    // Read as the app reads any vault: by the shape of its answers, vouched for by v1's factory.
+    const state = (await readVault(rpc, predicted))!;
+    expect(state).toMatchObject({ release: "v1", source: "v1", terms: v1Terms, fromFactory: true, factory: V1_MAINNET_FACTORY, windowBuys: null });
+    expect(state.status).toMatchObject({ due: true, funded: true, buysLeft: 2n, dueSince: null, windowEndsAt: null, turnEndsAt: null, turn: null });
+    expect(vaultCommunityWindow(state)).toBeNull();
+
+    // Topped up to its budget, with the same encoder as v2's.
+    await send(v1Owner.key, predicted, encodeFund(), vaultBudget(v1Plan));
+    expect(await balanceOf(WETH, predicted)).toBe(vaultBudget(v1Plan));
+
+    // v1's execute() pays whoever calls it: no window, no rewardTo.
+    const caller = await freshAccount(ETHER / 10n);
+    const bought = (await send(caller.key, predicted, encodeExecuteV1())).logs.map(decodeVaultEvent).find((event) => event?.name === "Bought");
+    expect(bought).toMatchObject({ source: "v1", emitter: predicted, keeper: caller.address, rewardTo: caller.address, reward: v1Plan.keeperReward, dueSince: null });
+    expect(await balanceOf(WETH, caller.address)).toBe(v1Plan.keeperReward);
+    expect(buyMaker({ ...(bought as Extract<typeof bought, { name: "Bought" }>), owner: v1Owner.address, at: null, communityWindow: null })).toBe("caller");
+    // v2's execute(address) is nothing a v1 vault knows.
+    await expect(rpc("eth_call", [{ from: caller.address, to: predicted, data: encodeExecute(caller.address) }, "latest"])).rejects.toThrow();
+
+    const left = await balanceOf(WETH, predicted);
+    await send(v1Owner.key, predicted, encodeClose());
+    expect(await balanceOf(WETH, predicted)).toBe(0n);
+    expect((await readVault(rpc, predicted))!).toMatchObject({ closed: true, status: { buysLeft: 0n } });
+    expect(left).toBe(vaultBudget(v1Plan) - firstBuy);
   });
 
   it("closing returns everything left to the owner as ether", async () => {

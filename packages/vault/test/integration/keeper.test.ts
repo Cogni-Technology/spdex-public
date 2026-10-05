@@ -12,11 +12,22 @@
  * and that `pnpm keeper --once` writes its JSONL, state and heartbeat, and
  * resumes from them.
  *
+ * v2's community window, on real bytes: a cold `rewardTo` nobody proved is
+ * left out of each buy's window, so the vaults here start far enough back
+ * that their first window has already ended and anyone may buy; a real SPX
+ * holder, proven on the fork from its recorded mainnet proof
+ * (`ensureHolderProven`), is paid for a buy inside its window at once, at the
+ * patient tip; v1's vaults are served beside v2's, each batch to its own
+ * release's batcher; and one case — exactly one (decision 32) — waits out a
+ * 60-second window in real time.
+ *
  * The shared fork's clock and base fee are never touched, and no block is
- * mined but by sending this file's own transactions: vaults start at the
- * chain's own time, so their first buy is due at once, and every keeper here
- * is limited to this file's vaults by an allowlist, with `confirmations: 1`
- * and the head-lag check off (an idle fork's head is days old). Every key is
+ * mined but by sending this file's own transactions. The fork's clock runs on
+ * with the wall clock, while its head is only as new as its last block, so a
+ * plan that must start "now" starts at the time the fork will give its next
+ * block (`forkNow`, the `pending` block's: a read). Every keeper here is
+ * limited to this file's vaults by an allowlist, with `confirmations: 1` and
+ * the head-lag check off (an idle fork's head is days old). Every key is
  * fresh, and every vault is closed at the end.
  *
  * Requires a fork: `pnpm anvil:fork` (point SPDEX_FORK_URL at another port to
@@ -33,14 +44,23 @@ import type { Address, Hex } from "@spdex/core";
 import { TOKENS, addressOfKey, generateSpendingKey, httpRpc, prepareTransaction, signPrepared, type JsonRpc } from "@spdex/chain";
 import {
   BATCHER_LIMITS,
+  DEFAULT_TURN_BUCKETS,
+  FEE_TIP_REFERENCE,
   MAINNET_BATCHER,
   MAINNET_FACTORY,
+  V1_FACTORY_ABI,
+  V1_MAINNET_BATCHER,
+  V1_MAINNET_FACTORY,
+  VAULT_ABI,
+  VAULT_LIMITS,
   buyFee,
   decodeBatcherEvent,
-  deployBatcherCall,
-  deployFactoryCall,
+  defaultCommunityWindow,
   encodeClose,
   encodeCreateVault,
+  encodeFund,
+  minGasPerAttempt,
+  v1BuyFee,
   vaultBudget,
   vaultsCreatedBy,
   type VaultPlan,
@@ -57,6 +77,7 @@ import {
   type KeeperPolicy,
   type KeeperState,
 } from "../../src/keeper.js";
+import { HOLDER, ensureHolderProven, ensureRelease } from "./fork.js";
 
 const FORK_URL = process.env["SPDEX_FORK_URL"] ?? "http://127.0.0.1:8545";
 const CHAIN_ID = Number(process.env["SPDEX_FORK_CHAIN_ID"] ?? "690069");
@@ -113,13 +134,12 @@ async function send(key: Hex, to: Address, data: Hex, value = 0n): Promise<Recei
 
 const hasCode = async (address: Address) => ((await rpc("eth_getCode", [address, "latest"])) as string) !== "0x";
 
-/** Deploy through the deterministic deployer unless it is there; a deployment that loses a race reverts, and the code is there all the same. */
-async function ensureDeployed(deployer: Hex, call: { to: Address; data: Hex }, at: Address): Promise<void> {
-  if (!(await hasCode(at))) await send(deployer, call.to, call.data);
-  expect(await hasCode(at)).toBe(true);
-}
-
-const chainNow = async (): Promise<bigint> => BigInt(((await rpc("eth_getBlockByNumber", ["latest", false])) as { timestamp: string }).timestamp);
+/**
+ * The time the fork will give its next block: its `pending` block's, a read.
+ * Its clock runs on with the wall clock while its head waits for a
+ * transaction, so this, not the head's time, is when a plan made now starts.
+ */
+const forkNow = async (): Promise<bigint> => BigInt(((await rpc("eth_getBlockByNumber", ["pending", false])) as { timestamp: string }).timestamp);
 
 /** Every config here: this file's vaults only, one confirmation, no head-lag check. */
 const FORK_POLICY: Partial<KeeperPolicy> = { sendWhen: "now", confirmations: 1, maxHeadLagSeconds: 0n };
@@ -131,18 +151,32 @@ describe("the keeper on the fork", () => {
   const opened: Address[] = [];
   const records: KeeperLogRecord[] = [];
 
-  /** A funded vault of `owner`'s: due at once unless `startIn` puts its start later. */
-  async function createVault(amountPerBuy: bigint, options: { startIn?: bigint; interval?: bigint; maxBuys?: bigint } = {}): Promise<{ vault: Address; plan: VaultPlan }> {
+  /**
+   * A funded v2 vault of `owner`'s. By default its first buy is due at once and
+   * its first community window has already ended, a minute ago: anyone may
+   * make it, the cold `rewardTo` here included. `inWindow` starts it now, so
+   * its first buy is inside its window; `startIn` later. Funded for every
+   * buy, unless `funding` says how much.
+   */
+  async function createVault(
+    amountPerBuy: bigint,
+    options: { startIn?: bigint; inWindow?: boolean; interval?: bigint; maxBuys?: bigint; communityWindow?: bigint; funding?: bigint } = {},
+  ): Promise<{ vault: Address; plan: VaultPlan }> {
+    const interval = options.interval ?? HOUR;
+    const communityWindow = options.communityWindow ?? defaultCommunityWindow(interval);
+    const now = await forkNow();
     const plan: VaultPlan = {
       marketIndex: 0n,
       amountPerBuy,
-      interval: options.interval ?? HOUR,
+      interval,
       maxBuys: options.maxBuys ?? 2n,
-      startAt: (await chainNow()) + (options.startIn ?? 0n),
+      startAt: options.startIn !== undefined ? now + options.startIn : options.inWindow ? now : now - communityWindow - 60n,
       keeperReward: buyFee(amountPerBuy).reward,
       maxSlippageBps: 300n,
+      communityWindow,
+      turnBuckets: DEFAULT_TURN_BUCKETS,
     };
-    const receipt = await send(owner.key, MAINNET_FACTORY, encodeCreateVault(plan), vaultBudget(plan));
+    const receipt = await send(owner.key, MAINNET_FACTORY, encodeCreateVault(plan), options.funding ?? vaultBudget(plan));
     expect(BigInt(receipt.status)).toBe(1n);
     const [created] = vaultsCreatedBy(MAINNET_FACTORY, receipt.logs);
     if (!created) throw new Error("no VaultCreated from the factory");
@@ -150,11 +184,19 @@ describe("the keeper on the fork", () => {
     return { vault: created.vault, plan };
   }
 
-  function tick(input: { vaults: Address[]; state: KeeperState; policy?: Partial<KeeperPolicy>; dryRun?: boolean; via?: JsonRpc; persist?: (s: KeeperState) => Promise<void> }) {
+  function tick(input: {
+    vaults: Address[];
+    state: KeeperState;
+    policy?: Partial<KeeperPolicy>;
+    dryRun?: boolean;
+    via?: JsonRpc;
+    persist?: (s: KeeperState) => Promise<void>;
+    rewardTo?: Address;
+  }) {
     const config = keeperConfig({
       chainId: CHAIN_ID,
       ...(input.dryRun ? {} : { keeperKey: keeper.key }),
-      rewardTo: cold,
+      rewardTo: input.rewardTo ?? cold,
       vaults: input.vaults,
       policy: { ...FORK_POLICY, ...input.policy },
     });
@@ -171,9 +213,9 @@ describe("the keeper on the fork", () => {
 
   beforeAll(async () => {
     expect(Number(BigInt((await rpc("eth_chainId", [])) as string))).toBe(CHAIN_ID);
-    const deployer = await freshAccount(ETHER);
-    await ensureDeployed(deployer.key, deployFactoryCall(), MAINNET_FACTORY);
-    await ensureDeployed(deployer.key, deployBatcherCall(MAINNET_FACTORY), MAINNET_BATCHER);
+    // Both releases, as anyone would put them on the fork: v2's registry, factory and batcher; v1's from its frozen source.
+    await ensureRelease("v2");
+    await ensureRelease("v1");
     owner = await freshAccount(5n * ETHER);
     keeper = await freshAccount(ETHER);
     cold = (await freshAccount()).address;
@@ -209,7 +251,13 @@ describe("the keeper on the fork", () => {
     // The chain agrees: the batch paid the cold address, not the keeper, and the batcher kept nothing.
     const receipt = await receiptOf(mined.hash);
     const batch = receipt.logs.map((log) => decodeBatcherEvent(MAINNET_BATCHER, log)).find((e) => e?.name === "Batch");
-    expect(batch).toMatchObject({ name: "Batch", caller: keeper.address, rewardTo: cold, bought: 2n, earned: fees, swept: 0n });
+    expect(batch).toMatchObject({ name: "Batch", source: "v2", caller: keeper.address, rewardTo: cold, bought: 2n, earned: fees });
+    // Each vault paid the cold address itself, after its window: v2's batcher moves no WETH, and has no sweep to report.
+    expect(mined.sweptWei).toBeNull();
+    expect(mined.bought.map((x) => [x.rewardTo, x.inCommunityWindow])).toEqual([
+      [cold, false],
+      [cold, false],
+    ]);
     expect(await wethOf(cold)).toBe(fees);
     expect(await wethOf(keeper.address)).toBe(0n);
     expect(await wethOf(MAINNET_BATCHER)).toBe(0n);
@@ -219,7 +267,10 @@ describe("the keeper on the fork", () => {
     expect(minedRecord).toMatchObject({ type: "batch_mined", earnedWei: fees, status: "success", late: false });
     expect(receipt.transactionHash.toLowerCase()).toBe(mined.hash);
     const sentRecord = records.find((r) => r.type === "batch_sent" && r.hash === mined.hash);
-    expect(sentRecord).toMatchObject({ type: "batch_sent", endpoint: "public", reason: "now", deployment: "v1", batcher: MAINNET_BATCHER });
+    expect(sentRecord).toMatchObject({ type: "batch_sent", endpoint: "public", reason: "now", deployment: "v2", batcher: MAINNET_BATCHER });
+    // The cold address never proved: the keeper read so, and said so.
+    expect(state.eligibility["v2"]).toMatchObject({ holder: cold, eligible: false, validUntil: 0n });
+    expect(records.find((r) => r.type === "eligibility")).toMatchObject({ deployment: "v2", rewardTo: cold, eligible: false, reason: "not-proven" });
     firstBatch = {
       hash: mined.hash,
       vaults: [a.vault, b.vault],
@@ -235,8 +286,8 @@ describe("the keeper on the fork", () => {
     console.log(`two first buys batched by the keeper: ${gasUsed} gas (model ${expectedGas})`);
     expect(expectedGas > 0n).toBe(true);
     expect(gasUsed <= expectedGas).toBe(true);
-    // Each attempt had its whole cap: the limit carries MIN_GAS_PER_ATTEMPT after the last vault.
-    expect(BATCHER_LIMITS.MIN_GAS_PER_ATTEMPT).toBe(460_000n);
+    // Each attempt had its whole gas: the limit carries what an attempt at the least gas needs after the last vault.
+    expect(minGasPerAttempt(BATCHER_LIMITS.MIN_EXECUTE_GAS)).toBe(460_000n);
   });
 
   let later: { vault: Address; plan: VaultPlan } | null = null;
@@ -356,6 +407,102 @@ describe("the keeper on the fork", () => {
     expect(restored.vaults[vault]).toMatchObject({ buysDone: 1n });
     expect(restored.seq).toBeGreaterThan(seqBefore);
   });
+
+  it("serves v1's vaults beside v2's: each release's due buys to its own batcher, one batch a tick", async () => {
+    const v2 = await createVault(ETHER / 100n);
+    // A v1 vault, as v1's factory makes them: no community window, and v1's fee for its size.
+    const amountPerBuy = ETHER / 100n;
+    const fee = v1BuyFee(amountPerBuy).reward;
+    const args = [0n, amountPerBuy, HOUR, 2n, (await forkNow()) - 60n, fee, 300n] as const;
+    const receipt = await send(owner.key, V1_MAINNET_FACTORY, encodeFunctionData({ abi: V1_FACTORY_ABI, functionName: "createVault", args }), 2n * (amountPerBuy + fee));
+    expect(BigInt(receipt.status)).toBe(1n);
+    const [created] = vaultsCreatedBy(V1_MAINNET_FACTORY, receipt.logs);
+    if (!created) throw new Error("no VaultCreated from v1's factory");
+    opened.push(created.vault);
+    expect(created).toMatchObject({ source: "v1", terms: { communityWindow: null, turnBuckets: null } });
+
+    const state = freshState();
+    const coldBefore = await wethOf(cold);
+    const first = await tick({ vaults: [created.vault, v2.vault], state });
+    const second = await tick({ vaults: [created.vault, v2.vault], state });
+    const sent = [first, second].map((r) => records.find((x) => x.type === "batch_sent" && x.hash === r.sent[0]?.hash));
+    expect(sent.map((r) => (r?.type === "batch_sent" ? [r.deployment, r.batcher, r.vaults.map((v) => v.vault)] : null))).toEqual([
+      ["v1", V1_MAINNET_BATCHER, [created.vault]],
+      ["v2", MAINNET_BATCHER, [v2.vault]],
+    ]);
+    // v1's batcher is the caller its vault paid, and forwarded the fee on; v2's vault paid rewardTo itself.
+    expect(first.mined[0]).toMatchObject({ status: "success", sweptWei: 0n, bought: [expect.objectContaining({ vault: created.vault, rewardTo: V1_MAINNET_BATCHER, dueSince: null })] });
+    expect(second.mined[0]).toMatchObject({ status: "success", sweptWei: null, bought: [expect.objectContaining({ vault: v2.vault, rewardTo: cold, inCommunityWindow: false })] });
+    expect(await wethOf(cold)).toBe(coldBefore + fee + v2.plan.keeperReward);
+    expect(await wethOf(V1_MAINNET_BATCHER)).toBe(0n);
+    expect(state.vaults[created.vault]).toMatchObject({ deployment: "v1", buysDone: 1n, terms: { communityWindow: null } });
+    expect(state.vaults[v2.vault]).toMatchObject({ deployment: "v2", buysDone: 1n, terms: { communityWindow: defaultCommunityWindow(HOUR) } });
+  });
+
+  it("pays a real SPX holder, proven from its recorded mainnet proof, for a buy inside its window at once, at the patient tip", async () => {
+    const proven = await ensureHolderProven();
+    const { vault, plan } = await createVault(ETHER / 100n, { inWindow: true });
+    const holderBefore = await wethOf(HOLDER);
+    const state = freshState();
+    // Waiting for cheap blocks, which never come here: the window does not wait for one.
+    const result = await tick({ vaults: [vault], state, rewardTo: HOLDER, policy: { sendWhen: "cheap", cheapBaseFee: 0n } });
+    expect(state.eligibility["v2"]).toMatchObject({ holder: HOLDER, eligible: true, validUntil: proven.validUntil, isAccount: true });
+    expect(result.sent.map((s) => s.vaults)).toEqual([[vault]]);
+    const sent = records.find((r) => r.type === "batch_sent" && r.hash === result.sent[0]!.hash);
+    expect(sent).toMatchObject({ reason: "window", urgent: false, maxPriorityFeePerGas: FEE_TIP_REFERENCE, vaults: [expect.objectContaining({ communityWindowEndsAt: plan.startAt + plan.communityWindow })] });
+    const mined = result.mined[0]!;
+    expect(mined).toMatchObject({ status: "success", sweptWei: null });
+    expect(mined.bought).toEqual([expect.objectContaining({ vault, rewardTo: HOLDER, dueSince: plan.startAt, inCommunityWindow: true })]);
+    // The holder's WETH grew by the fee (it may have held some already), and the vault counted a window buy.
+    expect(await wethOf(HOLDER)).toBe(holderBefore + plan.keeperReward);
+    const windowBuys = decodeFunctionResult({
+      abi: VAULT_ABI,
+      functionName: "windowBuys",
+      data: (await rpc("eth_call", [{ to: vault, data: encodeFunctionData({ abi: VAULT_ABI, functionName: "windowBuys" }) }, "latest"])) as Hex,
+    });
+    expect(BigInt(windowBuys)).toBe(1n);
+    // Signed at the patient tip, as the record says.
+    const tx = (await rpc("eth_getTransactionByHash", [mined.hash])) as { maxPriorityFeePerGas: string; input: string };
+    expect(BigInt(tx.maxPriorityFeePerGas)).toBe(FEE_TIP_REFERENCE);
+  });
+
+  // The one case that waits in real time (decision 32): a minute of the fork's clock, run on by the wall clock alone.
+  it(
+    "leaves a 60-second window to holders when rewardTo is not eligible, waits it out, and makes the buy once a genuine transaction has brought the chain past it",
+    { timeout: 240_000 },
+    async () => {
+      // Two buys, funded for the first: the owner tops up for the second while the first waits.
+      const perBuy = ETHER / 100n + buyFee(ETHER / 100n).reward;
+      const { vault, plan } = await createVault(ETHER / 100n, {
+        interval: VAULT_LIMITS.MIN_INTERVAL,
+        communityWindow: VAULT_LIMITS.MIN_COMMUNITY_WINDOW,
+        inWindow: true,
+        funding: perBuy,
+      });
+      const endsAt = plan.startAt + plan.communityWindow;
+      const state = freshState();
+      const first = await tick({ vaults: [vault], state });
+      // The vault was made inside its window; were the fork's head somehow a minute stale, this case could not be run.
+      expect(first.chainTime < endsAt, "the vault's creation landed after its own window").toBe(true);
+      expect(first.sent).toEqual([]);
+      expect(first.skipped).toContainEqual({ vault, code: "holders-first", detail: `SPX holders have first claim until ${endsAt} (chain time)` });
+      expect(first.waiting).toEqual({ reason: "holders-first", candidates: 1 });
+      // The next tick is planned for the window's end.
+      expect(first.nextTickSeconds).toBe(Math.min(Math.max(Number(endsAt - first.chainTime), 12), 60));
+
+      // Real time passes. Nothing moves the fork's clock, and nothing is mined to move its head.
+      while ((await forkNow()) <= endsAt) await new Promise((resolve) => setTimeout(resolve, 1_000));
+      // The owner tops the plan up for its second buy: a real step of it, and the transaction that brings the head past the window.
+      const topUp = await send(owner.key, vault, encodeFund(), perBuy);
+      expect(BigInt(topUp.status)).toBe(1n);
+
+      const second = await tick({ vaults: [vault], state });
+      expect(second.chainTime >= endsAt).toBe(true);
+      expect(second.sent.map((s) => s.vaults)).toEqual([[vault]]);
+      expect(second.mined[0]!.bought).toEqual([expect.objectContaining({ vault, rewardTo: cold, dueSince: plan.startAt, inCommunityWindow: false })]);
+      expect(records.filter((r) => r.type === "skip_cleared" && r.vault === vault)).toEqual([expect.objectContaining({ code: "holders-first" })]);
+    },
+  );
 
   it("every record serialises to one JSON line, with the key and the fork's URL nowhere in it", () => {
     const redact = makeRedactor({ key: keeper.key, urls: [FORK_URL, process.env["SPDEX_FORK_RPC_URL"] ?? ""] });

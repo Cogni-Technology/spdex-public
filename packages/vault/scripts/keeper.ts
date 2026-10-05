@@ -16,9 +16,12 @@
  *   SPDEX_KEEPER_RPC_URL(_FILE)   the endpoint for reads (and sends, without a send URL). Required.
  *   SPDEX_KEEPER_SEND_URL(_FILE)  a private, revert-protected endpoint for sends only. Optional.
  *   SPDEX_KEEPER_KEY_FILE         the key; without one this is a dry run that never signs.
- *   SPDEX_KEEPER_REWARD_TO        where batch rewards go (default: the keeper itself).
+ *   SPDEX_KEEPER_REWARD_TO        where batch rewards go (default: the keeper itself). To be paid inside v2's
+ *                                 community windows it must be an account that held 690 SPX, proven.
  *   SPDEX_KEEPER_VAULTS           an allowlist, comma-separated (default: every listed vault).
  *   SPDEX_KEEPER_DATA_DIR         state, lease, heartbeat and logs (default ./.keeper/<chainId>).
+ *   SPDEX_KEEPER_PROVE            1: prove rewardTo's SPX to the registry before its proof lapses (default 0).
+ *   SPDEX_KEEPER_MIN_RUNWAY_DAYS  warn when the key's ether covers fewer days of sends (default 7; 0 never).
  *
  * Nothing is contacted but the endpoints configured here (and the optional
  * heartbeat URL), no URL or key is ever printed, and free text in the log is
@@ -46,6 +49,7 @@ import {
   newKeeperState,
   parseKeeperState,
   resetTraps,
+  rewardToOf,
   serializeKeeperState,
   settleInFlight,
   stampRecord,
@@ -123,6 +127,8 @@ const config = keeperConfig({
   ...(rewardTo ? { rewardTo } : {}),
   ...(settings.vaults ? { vaults: settings.vaults } : {}),
   privateSend: settings.sendPrivate,
+  prove: settings.prove,
+  gasPerVault: settings.gasPerVault,
   policy,
 });
 
@@ -249,8 +255,14 @@ emit({
   rewardTo,
   chainId,
   dryRun,
-  deployments: config.deployments.map((d) => ({ id: d.id, factory: d.factory.toLowerCase() as Address, batcher: d.batcher.toLowerCase() as Address })),
+  deployments: config.deployments.map((d) => ({
+    id: d.id,
+    factory: d.factory.toLowerCase() as Address,
+    batcher: d.batcher.toLowerCase() as Address,
+    registry: d.registry === null ? null : (d.registry.toLowerCase() as Address),
+  })),
   sendMode: config.privateSend ? "private" : "public",
+  prove: config.prove,
   sendWhen: policy.sendWhen,
   policy: { ...policy },
   version: packageVersion(),
@@ -264,6 +276,9 @@ if (settings.keyFile && (statSync(settings.keyFile).mode & 0o077) !== 0) {
 }
 for (const name of settings.unknown) {
   emit({ type: "warn", code: "unknown-setting", text: `${name} is not a setting this keeper reads, so it is ignored; docs/KEEPER.md lists them all` });
+}
+if (settings.prove && dryRun) {
+  emit({ type: "warn", code: "prove-dry-run", text: "SPDEX_KEEPER_PROVE is 1, but a dry run signs nothing: rewardTo is not proven, and its proof's lapse is only logged" });
 }
 for (const vault of has("--reset-trapped") ? resetTraps(state) : []) emit({ type: "untrapped", vault, why: "reset" });
 if (forget && !forgetVault(state, forget.toLowerCase() as Address)) console.error(`keeper: ${forget} was not known`);
@@ -280,6 +295,13 @@ try {
     if (await hasCode(d.factory)) onChain.push(d);
     else if (d === last) fail(`there is no spDEX vault factory at ${d.factory} on chain ${chainId}`);
     else emit({ type: "warn", code: "deployment-missing", text: `release ${d.id} has no factory on this chain; its vaults are skipped` });
+  }
+  // Without its registry a release's vaults find nobody eligible: their buys wait out each community window, then
+  // open to anyone. Not a reason to stop; a reason to say so.
+  for (const d of onChain) {
+    if (d.registry !== null && !(await hasCode(d.registry))) {
+      emit({ type: "warn", code: "registry-missing", text: `release ${d.id} has no SPX holder registry on this chain: nobody is eligible inside its community windows` });
+    }
   }
   const missingBatchers = async () => {
     const missing: string[] = [];
@@ -395,6 +417,10 @@ async function heartbeat(result: KeeperTickResult | null): Promise<void> {
   // how many were due, the runway — is unknown rather than zero.
   const pending = state.pending;
   const last = pending?.attempts.at(-1);
+  // After a failed tick, the proof's lapse is still known from the last read, though whether it is eligible now is not.
+  const lastRead = [...config.deployments]
+    .reverse()
+    .flatMap((d) => (d.registry !== null && state.eligibility[d.id]?.holder === rewardToOf(config) ? [state.eligibility[d.id]!] : []))[0];
   const health = result?.health ?? {
     ok: false,
     headLagSeconds: null,
@@ -405,6 +431,9 @@ async function heartbeat(result: KeeperTickResult | null): Promise<void> {
     lastBatchAt: state.lastBatch?.at ?? null,
     balanceWei: state.balanceWei,
     runwayDays: null,
+    eligible: null,
+    proofValidUntil: lastRead?.validUntil ?? null,
+    proofDaysLeft: null,
   };
   const body = {
     phase: result?.phase ?? "running",
@@ -417,6 +446,9 @@ async function heartbeat(result: KeeperTickResult | null): Promise<void> {
     balanceWei: health.balanceWei,
     runwayDays: health.runwayDays,
     attention,
+    eligible: health.eligible,
+    proofValidUntil: health.proofValidUntil,
+    proofDaysLeft: health.proofDaysLeft,
   } as const;
   if (writesFiles) {
     writeAtomic(

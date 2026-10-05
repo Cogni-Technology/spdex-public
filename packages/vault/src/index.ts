@@ -11,14 +11,34 @@
  * matter who: it holds one plan's budget (funded up to 0.5 ETH, as WETH) and
  * enforces the plan itself — which token, how much, how often, to whom, and a
  * price floor from Uniswap v3's own 10-minute average — so whoever calls
- * `execute` chooses only *when*, and only inside a window that is due. They are
- * paid a small fixed fee for it, the plan's buy fee (`keeperReward`, fixed at
- * creation; `fee.ts` has the app's default) — which makes triggering worth
- * someone's while, but does not make anyone do it: a plan runs while somebody
- * runs a keeper. Nobody, spDEX included, can change the terms or move the funds
- * except the owner, and the only stop is "close and withdraw". The full
- * reasoning, and what the price floor does and does not protect against, is at
- * the top of `contracts/SpdexDcaVault.sol`.
+ * `execute` chooses only *when*, inside a slot that is due, and who receives
+ * the caller's own fee: `execute(rewardTo)`. That fee is the plan's buy fee
+ * (`keeperReward`, fixed at creation; `fee.ts` has the app's default) — which
+ * makes triggering worth someone's while, but does not make anyone do it: a
+ * plan runs while somebody runs a keeper. Nobody, spDEX included, can change
+ * the terms or move the funds except the owner, and the only stop is "close
+ * and withdraw". The full reasoning, and what the price floor does and does not
+ * protect against, is at the top of `contracts/SpdexDcaVault.sol`.
+ *
+ * ## The community window, and every release
+ *
+ * For the first minutes after each buy falls due (`dueSince`, for the plan's
+ * `communityWindow` seconds), a v2 vault pays its fee only to its owner or to
+ * an SPX holder the ownerless registry vouches for (`registry.ts`); after
+ * that, to anyone, as v1 did (docs/V2_UPGRADE.md). The owner may always be
+ * paid, so "Trigger now" (`encodeTrigger`) works inside the window. A plan may
+ * also share its window's first half out in turns (`turnBuckets`); every plan
+ * the app creates has none until decision 29 calls for them.
+ *
+ * v1's factory, batcher and vaults stay on mainnet unchanged for good: a v1
+ * vault's `execute()` takes no argument and pays its caller. So everything
+ * here reads every release (`releases.ts`), and asks what a vault's source can
+ * do (`featuresOf`) rather than which release it is: terms and status are
+ * decoded with the source's own ABI — by their shape when nothing says which,
+ * never with one ABI that would silently drop a later source's trailing fields
+ * or refuse an earlier one's — events by their topic, and a vault is believed
+ * only when one of the listed factories (`DEPLOYMENTS`) vouches for it. New
+ * vaults are only ever created on the latest release.
  *
  * ## Markets and clones, in one paragraph each
  *
@@ -39,7 +59,8 @@
  * Nothing here signs, and nothing here decides whether a transaction is safe to
  * sign — that is the Guard's job, in the app. These are the encoders and
  * readers both the app and the keeper (`keeper.ts`) build on, with the buy fee
- * (`fee.ts`) and the batcher's (`batcher.ts`). Reads go through the `JsonRpc`
+ * (`fee.ts`), the batcher's (`batcher.ts`) and the SPX holder registry's
+ * (`registry.ts`). Reads go through the `JsonRpc`
  * the caller passes, which is always the user's own endpoint, and every figure
  * that cannot be read comes back as `null` — unknown, never zero. The keeper and
  * its report are not exported from here: they are operator tools, behind
@@ -71,39 +92,74 @@ import {
   type JsonRpc,
 } from "@spdex/chain";
 import {
+  CURRENT_SOURCE,
+  DEPLOYMENTS,
   DETERMINISTIC_DEPLOYER,
   FACTORY_ABI,
   FACTORY_LIMITS,
-  FACTORY_SALT,
   MAINNET_DEPLOYMENT,
+  SOURCES,
+  V1_FACTORY_ABI,
+  V1_MAINNET_DEPLOYMENT,
+  V1_VAULT_ABI,
   VAULT_ABI,
   VAULT_LIMITS,
+  batcherAddress,
+  batcherInitCode,
   factoryAddress,
   factoryInitCode,
+  registryAddress,
+  registryInitCode,
+  v1FactoryAddress,
+  v1FactoryInitCode,
   type FactoryDeployment,
   type Market,
+  type SourceId,
+  type V1FactoryDeployment,
 } from "./artifacts.js";
+import {
+  LATEST_RELEASE,
+  SOURCE_IDS_NEWEST_FIRST,
+  deploymentOf,
+  isListedBatcher,
+  latestReleaseOf,
+  releaseOfFactory,
+  sourceOfRelease,
+  type VaultRelease,
+} from "./releases.js";
 
 export * from "./artifacts.js";
+export * from "./releases.js";
 export * from "./batcher.js";
 export * from "./fee.js";
 export * from "./platform.js";
+export * from "./registry.js";
 /**
  * The keeper's pure planning, for the app's "Help run the network": which due
- * vaults a batch carries and the gas it is signed with. Only these, from the
- * one keeper module that reads nothing and signs nothing (keeper-plan.ts
- * imports types, the artifacts and the fee); the keeper itself stays behind
- * `@spdex/vault/keeper` (boundaries.test.ts).
+ * vaults a batch carries and the gas it is signed with, and when a buy's
+ * community window ends. Only these, from the one keeper module that reads
+ * nothing and signs nothing (keeper-plan.ts imports types, the artifacts and
+ * the fee); the keeper itself stays behind `@spdex/vault/keeper`
+ * (boundaries.test.ts).
  */
 export {
+  COMMUNITY_URGENT_SECONDS,
+  COMMUNITY_URGENT_SHORT_BELOW,
   DEFAULT_KEEPER_POLICY,
   MAX_BATCH_GAS_CEILING,
   RATIO_ONE,
   batchGasLimit,
+  communityWindowEndsAt,
   deadlineOf,
+  dueSinceAt,
   earliestBuyAt,
+  inCommunityWindow,
+  minGasPerAttempt,
   modelBatchGas,
   selectBatch,
+  slotStartAt,
+  turnEndsAtOf,
+  urgentFrom,
   windowOf,
   type BatchCandidate,
   type BatchSelection,
@@ -111,6 +167,32 @@ export {
   type KeeperPolicy,
   type SelectedVault,
 } from "./keeper-plan.js";
+
+// ─── Which source a vault's terms are ──────────────────────────────────────────
+
+/**
+ * The source terms of this shape belong to, newest first: the one whose terms
+ * carry exactly the fields these do (v1's no window, v2's a window and its
+ * turns). By shape, for a vault no listed factory has vouched for yet; once
+ * one has, its release's source is the answer (`VaultState.source`).
+ */
+export function sourceOfTerms(terms: Pick<VaultTerms, "communityWindow" | "turnBuckets">): SourceId {
+  for (const id of SOURCE_IDS_NEWEST_FIRST) {
+    const f = SOURCES[id].features;
+    if (f.communityWindow === (terms.communityWindow !== null) && f.turns === (terms.turnBuckets !== null)) return id;
+  }
+  throw new RangeError("these terms are no source's shape");
+}
+
+/**
+ * The newest release built from the source these terms' shape belongs to: the
+ * release a vault with them would be, if a listed factory made it. A best
+ * guess for a vault no factory has vouched for; the vouching factory's release
+ * is the answer once one has (`readVault`).
+ */
+export function releaseOfTerms(terms: Pick<VaultTerms, "communityWindow" | "turnBuckets">): VaultRelease {
+  return latestReleaseOf(sourceOfTerms(terms)) ?? LATEST_RELEASE;
+}
 
 // ─── Terms ────────────────────────────────────────────────────────────────────
 
@@ -128,23 +210,39 @@ export interface VaultTerms {
   oraclePool: Address;
   /** WETH (wei) per buy. */
   amountPerBuy: bigint;
-  /** Seconds between buy windows. */
+  /** Seconds between buy slots. */
   interval: bigint;
   maxBuys: bigint;
   /** Unix seconds, chain time. */
   startAt: bigint;
-  /** WETH (wei) paid to whoever triggers a buy. */
+  /**
+   * WETH (wei) paid for each buy: to the `rewardTo` its trigger names (v2), or
+   * to whoever called `execute` (v1).
+   */
   keeperReward: bigint;
   /**
    * Basis points a buy may pay above the oracle pool's price: the better, for
    * the owner, of its 10-minute average and its price now.
    */
   maxSlippageBps: bigint;
+  /**
+   * Seconds after each buy falls due during which its fee may be paid only to
+   * the owner or an eligible SPX holder: the community window. `null` for a v1
+   * vault, which has none and pays whoever calls.
+   */
+  communityWindow: bigint | null;
+  /**
+   * How many turns the window's first half is shared out in: 0 for none, 2 to
+   * `MAX_TURN_BUCKETS` for a plan with turns (`bucketOf`, `turnOf`). `null` for
+   * a vault whose source has no turns (v1).
+   */
+  turnBuckets: bigint | null;
 }
 
 /**
  * What `createVault` takes: a market, by its index in the factory's list, and
- * the plan. Nobody creating a vault names a pair, a pool or a token.
+ * the plan. Nobody creating a vault names a pair, a pool or a token. Only the
+ * latest release creates vaults, so a plan always has a community window.
  */
 export interface VaultPlan {
   marketIndex: bigint;
@@ -155,6 +253,17 @@ export interface VaultPlan {
   startAt: bigint;
   keeperReward: bigint;
   maxSlippageBps: bigint;
+  /**
+   * Seconds of first claim for SPX holders after each buy falls due: at least
+   * `MIN_COMMUNITY_WINDOW` (60), at most a quarter of the interval and
+   * `MAX_COMMUNITY_WINDOW` (an hour). `defaultCommunityWindow` is the app's.
+   */
+  communityWindow: bigint;
+  /**
+   * Turns in the window's first half: 0 for none, or 2 to `MAX_TURN_BUCKETS`.
+   * `DEFAULT_TURN_BUCKETS` is the app's: none, until decision 29 calls for them.
+   */
+  turnBuckets: bigint;
 }
 
 /** What a vault can ever hold: `maxBuys × (amountPerBuy + keeperReward)`. */
@@ -187,6 +296,8 @@ export function termsOfPlan(plan: VaultPlan, deployment: FactoryDeployment = MAI
     startAt: plan.startAt,
     keeperReward: plan.keeperReward,
     maxSlippageBps: plan.maxSlippageBps,
+    communityWindow: plan.communityWindow,
+    turnBuckets: plan.turnBuckets,
   };
 }
 
@@ -209,7 +320,102 @@ export function termsProblems(plan: VaultPlan, now: bigint, deployment: FactoryD
   }
   if (vaultBudget(plan) > L.MAX_FUNDING) problems.push("FundingCapExceeded");
   if (plan.startAt > now + L.MAX_START_DRIFT || plan.startAt + L.MAX_START_DRIFT < now) problems.push("StartOutOfRange");
+  if (plan.communityWindow < L.MIN_COMMUNITY_WINDOW || plan.communityWindow > maxCommunityWindow(plan.interval)) {
+    problems.push("CommunityWindowOutOfRange");
+  }
+  if (plan.turnBuckets < 0n || plan.turnBuckets === 1n || plan.turnBuckets > L.MAX_TURN_BUCKETS) problems.push("TurnsOutOfRange");
   return problems;
+}
+
+// ─── The community window's length ────────────────────────────────────────────
+
+/**
+ * The longest community window a plan with this interval may have, as the
+ * factory holds it: a quarter of the interval, rounded down, and never more
+ * than `MAX_COMMUNITY_WINDOW` (an hour). A window that long ends inside its
+ * slot and leaves the rest of it open to anyone (decisions 4 and 12 of
+ * docs/V2_UPGRADE.md). Every interval the factory accepts allows at least 75
+ * seconds, above `MIN_COMMUNITY_WINDOW`.
+ */
+export function maxCommunityWindow(interval: bigint): bigint {
+  const quarter = interval / 4n;
+  return quarter < VAULT_LIMITS.MAX_COMMUNITY_WINDOW ? quarter : VAULT_LIMITS.MAX_COMMUNITY_WINDOW;
+}
+
+/**
+ * The window the app gives a new plan (decision 3): 30 minutes, or a quarter
+ * of the interval when that is shorter — 75 seconds for a 5-minute plan, 15
+ * minutes for an hourly one, 30 for a daily one. Never below the minute the
+ * factory requires.
+ */
+export function defaultCommunityWindow(interval: bigint): bigint {
+  const quarter = interval / 4n;
+  const window = quarter < 1_800n ? quarter : 1_800n;
+  return window < VAULT_LIMITS.MIN_COMMUNITY_WINDOW ? VAULT_LIMITS.MIN_COMMUNITY_WINDOW : window;
+}
+
+/**
+ * The windows Expert may choose from (decision 26): 1, 5, 15, 30 and 60
+ * minutes, beside "a quarter of the interval" (`maxCommunityWindow`). A preset
+ * above `maxCommunityWindow(interval)` is one the factory would refuse, and the
+ * app offers it disabled.
+ */
+export const COMMUNITY_WINDOW_PRESETS: readonly bigint[] = [60n, 300n, 900n, 1_800n, 3_600n];
+
+// ─── Turns ────────────────────────────────────────────────────────────────────
+
+/**
+ * The turns the app gives a new plan: none. The vault can share each window's
+ * first half out in turns among buckets of holders (`turnBuckets`, 2 to
+ * `MAX_TURN_BUCKETS`), so that a bot needs 690 SPX in every bucket to have
+ * first claim on every buy; it ships unused, and the app turns it on for new
+ * plans, with no contract deployed, if decision 29 of docs/V2_UPGRADE.md
+ * trips: one `rewardTo` winning more than half the window buys for 30 days.
+ */
+export const DEFAULT_TURN_BUCKETS = 0n;
+
+/**
+ * The bucket `holder` is in on a plan with `turnBuckets` turns: the vault's
+ * own `bucketOf`, keccak256 of the address, ABI-encoded, modulo the buckets.
+ * 0 for a plan without turns, where every address is in the one bucket.
+ */
+export function bucketOf(holder: Address, turnBuckets: bigint): bigint {
+  if (turnBuckets === 0n) return 0n;
+  return BigInt(keccak256(encodeAbiParameters([{ type: "address" }], [holder]))) % turnBuckets;
+}
+
+/**
+ * The bucket whose eligible holders have first claim on `vault`'s buy in slot
+ * `slot` (counted from its start, as `Bought` counts it), for the first half of
+ * its window: the vault's own `turnOf`, keccak256 of the vault and the slot,
+ * ABI-encoded, modulo the buckets. 0 for a plan without turns.
+ */
+export function turnOf(vault: Address, slot: bigint, turnBuckets: bigint): bigint {
+  if (turnBuckets === 0n) return 0n;
+  return BigInt(keccak256(encodeAbiParameters([{ type: "address" }, { type: "uint256" }], [vault, slot]))) % turnBuckets;
+}
+
+/**
+ * Whether `rewardTo` may be paid for `vault`'s buy that fell due at `dueSince`,
+ * at `now`, as far as turns go: always for a plan without turns, for the
+ * owner, and from the turn's end (`dueSince + communityWindow / 2`); inside
+ * the turn, only for an address in the slot's bucket. Says nothing about
+ * eligibility, which is the registry's, nor about the window, which is
+ * `inCommunityWindow`'s.
+ */
+export function onTurn(input: {
+  vault: Address;
+  owner: Address;
+  rewardTo: Address;
+  terms: Pick<VaultTerms, "startAt" | "interval" | "communityWindow" | "turnBuckets">;
+  dueSince: bigint;
+  now: bigint;
+}): boolean {
+  const k = input.terms.turnBuckets ?? 0n;
+  const window = input.terms.communityWindow ?? 0n;
+  if (k === 0n || input.now >= input.dueSince + window / 2n || lower(input.rewardTo) === lower(input.owner)) return true;
+  const slot = (input.dueSince - input.terms.startAt) / input.terms.interval;
+  return bucketOf(lower(input.rewardTo), k) === turnOf(lower(input.vault), slot, k);
 }
 
 // ─── Encoding ─────────────────────────────────────────────────────────────────
@@ -223,13 +429,47 @@ export const encodeCreateVault = (plan: VaultPlan): Hex =>
   encodeFunctionData({
     abi: FACTORY_ABI,
     functionName: "createVault",
-    args: [plan.marketIndex, plan.amountPerBuy, plan.interval, plan.maxBuys, plan.startAt, plan.keeperReward, plan.maxSlippageBps],
+    args: [
+      plan.marketIndex,
+      plan.amountPerBuy,
+      plan.interval,
+      plan.maxBuys,
+      plan.startAt,
+      plan.keeperReward,
+      plan.maxSlippageBps,
+      plan.communityWindow,
+      plan.turnBuckets,
+    ],
   });
 
-/** The ether to fund with travels as the transaction's value; the calldata is only the selector. */
+/** The ether to fund with travels as the transaction's value; the calldata is only the selector. Both releases. */
 export const encodeFund = (): Hex => encodeFunctionData({ abi: VAULT_ABI, functionName: "fund" });
-export const encodeExecute = (): Hex => encodeFunctionData({ abi: VAULT_ABI, functionName: "execute" });
+
+/**
+ * A v2 vault's `execute(rewardTo)`: make the buy that is due, and pay its fee
+ * to `rewardTo`. Inside the buy's community window the vault refuses any
+ * `rewardTo` but its owner and an eligible SPX holder (`NotEligible`); after
+ * it, any address but zero and the vault itself. The one argument says who
+ * receives the caller's fee and nothing about the buy (decision 11).
+ */
+export const encodeExecute = (rewardTo: Address): Hex => encodeFunctionData({ abi: VAULT_ABI, functionName: "execute", args: [rewardTo] });
+
+/** A v1 vault's `execute()`, selector 0x61461954: make the buy that is due, and pay its fee to the caller. */
+export const encodeExecuteV1 = (): Hex => encodeFunctionData({ abi: V1_VAULT_ABI, functionName: "execute" });
+
+/**
+ * "Trigger now"'s calldata for a vault of any release: `execute(owner)` where
+ * its source takes `rewardTo` — the community window never refuses it, and it
+ * pays the fee back to the owner — or v1's `execute()`, which pays it to
+ * whoever sends it: the owner, when the owner triggers.
+ */
+export function encodeTrigger(vault: { release: VaultRelease; owner: Address }): Hex {
+  return sourceOfRelease(vault.release).features.executeTakesRewardTo ? encodeExecute(lower(vault.owner)) : encodeExecuteV1();
+}
+
+/** Every release. */
 export const encodeClose = (): Hex => encodeFunctionData({ abi: VAULT_ABI, functionName: "close" });
+/** Every release. */
 export const encodeRescue = (token: Address): Hex =>
   encodeFunctionData({ abi: VAULT_ABI, functionName: "rescue", args: [token] });
 
@@ -237,9 +477,10 @@ export const encodeRescue = (token: Address): Hex =>
  * The one-time, permissionless deployment of the factory for `deployment`, and
  * the address it will land at. Anyone may send it, and whoever does, the list
  * is the same. It succeeds while every listed market passes the factory's
- * listing checks; sent where the factory already exists, or while a market
- * fails a check, it reverts and changes nothing — and says nothing about why,
- * because the deterministic deployer reverts with no reason of its own.
+ * listing checks and the registry it names has code (`deployRegistryCall`
+ * first); sent where the factory already exists, or while a check fails, it
+ * reverts and changes nothing — and says nothing about why, because the
+ * deterministic deployer reverts with no reason of its own.
  * `simulateFactoryDeployment` asks first and names the check;
  * `vaultAvailability` offers this only when that passes.
  */
@@ -252,10 +493,103 @@ export function deployFactoryCall(deployment: FactoryDeployment = MAINNET_DEPLOY
   return {
     to: DETERMINISTIC_DEPLOYER,
     // The deterministic deployer's whole interface: 32 bytes of salt, then init code.
-    data: `0x${FACTORY_SALT.slice(2)}${factoryInitCode(deployment).slice(2)}` as Hex,
+    data: `0x${SOURCES[CURRENT_SOURCE].factorySalt.slice(2)}${factoryInitCode(deployment).slice(2)}` as Hex,
     value: 0n,
     factory: factoryAddress(deployment),
   };
+}
+
+/**
+ * The one-time, permissionless deployment of the SPX holder registry, and the
+ * address it lands at (`MAINNET_REGISTRY` on any chain with the deterministic
+ * deployer: it takes no constructor arguments). It goes first: a v2 factory's
+ * constructor refuses a registry with no code (`NotARegistry`). Sent where the
+ * registry already exists, it reverts and changes nothing.
+ */
+export function deployRegistryCall(): { to: Address; data: Hex; value: bigint; registry: Address } {
+  return {
+    to: DETERMINISTIC_DEPLOYER,
+    data: `0x${SOURCES[CURRENT_SOURCE].registrySalt!.slice(2)}${registryInitCode().slice(2)}` as Hex,
+    value: 0n,
+    registry: registryAddress(),
+  };
+}
+
+/**
+ * v1's factory, from its frozen source: deployed on mainnet at block
+ * 26,100,366, and deployable again only where it isn't — a fork of an earlier
+ * block, as the tests use. It lands at `V1_MAINNET_FACTORY` for v1's mainnet
+ * list, which is what proves the frozen source is v1's.
+ */
+export function deployV1FactoryCall(deployment: V1FactoryDeployment = V1_MAINNET_DEPLOYMENT): {
+  to: Address;
+  data: Hex;
+  value: bigint;
+  factory: Address;
+} {
+  return {
+    to: DETERMINISTIC_DEPLOYER,
+    data: `0x${SOURCES.v1.factorySalt.slice(2)}${v1FactoryInitCode(deployment).slice(2)}` as Hex,
+    value: 0n,
+    factory: v1FactoryAddress(deployment),
+  };
+}
+
+/** One transaction of a release's deployment, to the deterministic deployer. */
+export interface ReleaseDeploymentCall {
+  name: "registry" | "factory" | "batcher";
+  to: Address;
+  data: Hex;
+  value: bigint;
+  /** Where the contract lands. Deployed already when it has code there: skip the call. */
+  address: Address;
+}
+
+/**
+ * Every transaction that deploys a release, in the order they must be sent,
+ * from the release's own source and arguments (`DEPLOYMENTS`): its registry
+ * when it is its source's own, its factory (whose constructor checks the
+ * registry has code), and its batcher — v1's bound to its factory, or, from v2
+ * on, the one bound to no factory, which every such release shares and which
+ * needs nothing deployed before it. Anyone may send them; one whose contract
+ * is already there reverts and changes nothing, so a deployer skips each whose
+ * `address` has code. `deployment` replaces the release's own arguments (a
+ * fork's own market list, say); a registry other than the source's is left
+ * out, since deploying that one is its author's business.
+ */
+export function deployReleaseCalls(release: VaultRelease, deployment?: FactoryDeployment | V1FactoryDeployment): ReleaseDeploymentCall[] {
+  const recorded = deploymentOf(release);
+  const source = SOURCES[recorded.source];
+  const chain = {
+    weth: MAINNET_DEPLOYMENT.weth as Address,
+    uniswapV2Factory: MAINNET_DEPLOYMENT.uniswapV2Factory as Address,
+    uniswapV3Factory: MAINNET_DEPLOYMENT.uniswapV3Factory as Address,
+    markets: recorded.markets,
+  };
+  const args: FactoryDeployment | V1FactoryDeployment =
+    deployment ?? (recorded.registry === null ? chain : { ...chain, registry: recorded.registry });
+  const named: Address | null = "registry" in args ? lower((args as FactoryDeployment).registry) : null;
+  if (source.features.registry && named === null) throw new RangeError(`a ${recorded.source} deployment names its registry`);
+  const viaDeployer = (salt: Hex, initCode: Hex): Hex => `0x${salt.slice(2)}${initCode.slice(2)}` as Hex;
+  const calls: ReleaseDeploymentCall[] = [];
+  if (source.registrySalt !== null && named !== null) {
+    const registry = registryAddress(recorded.source);
+    if (named === registry) {
+      calls.push({ name: "registry", to: DETERMINISTIC_DEPLOYER, data: viaDeployer(source.registrySalt, registryInitCode(recorded.source)), value: 0n, address: registry });
+    }
+  }
+  const factory = factoryAddress(args, recorded.source);
+  calls.push({ name: "factory", to: DETERMINISTIC_DEPLOYER, data: viaDeployer(source.factorySalt, factoryInitCode(args, recorded.source)), value: 0n, address: factory });
+  // A batcher bound to no factory is built for WETH; v1's, for its factory.
+  const batcherArgument = source.features.sharedBatcher ? lower(args.weth) : factory;
+  calls.push({
+    name: "batcher",
+    to: DETERMINISTIC_DEPLOYER,
+    data: viaDeployer(source.batcherSalt, batcherInitCode(batcherArgument, recorded.source)),
+    value: 0n,
+    address: batcherAddress(batcherArgument, recorded.source),
+  });
+  return calls;
 }
 
 /** Whether the factory's deployment would succeed right now, and if not, why. */
@@ -309,6 +643,8 @@ export function describeListingRefusal(error: { name: string; args: readonly unk
       return "its market list is empty";
     case "NotAUniswapFactory":
       return "Uniswap's factories have no code on this chain";
+    case "NotARegistry":
+      return "the SPX holder registry it names has no code on this chain yet; it is deployed first";
     case "InvalidToken":
       return `${market} names WETH or no token at all`;
     case "DuplicateMarket":
@@ -355,18 +691,23 @@ export function implementationAddress(factory: Address): Address {
   return lower(getContractAddress({ opcode: "CREATE", from: factory, nonce: 1n }));
 }
 
-/** How many bytes of terms a vault's clone carries after its 45-byte proxy. */
-export const VAULT_ARGS_LENGTH = 112;
+/** How many bytes of terms a vault of the current source carries after its 45-byte proxy (117 for v2's). */
+export const VAULT_ARGS_LENGTH = SOURCES[CURRENT_SOURCE].vaultArgsLength;
+
+/** How many a v1 vault's carries: v2's without the community window and its turns. */
+export const V1_VAULT_ARGS_LENGTH = SOURCES.v1.vaultArgsLength;
 
 /**
  * A vault's terms as its clone carries them, packed: owner, tokenOut, pair,
  * oraclePool (20 bytes each), amountPerBuy, keeperReward, startAt (8 each),
- * interval (4), maxBuys, maxSlippageBps (2 each). `contracts/libraries/VaultArgs.sol`
- * is the source of this layout; the forge tests and the integration test hold
- * the two to agreement.
+ * interval (4), maxBuys, maxSlippageBps (2 each) — v1's 112 bytes — and for a
+ * v2 vault then its community window (4) and its turns (1), 117 in all. Which
+ * layout follows from the terms: v1's have neither. `contracts/libraries/VaultArgs.sol` is
+ * the source of this layout, and `releases/v1`'s copy of it of v1's; the forge
+ * tests and the integration tests hold the three to agreement.
  */
 export function encodeVaultArgs(owner: Address, terms: VaultTerms): Hex {
-  return encodePacked(
+  const v1 = encodePacked(
     ["address", "address", "address", "address", "uint64", "uint64", "uint64", "uint32", "uint16", "uint16"],
     [
       owner,
@@ -381,6 +722,9 @@ export function encodeVaultArgs(owner: Address, terms: VaultTerms): Hex {
       Number(terms.maxSlippageBps),
     ],
   );
+  const window = terms.communityWindow === null ? [] : [encodePacked(["uint32"], [Number(terms.communityWindow)])];
+  const turns = terms.turnBuckets === null ? [] : [encodePacked(["uint8"], [Number(terms.turnBuckets)])];
+  return concat([v1, ...window, ...turns]);
 }
 
 /** EIP-1167's runtime around the implementation's address. */
@@ -399,8 +743,11 @@ export function vaultRuntimeCode(implementation: Address, owner: Address, terms:
  * Where `factory` will put `owner`'s vault with this nonce and these terms —
  * the factory's `predictVault`, computed here without a round trip. `nonce` is
  * the factory's `nonces(owner)` before the creation (see `readVaultNonce`).
- * The address commits to every term, so a vault found there holds exactly
- * these.
+ * The address commits to every term, the community window included, so a vault
+ * found there holds exactly these. For either release: the implementation is
+ * the factory's own (`implementationAddress`), and the clone's layout follows
+ * from the terms, so v1 terms with v1's factory give a v1 vault's address
+ * (a v2 clone is 162 bytes, init code `0x6100a2…`; a v1 clone 157, `0x61009d…`).
  */
 export function predictVault(input: { factory: Address; owner: Address; nonce: bigint; terms: VaultTerms }): Address {
   const runtime = vaultRuntimeCode(implementationAddress(input.factory), input.owner, input.terms);
@@ -605,7 +952,9 @@ export interface OwnerVaults {
  * Every vault `owner` has created on `factory`, from the chain alone: the
  * factory's count (`nonces(owner)`), then its `VaultCreated` logs, which carry
  * the owner as an indexed topic, read backwards from the newest block until
- * every vault the factory counts is accounted for.
+ * every vault the factory counts is accounted for. One factory a search: an
+ * owner's vaults on v1's and v2's are two searches, each with its release's
+ * topic.
  *
  * This is how an owner gets back to a vault the app lost track of, because a
  * card was deleted, a config was replaced or wiped, or this is another
@@ -663,6 +1012,13 @@ export async function findVaultsByOwner(
     oldestBlock?: bigint;
     maxQueries?: number;
     known?: readonly { vault: Address; terms: VaultTerms }[];
+    /**
+     * The release `factory` belongs to, whose source decides the `VaultCreated`
+     * topic searched for: v1's and v2's differ, since v2's terms carry a window
+     * and its turns. By default `releaseOfFactory(factory)`, and the latest
+     * release for a factory spDEX doesn't list.
+     */
+    release?: VaultRelease;
   } = {},
 ): Promise<OwnerVaults> {
   const maxRange = options.maxRange ?? OWNER_SEARCH_RANGE;
@@ -699,7 +1055,8 @@ export async function findVaultsByOwner(
   const byRange = newest + 1n > maxRange ? newest + 1n - maxRange : 0n;
   const floor = options.oldestBlock !== undefined && options.oldestBlock > byRange ? options.oldestBlock : byRange;
   const windows = [chunk, ...OWNER_SEARCH_WINDOWS.filter((window) => window < chunk)];
-  const topics = [VAULT_CREATED_TOPIC, encodeAbiParameters([{ type: "address" }], [who])];
+  const release = options.release ?? releaseOfFactory(factory) ?? LATEST_RELEASE;
+  const topics = [VAULT_EVENT_TOPICS[sourceOfRelease(release).id].VaultCreated, encodeAbiParameters([{ type: "address" }], [who])];
 
   let to = newest;
   let windowIndex = 0;
@@ -739,8 +1096,6 @@ export async function findVaultsByOwner(
 
 const messageOf = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 
-const VAULT_CREATED_TOPIC = encodeEventTopics({ abi: FACTORY_ABI, eventName: "VaultCreated" })[0] as Hex;
-
 const hexBlock = (block: bigint): Hex => `0x${block.toString(16)}`;
 
 /**
@@ -759,12 +1114,62 @@ function newestFirst<T extends { blockNumber?: string; logIndex?: string }>(logs
 
 // ─── Decoding ─────────────────────────────────────────────────────────────────
 
-const EVENTS_ABI = [...FACTORY_ABI, ...VAULT_ABI].filter((item) => item.type === "event");
+/**
+ * Any source's factory and vault ABI items. A new source's ABIs join this
+ * union, so that its events decode with their own field names.
+ */
+type AnyVaultAbi = readonly (
+  | (typeof FACTORY_ABI)[number]
+  | (typeof VAULT_ABI)[number]
+  | (typeof V1_FACTORY_ABI)[number]
+  | (typeof V1_VAULT_ABI)[number]
+)[];
+
+/** Each source's factory and vault events. `Funded`, `Closed` and `Rescued` are the same in every one. */
+const EVENTS_ABI = Object.fromEntries(
+  SOURCE_IDS_NEWEST_FIRST.map((id) => [
+    id,
+    ([...SOURCES[id].factoryAbi, ...SOURCES[id].vaultAbi] as AnyVaultAbi).filter((item) => item.type === "event"),
+  ]),
+) as unknown as Record<SourceId, AnyVaultAbi>;
+
+const topicOf = (abi: readonly unknown[], eventName: string): Hex => encodeEventTopics({ abi: abi as never, eventName } as never)[0] as Hex;
+
+/**
+ * Every factory and vault event's topic, per source, so that nothing that
+ * filters logs by topic copies one by hand: `Bought` and `VaultCreated` differ
+ * between v1 and v2 (v2's carry `rewardTo` and `dueSince`, and the community
+ * window and its turns); `Funded`, `Closed` and `Rescued` are the same in both.
+ * A history reader that wants every buy asks for every source's `Bought` topic
+ * (`vaultTopicsOf`); a release's are its source's (`sourceOfRelease`).
+ */
+export const VAULT_EVENT_TOPICS = Object.fromEntries(
+  SOURCE_IDS_NEWEST_FIRST.map((id) => {
+    const { factoryAbi, vaultAbi } = SOURCES[id];
+    return [
+      id,
+      {
+        VaultCreated: topicOf(factoryAbi, "VaultCreated"),
+        Bought: topicOf(vaultAbi, "Bought"),
+        Funded: topicOf(vaultAbi, "Funded"),
+        Closed: topicOf(vaultAbi, "Closed"),
+        Rescued: topicOf(vaultAbi, "Rescued"),
+      },
+    ];
+  }),
+) as Record<SourceId, { VaultCreated: Hex; Bought: Hex; Funded: Hex; Closed: Hex; Rescued: Hex }>;
+
+/** Every source's topics for one event, each once: what a log filter for it, across releases, asks for. */
+export function vaultTopicsOf(name: "VaultCreated" | "Bought" | "Funded" | "Closed" | "Rescued"): Hex[] {
+  return [...new Set(SOURCE_IDS_NEWEST_FIRST.map((id) => VAULT_EVENT_TOPICS[id][name]))];
+}
 
 export type VaultEvent =
   | {
       name: "VaultCreated";
       emitter: Address;
+      /** Which source's factory event it is laid out as: v2's terms carry the community window and its turns. */
+      source: SourceId;
       owner: Address;
       vault: Address;
       marketIndex: bigint;
@@ -776,11 +1181,18 @@ export type VaultEvent =
   | {
       name: "Bought";
       emitter: Address;
+      /** Which source's vault event it is laid out as: v2's carries `rewardTo` and `dueSince`. */
+      source: SourceId;
       slot: bigint;
       amountIn: bigint;
       amountOut: bigint;
       /** Whoever called `execute`: a keeper's account, an owner, or a batcher. */
       keeper: Address;
+      /**
+       * Who was paid the fee: the `rewardTo` the trigger named (v2), or the
+       * caller (v1, which paid `msg.sender`: the same as `keeper`).
+       */
+      rewardTo: Address;
       reward: bigint;
       /** The least this buy was allowed to deliver: `quote()`'s floor at that moment. */
       floorOut: bigint;
@@ -788,6 +1200,12 @@ export type VaultEvent =
       buyNumber: bigint;
       /** The oracle pool's depth this buy was checked against, wei of WETH. */
       oracleDepth: bigint;
+      /**
+       * When the buy fell due, chain time: its community window ran from here
+       * for the plan's `communityWindow` seconds. `null` for v1, which has no
+       * window and never logged it.
+       */
+      dueSince: bigint | null;
     }
   | { name: "Closed"; emitter: Address; amount: bigint }
   | { name: "Rescued"; emitter: Address; token: Address; amount: bigint };
@@ -812,70 +1230,118 @@ export function checksumAddress(address: string): Address {
 }
 
 /**
- * One factory or vault log, decoded; `null` for anything else.
+ * One factory or vault log of any release, decoded, with which source's
+ * layout it is (`VaultCreated` and `Bought` say so); `null` for anything else.
  *
  * Returns null rather than guessing: an unrelated event with a colliding
  * signature from some other contract is not a buy. Which contract emitted it is
  * reported as `emitter`, and a caller that cares — the Guard does — must check
- * it is the factory or a vault the factory vouches for.
+ * it is a listed factory or a vault one vouches for.
  */
 export function decodeVaultEvent(log: RawLog): VaultEvent | null {
-  let decoded;
-  try {
-    decoded = decodeEventLog({
-      abi: EVENTS_ABI,
-      topics: log.topics as [Hex, ...Hex[]],
-      data: log.data as Hex,
-      strict: true,
-    });
-  } catch {
-    return null;
-  }
   const emitter = lower(log.address);
-  switch (decoded.eventName) {
-    case "VaultCreated": {
-      const { owner, vault, marketIndex, terms, funded } = decoded.args;
-      return {
-        name: "VaultCreated",
-        emitter,
-        owner: lower(owner),
-        vault: lower(vault),
-        marketIndex,
-        terms: normaliseTerms(terms),
-        funded,
-      };
+  // The newest source's layouts first; an older `Bought` or `VaultCreated` has
+  // another topic, and only its own source's layout decodes it. The events all
+  // share decode as the newest's.
+  for (const source of SOURCE_IDS_NEWEST_FIRST) {
+    let decoded;
+    try {
+      decoded = decodeEventLog({ abi: EVENTS_ABI[source], topics: log.topics as [Hex, ...Hex[]], data: log.data as Hex, strict: true });
+    } catch {
+      continue;
     }
-    case "Funded":
-      return { name: "Funded", emitter, amount: decoded.args.amount };
-    case "Bought": {
-      const { slot, amountIn, amountOut, keeper, reward, floorOut, buyNumber, oracleDepth } = decoded.args;
-      return { name: "Bought", emitter, slot, amountIn, amountOut, keeper: lower(keeper), reward, floorOut, buyNumber, oracleDepth };
+    switch (decoded.eventName) {
+      case "VaultCreated": {
+        const { owner, vault, marketIndex, terms, funded } = decoded.args;
+        return {
+          name: "VaultCreated",
+          emitter,
+          source,
+          owner: lower(owner),
+          vault: lower(vault),
+          marketIndex,
+          terms: termsFromAbi(terms),
+          funded,
+        };
+      }
+      case "Funded":
+        return { name: "Funded", emitter, amount: decoded.args.amount };
+      case "Bought": {
+        const { slot, amountIn, amountOut, keeper, reward, floorOut, buyNumber, oracleDepth } = decoded.args;
+        const v2 = "rewardTo" in decoded.args ? decoded.args : null;
+        return {
+          name: "Bought",
+          emitter,
+          source,
+          slot,
+          amountIn,
+          amountOut,
+          keeper: lower(keeper),
+          rewardTo: lower(v2 ? v2.rewardTo : keeper),
+          reward,
+          floorOut,
+          buyNumber,
+          oracleDepth,
+          dueSince: v2 ? v2.dueSince : null,
+        };
+      }
+      case "Closed":
+        return { name: "Closed", emitter, amount: decoded.args.amount };
+      case "Rescued":
+        return { name: "Rescued", emitter, token: lower(decoded.args.token), amount: decoded.args.amount };
+      default:
+        return null;
     }
-    case "Closed":
-      return { name: "Closed", emitter, amount: decoded.args.amount };
-    case "Rescued":
-      return { name: "Rescued", emitter, token: lower(decoded.args.token), amount: decoded.args.amount };
-    default:
-      return null;
   }
+  return null;
 }
 
 /**
- * A vault or factory revert, by the contract's own error name and arguments;
- * `null` when the data is not one of them (an out-of-gas, a pool's own
- * "OLD", a token's revert string). Named errors are what lets a keeper print
- * "not due until …" and the app "the price is outside your floor" instead of
- * a hex blob. A plan's terms are refused by the factory, a buy by the vault;
- * both are tried, and no selector is shared between them.
+ * Errors of the vendored proof verifier (Optimism's RLP reader), which the
+ * registry's ABI carries: each means the proof's bytes are not a proof of
+ * that block's state, however they were made.
+ */
+const PROOF_DECODING_ERRORS = new Set(["EmptyItem", "UnexpectedString", "InvalidDataRemainder", "UnexpectedList", "ContentLengthMismatch", "InvalidHeader"]);
+
+/** Solidity's panic for an index out of bounds, which the RLP reader raises on a list of more than 32 items. */
+const PANIC_INDEX_OUT_OF_BOUNDS = 0x32n;
+
+/**
+ * A vault, factory or SPX holder registry revert, by the contract's own error
+ * name and arguments, for v1 and v2 alike; `null` when the data is none of
+ * them (an out-of-gas, an empty revert). Named errors are what lets a keeper
+ * print "not due until …" and the app "the price is outside your floor"
+ * instead of a hex blob. A plan's terms are refused by the factory, a buy by
+ * the vault, a proof by the registry; all are tried. A revert string or a
+ * panic from elsewhere comes back as Solidity names it, `Error` or `Panic`.
+ *
+ * A proof the registry's vendored verifier cannot follow reverts with the
+ * verifier's own words — an `Error("MerkleTrie: …")`, one of its RLP errors,
+ * or `Panic(0x32)` — and all of those come back as one name,
+ * `ProofMismatch`, with what the verifier said as its argument: they mean one
+ * thing to anyone who sent the proof, that it does not match the block's
+ * state (`describeRegistryError` words it).
  */
 export function decodeVaultError(data: string): { name: string; args: readonly unknown[] } | null {
-  for (const abi of [VAULT_ABI, FACTORY_ABI]) {
+  const abis: (readonly unknown[])[] = [];
+  for (const id of SOURCE_IDS_NEWEST_FIRST) {
+    const { vaultAbi, factoryAbi, registryAbi } = SOURCES[id];
+    abis.push(vaultAbi, factoryAbi, ...(registryAbi === null ? [] : [registryAbi]));
+  }
+  for (const abi of abis) {
+    let decoded;
     try {
-      const decoded = decodeErrorResult({ abi, data: data as Hex });
-      return { name: decoded.errorName, args: decoded.args ?? [] };
+      decoded = decodeErrorResult({ abi: abi as typeof VAULT_ABI, data: data as Hex });
     } catch {
-      // Not this contract's; try the other.
+      // Not this contract's; try the next.
+      continue;
     }
+    const name = decoded.errorName as string;
+    const args = (decoded.args ?? []) as readonly unknown[];
+    if (PROOF_DECODING_ERRORS.has(name)) return { name: "ProofMismatch", args: [name] };
+    if (name === "Error" && typeof args[0] === "string" && args[0].startsWith("MerkleTrie:")) return { name: "ProofMismatch", args };
+    if (name === "Panic" && args[0] === PANIC_INDEX_OUT_OF_BOUNDS) return { name: "ProofMismatch", args: ["Panic(0x32)"] };
+    return { name, args };
   }
   return null;
 }
@@ -890,7 +1356,8 @@ export function decodeVaultError(data: string): { name: string; args: readonly u
  * `delegatecall` to make a genuine-looking clone on a market the factory never
  * listed (`test_r5b_runningTheFactoryCodeElsewhereNeverYieldsAVouchedVault`).
  * Only the factory's own logs say what the factory did, so this is the way to
- * read a creation, and `factory` should be one computed with `factoryAddress`.
+ * read a creation, and `factory` should be one computed with `factoryAddress`
+ * (or `v1FactoryAddress`, for v1's).
  */
 export function vaultsCreatedBy(factory: Address, logs: readonly RawLog[]): Extract<VaultEvent, { name: "VaultCreated" }>[] {
   const expected = lower(factory);
@@ -902,9 +1369,144 @@ export function vaultsCreatedBy(factory: Address, logs: readonly RawLog[]): Extr
   return created;
 }
 
+/**
+ * Who made a buy, as Your activity, a vault card's history and the keeper's
+ * report all say it:
+ *
+ * - `"owner"`: the owner's own trigger. In v2, paid back to the owner and sent
+ *   by the owner; in v1, called by the owner.
+ * - `"returned"`: v2, paid back to the owner by someone else. Anyone may make
+ *   a buy inside its window by naming the owner (the exception is for whoever
+ *   is paid, not whoever sends): the owner's fee came back, but it was not the
+ *   owner's doing, and is never shown as "you".
+ * - `"community"`: v2, paid to someone else inside its community window: an
+ *   SPX holder the registry vouched for at that moment.
+ * - `"open"`: v2, paid to someone else after its window, when anyone may be.
+ * - `"caller"`: v1, called by someone other than the owner: a keeper, a
+ *   batcher, anyone.
+ *
+ * `sender` is the transaction's sender when it is known; without it, `keeper`
+ * (the caller of `execute`) stands in, unless that is one of spDEX's batchers,
+ * which send for whoever calls them. `at` is the block's time. `source` is the
+ * source of the vault's layout (`Bought.source`), which says whether it paid
+ * `rewardTo` or its caller. `null` when anything this needs is unknown —
+ * never a guess.
+ */
+export type BuyMaker = "owner" | "returned" | "community" | "open" | "caller";
+
+export function buyMaker(input: {
+  source: SourceId;
+  owner: Address | null;
+  rewardTo: Address | null;
+  keeper: Address | null;
+  sender?: Address | null;
+  at: bigint | null;
+  dueSince: bigint | null;
+  communityWindow: bigint | null;
+}): BuyMaker | null {
+  const owner = input.owner === null ? null : lower(input.owner);
+  if (owner === null) return null;
+  if (!SOURCES[input.source].features.executeTakesRewardTo) {
+    if (input.keeper === null) return null;
+    return lower(input.keeper) === owner ? "owner" : "caller";
+  }
+  if (input.rewardTo === null) return null;
+  if (lower(input.rewardTo) === owner) {
+    const keeper = input.keeper === null ? null : lower(input.keeper);
+    const sender = input.sender ? lower(input.sender) : keeper !== null && !isListedBatcher(keeper) ? keeper : null;
+    if (sender === null) return null;
+    return sender === owner ? "owner" : "returned";
+  }
+  if (input.at === null || input.dueSince === null || input.communityWindow === null) return null;
+  return input.at < input.dueSince + input.communityWindow ? "community" : "open";
+}
+
 /** Terms with their addresses lowercased, as every reader here returns them. */
 export function normaliseTerms(terms: VaultTerms): VaultTerms {
   return { ...terms, tokenOut: lower(terms.tokenOut), pair: lower(terms.pair), oraclePool: lower(terms.oraclePool) };
+}
+
+/** Terms as an ABI decodes them, v1's without a window or turns, as `VaultTerms`. */
+function termsFromAbi(terms: Omit<VaultTerms, "communityWindow" | "turnBuckets"> & { communityWindow?: bigint; turnBuckets?: bigint }): VaultTerms {
+  return normaliseTerms({ ...terms, communityWindow: terms.communityWindow ?? null, turnBuckets: terms.turnBuckets ?? null });
+}
+
+/** How many words a source's view answers with: every output is a static word, the terms' tuple one per field. */
+function wordsOfOutput(id: SourceId, functionName: "terms" | "status"): number {
+  const abi = SOURCES[id].vaultAbi as readonly { type: string; name?: string; outputs?: readonly { components?: readonly unknown[] }[] }[];
+  const item = abi.find((i) => i.type === "function" && i.name === functionName) as
+    | { outputs: readonly { components?: readonly unknown[] }[] }
+    | undefined;
+  if (!item) return -1;
+  return item.outputs.reduce((sum, output) => sum + (output.components ? output.components.length : 1), 0);
+}
+
+/**
+ * The source whose `functionName` answers with this many words, newest first:
+ * how an answer is told apart when no factory says which source a vault is.
+ */
+function sourceByWords(functionName: "terms" | "status", words: number | null): SourceId | null {
+  if (words === null) return null;
+  return SOURCE_IDS_NEWEST_FIRST.find((id) => wordsOfOutput(id, functionName) === words) ?? null;
+}
+
+/**
+ * A vault's `terms()` answer, decoded with `source`'s ABI, or by its shape
+ * when `source` is not given: nine words are v1's terms (`communityWindow` and
+ * `turnBuckets` null), eleven v2's. `null` for anything else, "0x" included:
+ * not a vault's answer.
+ *
+ * By shape, because no one ABI reads every source: a later answer decoded with
+ * an earlier ABI silently loses its trailing fields, and an earlier one with a
+ * later ABI throws. Every read of an unknown vault's terms goes through here.
+ */
+export function decodeTerms(data: string | undefined, source?: SourceId): VaultTerms | null {
+  const id = source ?? sourceByWords("terms", wordsOf(data));
+  if (id === null || wordsOf(data) !== wordsOfOutput(id, "terms")) return null;
+  const abi = SOURCES[id].vaultAbi as typeof VAULT_ABI;
+  return decodeOr(data, (d) => termsFromAbi(decodeFunctionResult({ abi, functionName: "terms", data: d })));
+}
+
+/**
+ * A vault's `status()` answer, decoded with `source`'s ABI or by its shape, as
+ * `decodeTerms`: five words are v1's (no window: `dueSince`, `windowEndsAt`
+ * and the turn null), nine v2's. Zero for "no next buy", "no buy left" is
+ * reported as null, never as a time. `null` for anything else.
+ */
+export function decodeStatus(data: string | undefined, source?: SourceId): { source: SourceId; status: VaultStatus } | null {
+  const id = source ?? sourceByWords("status", wordsOf(data));
+  if (id === null || wordsOf(data) !== wordsOfOutput(id, "status")) return null;
+  const features = SOURCES[id].features;
+  return decodeOr(data, (d) => {
+    const answer = decodeFunctionResult({
+      abi: SOURCES[id].vaultAbi as typeof VAULT_ABI,
+      functionName: "status",
+      data: d,
+    }) as readonly [boolean, bigint, bigint, bigint, boolean, bigint?, bigint?, bigint?, bigint?];
+    const [due, nextBuyAt, buysLeft, wethBalance, funded, dueSince, windowEndsAt, turnEndsAt, turn] = answer;
+    const known = (t: bigint | undefined) => (t === undefined || t === 0n ? null : t);
+    const noneLeft = buysLeft === 0n;
+    return {
+      source: id,
+      status: {
+        due,
+        nextBuyAt: known(nextBuyAt),
+        buysLeft,
+        wethBalance,
+        funded,
+        dueSince: known(dueSince),
+        windowEndsAt: known(windowEndsAt),
+        turnEndsAt: features.turns && !noneLeft ? known(turnEndsAt) : null,
+        turn: features.turns && !noneLeft && turn !== undefined ? turn : null,
+      },
+    };
+  });
+}
+
+/** How many 32-byte words an answer is; null for one that isn't whole words. */
+function wordsOf(data: string | undefined): number | null {
+  if (typeof data !== "string" || !/^0x(?:[0-9a-fA-F]{64})*$/.test(data)) return null;
+  return (data.length - 2) / 64;
 }
 
 // ─── Reading a vault ──────────────────────────────────────────────────────────
@@ -912,10 +1514,11 @@ export function normaliseTerms(terms: VaultTerms): VaultTerms {
 export interface VaultStatus {
   /**
    * Every check `execute` makes except the price floor passes right now: not
-   * closed, a buy left, the window open and the last buy far enough back, the
+   * closed, a buy left, the slot open and the last buy far enough back, the
    * budget there, and the oracle pool answering with `MIN_ORACLE_DEPTH` behind
    * it. Whether the price is inside the floor is the quote's question, and a
-   * moment's; `whyNotNow` puts the two together.
+   * moment's; `whyNotNow` puts the two together. Says nothing about who may be
+   * paid: inside the community window that is the registry's question.
    */
   due: boolean;
   /**
@@ -933,10 +1536,39 @@ export interface VaultStatus {
   wethBalance: bigint;
   /** Whether that covers the next buy and its reward. */
   funded: boolean;
+  /**
+   * When the next buy falls (or fell) due, chain time, the moment its community
+   * window is measured from: `nextBuyAt` until then, and from then on the later
+   * of that and the start of the slot the chain's clock is in. `null` for a v1
+   * vault, which has no window, and when no buy is left.
+   */
+  dueSince: bigint | null;
+  /**
+   * `dueSince + communityWindow`: until this moment the fee can be paid only to
+   * the owner or an eligible SPX holder; from it, to anyone. `null` as
+   * `dueSince`.
+   */
+  windowEndsAt: bigint | null;
+  /**
+   * Until this moment, inside the window, a `rewardTo` other than the owner
+   * must also be in the bucket `turn`: `dueSince + communityWindow / 2` for a
+   * plan with turns, `dueSince` (no turn) for one without. `null` for a vault
+   * whose source has no turns, and when no buy is left.
+   */
+  turnEndsAt: bigint | null;
+  /** The bucket with first claim on the next buy until `turnEndsAt`; 0 without turns; `null` as `turnEndsAt`. */
+  turn: bigint | null;
 }
 
 export interface VaultState {
   address: Address;
+  /**
+   * Which release the vault is: the vouching factory's, when one does; else
+   * the newest release built from the source its answers are shaped as.
+   */
+  release: VaultRelease;
+  /** The source its answers are shaped as, which says what it can do (`SOURCES[source].features`). */
+  source: SourceId;
   owner: Address;
   terms: VaultTerms;
   closed: boolean;
@@ -944,6 +1576,12 @@ export interface VaultState {
   /** Everything delivered to the owner, raw `tokenOut` units, measured at the owner. */
   totalOut: bigint;
   totalRewards: bigint;
+  /**
+   * Buys made inside their community window and paid to someone other than
+   * the owner: the community's. `null` for a v1 vault, which has no window, and
+   * when it could not be read.
+   */
+  windowBuys: bigint | null;
   status: VaultStatus;
   /**
    * What a buy would deliver now, the least it may, and the depth (wei of
@@ -953,8 +1591,14 @@ export interface VaultState {
    * not that the floor is zero.
    */
   quote: { spotOut: bigint; floorOut: bigint; oracleDepth: bigint } | null;
-  /** Whether the factory vouches for this vault; `null` when no factory was asked. */
+  /**
+   * Whether a factory asked vouches for this vault (`isVault`): true when one
+   * does, false when every one asked answered no, `null` when none was asked
+   * or one could not be read and none said yes.
+   */
   fromFactory: boolean | null;
+  /** The factory that vouches for it, lowercase; `null` when none asked does, or it is unknown. */
+  factory: Address | null;
   /**
    * The timestamp of the block every figure here was read at: the vault's own
    * clock, which is what `nextBuyAt` and any countdown must be compared with —
@@ -967,20 +1611,31 @@ export interface VaultState {
 type Reader = Pick<Multicall3Reader, "multicall">;
 
 /**
- * A vault's terms, progress, status and price, whether the factory created
- * it, and the chain's time — one Multicall3 round trip at the latest block, so
- * every figure describes the same moment.
+ * A vault's terms, progress, status and price, whether a factory created it,
+ * and the chain's time — one Multicall3 round trip at the latest block, so
+ * every figure describes the same moment. For a vault of either release: its
+ * terms and status are decoded by their shape (`decodeTerms`, `decodeStatus`),
+ * and `windowBuys`, which v1 has not, is asked anyway and read as unknown
+ * there.
  *
- * Returns `null` when the address does not answer `terms()` the way a vault
- * does: no code, or something else's. A vault whose oracle is momentarily
- * unable to answer still reads, with `quote: null`.
+ * Which factories are asked whether they made it: `factories`, or the one
+ * `factory`, or by default every release's (`DEPLOYMENTS`), so a v1 vault read
+ * by an app that creates v2 vaults is still recognised as spDEX's — one more
+ * call each. A vault the factories vouch for is decoded with its release's
+ * source's ABI, and must answer in that shape.
+ *
+ * Returns `null` when the address does not answer `terms()` and `status()`
+ * the way a vault of one release does: no code, something else's, or answers
+ * of two different releases. A vault whose oracle is momentarily unable to
+ * answer still reads, with `quote: null`.
  */
 export async function readVault(
   rpc: JsonRpc,
   vault: Address,
-  options: { factory?: Address; reader?: Reader } = {},
+  options: { factories?: readonly Address[]; factory?: Address; reader?: Reader } = {},
 ): Promise<VaultState | null> {
   const reader = options.reader ?? new Multicall3Reader(rpc);
+  const factories = (options.factories ?? (options.factory ? [options.factory] : DEPLOYMENTS.map((d) => d.factory))).map(lower);
   const call = (functionName: VaultView) => ({
     to: vault,
     data: encodeFunctionData({ abi: VAULT_ABI, functionName }),
@@ -988,18 +1643,27 @@ export async function readVault(
   const calls = VAULT_VIEWS.map(call);
   // Multicall3's own view of the block it runs in: the time `status()` judged by.
   calls.push({ to: CONTRACTS.multicall3, data: encodeFunctionData({ abi: MULTICALL3_CLOCK_ABI, functionName: "getCurrentBlockTimestamp" }) });
-  if (options.factory) {
-    calls.push({
-      to: options.factory,
-      data: encodeFunctionData({ abi: FACTORY_ABI, functionName: "isVault", args: [vault] }),
-    });
+  for (const factory of factories) {
+    calls.push({ to: factory, data: encodeFunctionData({ abi: FACTORY_ABI, functionName: "isVault", args: [vault] }) });
   }
   const results = await reader.multicall(calls);
   // A failed call comes back as "0x" (see Multicall3Reader), and so does a
   // reply that does not decode as a vault's: both mean "not known", never zero.
-  const known = <T>(name: VaultView, decode: (data: Hex) => T): T | null => decodeOr(results[VAULT_VIEWS.indexOf(name)], decode);
+  const raw = (name: VaultView): string | undefined => results[VAULT_VIEWS.indexOf(name)];
+  const known = <T>(name: VaultView, decode: (data: Hex) => T): T | null => decodeOr(raw(name), decode);
 
-  const terms = known("terms", (data) => decodeFunctionResult({ abi: VAULT_ABI, functionName: "terms", data }));
+  const answers = factories.map((factory, i) => ({
+    factory,
+    vouched: decodeOr(results[VAULT_VIEWS.length + 1 + i], (data) => decodeFunctionResult({ abi: FACTORY_ABI, functionName: "isVault", data })),
+  }));
+  const vouching = answers.find((answer) => answer.vouched === true) ?? null;
+  const fromFactory = vouching ? true : answers.length > 0 && answers.every((answer) => answer.vouched === false) ? false : null;
+  const vouchingRelease = vouching ? releaseOfFactory(vouching.factory) : null;
+  // The vouching factory's source, when it is a listed one; else whatever shape the answers have.
+  const expectedSource = vouchingRelease === null ? undefined : deploymentOf(vouchingRelease).source;
+
+  const terms = decodeTerms(raw("terms"), expectedSource);
+  const status = decodeStatus(raw("status"), expectedSource);
   const owner = known("owner", (data) => decodeFunctionResult({ abi: VAULT_ABI, functionName: "owner", data }));
   const closed = known("closed", (data) => decodeFunctionResult({ abi: VAULT_ABI, functionName: "closed", data }));
   const buysDone = known("buysDone", (data) => decodeFunctionResult({ abi: VAULT_ABI, functionName: "buysDone", data }));
@@ -1007,49 +1671,65 @@ export async function readVault(
   const totalRewards = known("totalRewards", (data) =>
     decodeFunctionResult({ abi: VAULT_ABI, functionName: "totalRewards", data }),
   );
-  const status = known("status", (data) => decodeFunctionResult({ abi: VAULT_ABI, functionName: "status", data }));
   if (
     terms === null ||
+    status === null ||
     owner === null ||
     closed === null ||
     buysDone === null ||
     totalOut === null ||
-    totalRewards === null ||
-    status === null
+    totalRewards === null
   ) {
     return null;
   }
+  const source = sourceOfTerms(terms);
+  // A vault answers both in its own source's shape; anything else is not one.
+  if (status.source !== source) return null;
+  const release = vouchingRelease ?? latestReleaseOf(source) ?? LATEST_RELEASE;
   const quote = known("quote", (data) => decodeFunctionResult({ abi: VAULT_ABI, functionName: "quote", data }));
+  const windowBuys = SOURCES[source].features.communityWindow
+    ? known("windowBuys", (data) => BigInt(decodeFunctionResult({ abi: VAULT_ABI, functionName: "windowBuys", data })))
+    : null;
 
   const chainTime = decodeOr(results[VAULT_VIEWS.length], (data) =>
     decodeFunctionResult({ abi: MULTICALL3_CLOCK_ABI, functionName: "getCurrentBlockTimestamp", data }),
   );
 
-  let fromFactory: boolean | null = null;
-  if (options.factory) {
-    const raw = results[VAULT_VIEWS.length + 1] as Hex | undefined;
-    fromFactory =
-      raw && raw !== "0x" ? decodeFunctionResult({ abi: FACTORY_ABI, functionName: "isVault", data: raw }) : null;
-  }
-
-  const [due, nextBuyAt, buysLeft, wethBalance, funded] = status;
   return {
     address: lower(vault),
+    release,
+    source,
     owner: lower(owner),
-    terms: normaliseTerms(terms),
+    terms,
     closed,
     buysDone: BigInt(buysDone),
     totalOut,
     totalRewards,
-    status: { due, nextBuyAt: nextBuyAt === 0n ? null : nextBuyAt, buysLeft, wethBalance, funded },
+    windowBuys,
+    status: status.status,
     quote: quote === null ? null : { spotOut: quote[0], floorOut: quote[1], oracleDepth: quote[2] },
     fromFactory,
+    factory: vouching?.factory ?? null,
     chainTime,
   };
 }
 
-const VAULT_VIEWS = ["terms", "owner", "closed", "buysDone", "totalOut", "totalRewards", "status", "quote"] as const;
+const VAULT_VIEWS = ["terms", "owner", "closed", "buysDone", "totalOut", "totalRewards", "status", "quote", "windowBuys"] as const;
 type VaultView = (typeof VAULT_VIEWS)[number];
+
+/**
+ * A v2 vault's next buy's community window at the moment it was read: when the
+ * buy fell (or falls) due, when the window ends, and whether the chain's clock
+ * is inside it — due, and before its end — which is when a vault card says
+ * "Community window until 14:32, then open to anyone". `null` for a v1 vault,
+ * one with no buy left, and an unknown chain time.
+ */
+export function vaultCommunityWindow(state: Pick<VaultState, "status" | "chainTime">): { dueSince: bigint; endsAt: bigint; inWindow: boolean } | null {
+  const { dueSince, windowEndsAt, nextBuyAt } = state.status;
+  if (dueSince === null || windowEndsAt === null || state.chainTime === null) return null;
+  const due = nextBuyAt !== null && state.chainTime >= nextBuyAt;
+  return { dueSince, endsAt: windowEndsAt, inWindow: due && state.chainTime < windowEndsAt };
+}
 
 const MULTICALL3_CLOCK_ABI = parseAbi(["function getCurrentBlockTimestamp() view returns (uint256)"]);
 
@@ -1152,39 +1832,43 @@ export function fundingRoom(state: Pick<VaultState, "terms" | "status">): bigint
 
 /**
  * Gas one `execute` transaction uses, all in (the 21,000 base included), for a
- * buy of SPX made on its own, at its dearest (a first buy on a busy pool): what
- * "Trigger now"'s gas limit is sized from (`KEEPER_MIN_EXECUTE_GAS_LIMIT`), not
- * what a buy costs. A keeper sends buys only in batches, where a buy costs
- * less; the buy fee is priced from that (`fee.ts`).
+ * buy of SPX made on its own, at its dearest (a v2 vault's first buy on a busy
+ * pool, inside its community window and paid to an eligible holder, so the
+ * registry is asked from cold): what "Trigger now"'s gas limit is sized from
+ * (`KEEPER_MIN_EXECUTE_GAS_LIMIT`), not what a buy costs. A keeper sends buys
+ * only in batches, where a buy costs less; the buy fee is priced from that
+ * (`fee.ts`). It covers v1's buys too, which cost less.
  *
  * Pinned twice, each failing if a real buy needs more: the quiet-pool path by
  * `test/integration/vault.test.ts`, a real transaction on the local fork, and
  * the busy-pool path — the dear one — by `test/forge/Gas.t.sol`, which trades
- * on the pool first and measures from cold. Four things move it:
+ * on the pool first and measures from cold: 312,751 for v2 (v1's was
+ * 301,163). Five things move it:
  *
  * - **Whether slots are written from zero.** A vault's first buy pays an owner
- *   who may never have held SPX and a caller who may never have held WETH, and
- *   writes the vault's own counters for the first time: 247,300 measured on the
- *   fork with a quiet pool, and 300,300 with a busy one (at most: the forge
- *   figure counts 2,500 a transaction does not pay). A later buy writes fewer
- *   slots from zero and costs about 70,000 less.
+ *   who may never have held SPX and a `rewardTo` who may never have held
+ *   WETH, and writes the vault's own counters for the first time. A later buy
+ *   writes fewer slots from zero and costs about 70,000 less.
  * - **The clone.** Every call goes through the vault's 45-byte proxy to the
  *   shared implementation and reads the terms back from the clone's code: about
- *   5,000 more than the full contract per vault that phase 5a deployed (242,500
- *   for the same first buy), which is what creating a vault for about 175,000
- *   rather than 2.3 million costs at each buy.
+ *   5,000 more than a full contract per vault, which is what creating a vault
+ *   for about 177,000 rather than 2.3 million costs at each buy.
  * - **How busy the oracle pool has been.** When the pool traded within the last
  *   ten minutes, `observe` binary-searches the 1,800 observations it keeps,
  *   about 68,000 gas on its own; when it has not, the answer extends its latest
- *   observation, about 11,000. That is the spread in each range above, and the
- *   busy case is the usual one for SPX on mainnet.
+ *   observation, about 11,000. That is the spread between the quiet and busy
+ *   figures, and the busy case is the usual one for SPX on mainnet.
+ * - **The community window.** Inside it, a `rewardTo` other than the owner
+ *   costs the registry's check: about 9,500 cold, 12,000 for an address whose
+ *   account is cold too. Trigger now pays the owner, so the registry is never
+ *   asked; after the window nobody is.
  * - **The pool's price now**, read beside the average so the floor can follow a
  *   market that has just moved in the owner's favour: a few thousand.
  *
  * SPX's own transfer is about 64,000 into a new holder. A token with a heavier
  * transfer costs more; this sizes a gas limit, it does not promise one.
  */
-export const EXECUTE_GAS = 320_000n;
+export const EXECUTE_GAS = 330_000n;
 
 /**
  * The gas limit a wallet signs an `execute` sent on its own with, as a share
@@ -1195,27 +1879,29 @@ export const EXECUTE_GAS = 320_000n;
 export const KEEPER_GAS_HEADROOM_BPS = 12_000n;
 
 /**
- * The gas the batcher gives each vault's `execute`, mirrored from its
- * `EXECUTE_GAS_CAP` (`BATCHER_LIMITS`, held equal by a unit test): well above
- * an honest buy of SPX (the dearest, a first buy on a busy pool, estimates at
- * about 306,700), and far below what a hostile vault would like a keeper to
- * burn. A vault can be built to look cheap and successful in a simulation and
- * then spend every unit of gas it is given in a real transaction; this is what
- * bounds that loss.
+ * The gas a keeper's batch gives each vault's `execute`: the batcher's least,
+ * `MIN_EXECUTE_GAS` (`BATCHER_LIMITS`, held equal by a unit test), which v1's
+ * batcher gave as its fixed `EXECUTE_GAS_CAP`. The batcher from v2 on takes it
+ * as an argument, so a fork that reprices a buy past it needs a new figure
+ * here, not a new batcher. Well above an honest buy of SPX (the dearest, a first buy
+ * on a busy pool, estimates at about 319,200), and far below what a hostile
+ * vault would like a keeper to burn. A vault can be built to look cheap and
+ * successful in a simulation and then spend every unit of gas it is given in a
+ * real transaction; this is what bounds that loss.
  */
 export const MAX_EXECUTE_GAS_LIMIT = 400_000n;
 
 /**
  * The least gas limit an `execute` sent on its own — the owner's "Trigger now"
- * — is signed with: `EXECUTE_GAS` plus a wallet's headroom, 384,000.
+ * — is signed with: `EXECUTE_GAS` plus a wallet's headroom, 396,000.
  *
  * An estimate describes the pool as it was when it was made. A buy estimated
  * on a quiet pool, with a trade landing on the pool first, takes the busy path
- * in the block: 57,000 more, which a quiet estimate's 20% does not cover (a
- * first buy estimates at about 253,700 quiet and needs about 306,700 busy). It
- * would run out of gas, having used all of it, and the owner would still pay
- * for the gas. Unused gas is refunded, so the floor costs nothing when it is
- * not needed.
+ * in the block: about 57,000 more, which a quiet estimate's 20% does not cover
+ * (a first buy estimates at about 265,000 quiet and needs about 319,000 busy).
+ * It would run out of gas, having used all of it, and the owner would still
+ * pay for the gas. Unused gas is refunded, so the floor costs nothing when it
+ * is not needed.
  */
 export const KEEPER_MIN_EXECUTE_GAS_LIMIT = (EXECUTE_GAS * KEEPER_GAS_HEADROOM_BPS) / 10_000n;
 
@@ -1261,6 +1947,13 @@ export interface VaultAvailability {
   factory: Address;
   /** Whether it is deployed on this chain; `null` when the endpoint would not say. */
   factoryDeployed: boolean | null;
+  /**
+   * Whether the SPX holder registry the factory names is deployed: `true`
+   * whenever the factory is, whose constructor refused a registry without
+   * code; asked only while the factory isn't. `null` when the endpoint would
+   * not say.
+   */
+  registryDeployed: boolean | null;
   /**
    * Whether its one-time deployment (`deployFactoryCall`) would succeed right
    * now, from `simulateFactoryDeployment`: offer it only when this is `true`.
@@ -1314,8 +2007,11 @@ export interface VaultAvailability {
  *
  * An undeployed factory makes `available` false. Its deployment is one
  * permissionless transaction (`deployFactoryCall`), which succeeds only while
- * every listed market passes the listing checks, so it is simulated first and
- * the reason says whether it can be sent and, if not, which check refuses it.
+ * every listed market passes the listing checks and the SPX holder registry it
+ * names has code, so it is simulated first and the reason says whether it can
+ * be sent and, if not, which check refuses it. While the registry is missing
+ * too, that is the reason given: its deployment (`deployRegistryCall`) comes
+ * first, and the factory's can't be judged until it is there.
  */
 export async function vaultAvailability(
   rpc: JsonRpc,
@@ -1333,7 +2029,19 @@ export async function vaultAvailability(
     factoryDeployed = null;
   }
   let factoryDeployable: boolean | null = null;
+  let registryDeployed: boolean | null = factoryDeployed === true ? true : null;
   if (factoryDeployed === false) {
+    try {
+      registryDeployed = ((await rpc("eth_getCode", [lower(deployment.registry), "latest"])) as string) !== "0x";
+    } catch {
+      registryDeployed = null;
+    }
+  }
+  if (factoryDeployed === false && registryDeployed === false) {
+    reasons.push(
+      "the vault factory is not deployed on this chain yet, nor the SPX holder registry it needs first; deploying the registry, then the factory, is two transactions anyone can send",
+    );
+  } else if (factoryDeployed === false) {
     let check: FactoryDeploymentCheck | null;
     try {
       check = await simulateFactoryDeployment(rpc, deployment);
@@ -1359,6 +2067,7 @@ export async function vaultAvailability(
       available: false,
       factory,
       factoryDeployed,
+      registryDeployed,
       factoryDeployable,
       market: null,
       marketHealthy: null,
@@ -1378,6 +2087,7 @@ export async function vaultAvailability(
     available: factoryDeployed === true && healthy === true,
     factory,
     factoryDeployed,
+    registryDeployed,
     factoryDeployable,
     market,
     marketHealthy: healthy,

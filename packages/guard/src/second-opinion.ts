@@ -857,7 +857,8 @@ export function compareOutcomes(main: SimulationOutcome, second: SimulationOutco
  *   warning `SECOND_OPINION_UNAVAILABLE`, or is refused with that code where
  *   the path never signs unchecked (`neverUnchecked`): under
  *   `requireSimulation`, a Permit2 grant, a vault transaction that sends
- *   ether, and a batch of vault buys.
+ *   ether, and a batch of vault buys. A proof of SPX held is not among them:
+ *   it moves no money, and follows `requireSimulation` as closing does.
  * - `uncompared` (the main service failed first): a refusal stays one, and so
  *   does a difference between the two services' unpinned test-runs; a pass
  *   becomes `SIMULATION_UNAVAILABLE`, `unverified` or refused as above.

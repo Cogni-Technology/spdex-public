@@ -28,7 +28,8 @@
  * each visible line is one short sentence or one line of figures, and the
  * reasons behind it are one tap away (a `Term`, or the closed "How auto-buy
  * works"). What must never be a tap away stays visible: UNAUDITED and the
- * 0.5 ETH cap; that anyone can trigger a vault's buy and nobody has to; that
+ * 0.5 ETH cap; that anyone can trigger a vault's buy, SPX holders first for its
+ * community window, and nobody has to; that
  * only closing it stops it; who the buy fee is paid to; that missed times are
  * skipped and the plan ends later; that a plan you confirm needs spDEX open;
  * and every refusal.
@@ -73,7 +74,15 @@ import {
 } from "../../lib/dca/form.js";
 import { tokenFor } from "../../lib/dca/format.js";
 import { VAULT_FACTORY_ACTIVITY, type AutoBuy, type AutoBuyDeps } from "../../lib/dca/useAutoBuy.js";
-import { DEFAULT_VAULT_SLIPPAGE_BPS, vaultCapText } from "../../lib/dca/vault.js";
+import {
+  DEFAULT_VAULT_SLIPPAGE_BPS,
+  vaultCapText,
+  vaultWindowChoiceOf,
+  vaultWindowOf,
+  vaultWindowOptions,
+  vaultWindowValue,
+  type VaultWindowChoice,
+} from "../../lib/dca/vault.js";
 import { GLOSSARY, tokenOptionText } from "../../lib/names.js";
 import { networkLabel } from "../../lib/networks.js";
 import { formatAmount, TOKEN_LIST } from "../../lib/tokens.js";
@@ -92,6 +101,8 @@ import { SayingLine } from "../culture/SayingLine.js";
 import { AllowanceHint, UnauditedBadge, VaultFactorySetup, WithKeeperTerm } from "./VaultCard.js";
 import {
   allowanceText,
+  COMMUNITY_WINDOW_HINT,
+  communityWindowLine,
   FEE_PAYEE,
   SIGNER_CHOICE_TITLES,
   VAULT_SLIPPAGE_OPTIONS as SLIPPAGE_OPTIONS,
@@ -101,8 +112,10 @@ import {
   vaultFeeNotes,
   vaultSetupText,
   walletFeeText,
+  windowOptionLabel,
 } from "./vaultCopy.js";
-import { BUY_FEE_CEILING_BPS } from "@spdex/vault";
+import { BUY_FEE_CEILING_BPS, LATEST_RELEASE } from "@spdex/vault";
+import { RegistryAdvisory } from "../network/RegistryAdvisory.js";
 import { bpsPercentText } from "../../lib/money/format.js";
 
 function newDraftId(): string {
@@ -116,7 +129,7 @@ function newDraftId(): string {
 function howVaultsWork(allowance: string): string {
   return (
     `Unaudited smart contract: you can put in at most ${vaultCapText()}. Only you can withdraw — nobody, not spDEX, can ` +
-    `change it or take the funds. Anyone can trigger a due buy and is paid its buy fee; each buy is refused if the price ` +
+    `change it or take the funds. Anyone can trigger a due buy and be paid its buy fee, SPX holders first; each buy is refused if the price ` +
     `is more than ${allowance} worse than Uniswap's 10-minute average. It buys SPX only, paid with ETH, through the ` +
     "deepest SPX market."
   );
@@ -180,6 +193,9 @@ export function RecurringForm({ autoBuy, deps }: { autoBuy: AutoBuy; deps: AutoB
   // A vault's price allowance: not a field of the plan (the plan has no
   // place for it), but a term of the vault, fixed when it is created.
   const [vaultSlippage, setVaultSlippage] = useState<number>(DEFAULT_VAULT_SLIPPAGE_BPS);
+  // A vault's community window, the same kind of term: Expert's choice, else
+  // the plan's default, which Simple always uses (decision 26).
+  const [vaultWindow, setVaultWindow] = useState<VaultWindowChoice>("default");
   const allowanceId = useId();
 
   const edit = (patch: Partial<RecurringFields>) => {
@@ -268,7 +284,10 @@ export function RecurringForm({ autoBuy, deps }: { autoBuy: AutoBuy; deps: AutoB
   // a share of each buy in ether, and an amount of another token isn't one.
   const paysEther = sell !== null && sell.address === NATIVE_TOKEN;
   const vaultCosts = paysEther && parsed.maxBuys !== null ? autoBuy.vaultCostsFor(parsed.amountPerBuy, parsed.maxBuys) : null;
-  const vaultProblem = vault ? vaultFormError(parsed, vaultSlippage, money) : null;
+  // An Expert-only choice counts only in Expert, as `parseForm` counts the
+  // Expert-only fields: one left behind there must not shape a Simple plan.
+  const windowSeconds = parsed.intervalSeconds === null ? null : vaultWindowOf(expert ? vaultWindow : "default", parsed.intervalSeconds);
+  const vaultProblem = vault ? vaultFormError(parsed, vaultSlippage, money, windowSeconds) : null;
   // What the buy fee means for this plan — that buys this small may be
   // skipped, or made only while network fees are low — is said here, where
   // the choice is made, not just in the cost line.
@@ -402,9 +421,15 @@ export function RecurringForm({ autoBuy, deps }: { autoBuy: AutoBuy; deps: AutoB
         plan,
         signer,
         firstBuyNow: parsed.startAt === null,
-        // The buy fee the card showed is the one the vault is created with.
+        // The buy fee and the window the card showed are the ones the vault is created with.
         ...(vault
-          ? { vault: { maxSlippageBps: vaultSlippage, ...(vaultCosts === null ? {} : { keeperReward: vaultCosts.fee.reward }) } }
+          ? {
+              vault: {
+                maxSlippageBps: vaultSlippage,
+                ...(vaultCosts === null ? {} : { keeperReward: vaultCosts.fee.reward }),
+                ...(windowSeconds === null ? {} : { communityWindow: windowSeconds }),
+              },
+            }
           : {}),
       });
       if (!result.ok) {
@@ -655,7 +680,10 @@ export function RecurringForm({ autoBuy, deps }: { autoBuy: AutoBuy; deps: AutoB
           </p>
         ) : null}
         {hasAmount && vault ? <p data-testid="dca-form-vault-setup-cost">{vaultSetupText(vaultCosts, buysTotal)}</p> : null}
+        {vault && windowSeconds !== null ? <p data-testid="dca-form-vault-window-line">{communityWindowLine(windowSeconds)}</p> : null}
       </div>
+      {/* Decision 31's notice: v2 vaults are still created, and say so. Nothing unless a build sets it. */}
+      {vault ? <RegistryAdvisory release={LATEST_RELEASE} testId="dca-form-registry-advisory" /> : null}
       {feeWarning !== null ? (
         <Banner tone="warn" title={feeWarning} testId="dca-form-fee-warning">
           Fewer, larger buys cost less.
@@ -711,7 +739,8 @@ export function RecurringForm({ autoBuy, deps }: { autoBuy: AutoBuy; deps: AutoB
             ) : (
               <>
                 <UnauditedBadge testId="dca-form-vault-badge" /> A <Term tip={VAULT_TIPS.vault}>vault</Term> you own
-                holds the budget — no tab needed. Anyone can make its due buys; nobody has to. Only closing it stops it.{" "}
+                holds the budget — no tab needed. Anyone can make its due buys, SPX holders first; nobody has to. Only closing it
+                stops it.{" "}
                 <Term tip={howVaultsWork(allowance)}>How vaults work</Term>
               </>
             )
@@ -764,6 +793,25 @@ export function RecurringForm({ autoBuy, deps }: { autoBuy: AutoBuy; deps: AutoB
             />
             <AllowanceHint allowance={allowance} />
           </div>
+          {expert && parsed.intervalSeconds !== null ? (
+            <Field label="Community window" hint={COMMUNITY_WINDOW_HINT}>
+              <select
+                className="spdex-select"
+                data-testid="dca-form-vault-window"
+                value={vaultWindowValue(vaultWindow, parsed.intervalSeconds)}
+                onChange={(event) => {
+                  setVaultWindow(vaultWindowChoiceOf(event.target.value));
+                  setError(null);
+                }}
+              >
+                {vaultWindowOptions(parsed.intervalSeconds).map((option) => (
+                  <option key={option.value} value={option.value} disabled={option.disabled}>
+                    {windowOptionLabel(option)}
+                  </option>
+                ))}
+              </select>
+            </Field>
+          ) : null}
           <VaultFactorySetup autoBuy={autoBuy} deps={deps} testId="dca-form-vault-setup" />
           {vaultProblem !== null ? (
             <Banner tone="warn" title="A vault can't take this plan" testId="dca-form-vault-problem">
@@ -799,13 +847,13 @@ export function RecurringForm({ autoBuy, deps }: { autoBuy: AutoBuy; deps: AutoB
         <ul className="spdex-dca-how">
           {vault ? (
             <>
-              <li>Anyone can trigger a due buy: a keeper bot, you (Trigger now), or a keeper you run.</li>
+              <li>Anyone can trigger a due buy, SPX holders first: a community keeper, a keeper bot, you (Trigger now), or a keeper you run.</li>
               <li>Unaudited: nobody independent has reviewed it, so at most {vaultCapText()} goes in.</li>
               <li>No pause: only closing it stops it. Switching Auto-buy off doesn&apos;t.</li>
               <li>
                 Each buy pays its buy fee (never more than {bpsPercentText(Number(BUY_FEE_CEILING_BPS))}%, network cost included) to
-                whoever triggers it — maybe a keeper run by spDEX&apos;s developers, who keep what&apos;s left after the network fee. The
-                pool&apos;s 0.3% fee applies too.
+                the keeper that makes it, or back to you when you do — maybe a keeper run by spDEX&apos;s developers, who keep
+                what&apos;s left after the network fee. The pool&apos;s 0.3% fee applies too.
               </li>
               <li>Sharing your plans shares the vault&apos;s address: anyone can watch it; only your wallet can fund or close it.</li>
               <li>Auto-buys never send tips.</li>
@@ -842,8 +890,8 @@ export function RecurringForm({ autoBuy, deps }: { autoBuy: AutoBuy; deps: AutoB
           {vault ? (
             <p className="spdex-dca-hint">
               A vault plan's start is rewritten in the network's time when it is saved, and its vault's address is added
-              once the vault exists. The allowance ({vaultSlippage} bps) and the buy fee are the vault's, not the
-              plan's.
+              once the vault exists. The allowance ({vaultSlippage} bps), the community window
+              {windowSeconds === null ? "" : ` (${formatCount(windowSeconds)} s)`} and the buy fee are the vault's, not the plan's.
             </p>
           ) : null}
         </Disclosure>

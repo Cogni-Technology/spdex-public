@@ -26,6 +26,8 @@ struct Market {
 /// @author spDEX
 /// @notice UNAUDITED. Has no owner, no admin, no fee and no upgrade path: it creates vaults
 ///         for whoever asks, on the markets it was deployed with, and records that it did.
+///         Every vault it creates asks the one SPX holder registry it was deployed with who
+///         may be paid inside a community window.
 ///
 /// @dev ## The market list
 ///
@@ -70,8 +72,10 @@ struct Market {
 ///      (0x4e59b44847b379578588920ca78fbf26c0b4956c) with a fixed salt, so its address is a
 ///      pure function of this bytecode — which includes the vault's, since the constructor
 ///      deploys the implementation — and of the constructor's arguments: WETH, Uniswap's two
-///      factories and the market list. Anyone can rebuild it from source and recompute that
-///      address, and the address pins the implementation and the markets together. The app
+///      factories, the SPX holder registry and the market list. Anyone can rebuild it from
+///      source and recompute that address, and the address pins the implementation, the
+///      registry and the markets together. The registry is deployed first, the same way, so
+///      its address is known before this one is worked out. The app
 ///      ships the address it expects, checks there is code there, and on a chain where there
 ///      is not yet, offers the one-time deployment — which anyone may send, since it has no
 ///      owner to set. Whoever sends it, the list is the same: a deployment attempted while a
@@ -89,6 +93,20 @@ struct Market {
 ///      address comes from CREATE2 with the salt `keccak256(owner, nonce)`; since the code
 ///      carries the terms, the address commits to them too. `predictVault` gives it before
 ///      the transaction is mined, and no two of one owner's vaults can collide.
+///
+///      Every plan has a community window, a term like the others: at least
+///      `MIN_COMMUNITY_WINDOW`, at most `MAX_COMMUNITY_WINDOW`, and at most a quarter of
+///      the plan's interval. A plan cannot opt out of it: every vault from this factory
+///      gives SPX holders first claim on its fees. The quarter is what keeps a window inside
+///      its slot — a buy falls due at most half an interval into its slot — so a window can
+///      neither run into the next buy nor swallow the part of a slot that is open to anyone;
+///      the minute is what keeps first claim from being nominal. `MIN_INTERVAL` is 300, so
+///      every interval allows a window of at least 75 seconds.
+///
+///      A plan may also share its window's first half out in turns (`turnBuckets`: none, or 2
+///      to `MAX_TURN_BUCKETS`; `SpdexDcaVault`'s "Turns" says how). It is a term like the
+///      window, so whether a vault has turns is fixed when it is created, and a vault created
+///      with none never has any.
 ///
 ///      It lists every vault it created, oldest first (`vaultCount`, `vaultsPage`), so that
 ///      anyone's keeper can find them from this contract alone.
@@ -109,6 +127,9 @@ contract SpdexVaultFactory is VaultLimits {
     address public immutable uniswapV3Factory;
     /// The contract every vault is a clone of, deployed by this factory's constructor.
     address public immutable implementation;
+    /// The SPX holder registry every vault from this factory asks, inside a community window,
+    /// whether a `rewardTo` may be paid. Fixed here and in the implementation's code.
+    address public immutable registry;
 
     /// The markets vaults can buy on, fixed at deployment. `markets(i)` for each entry;
     /// `marketCount()` for how many.
@@ -143,6 +164,9 @@ contract SpdexVaultFactory is VaultLimits {
     // The list, at deployment. Each names the entry it refused.
     error NoMarkets();
     error NotAUniswapFactory();
+    /// The registry given has no code: every community window would ask nothing and refuse
+    /// everyone but the owner.
+    error NotARegistry();
     error InvalidToken(uint256 index);
     error DuplicateMarket(uint256 index);
     error PairNotFromUniswap(uint256 index);
@@ -162,12 +186,30 @@ contract SpdexVaultFactory is VaultLimits {
     error FundingCapExceeded(uint256 budget, uint256 cap);
     error StartOutOfRange();
     error FundingExceedsNeed(uint256 need);
+    /// The plan's community window is under `minimum` (`MIN_COMMUNITY_WINDOW`) or over
+    /// `maximum`: the lesser of `MAX_COMMUNITY_WINDOW` and a quarter of the plan's interval,
+    /// rounded down. Unlike the other bounds, that one is not a constant a caller can read, so
+    /// the refusal says what it was.
+    error CommunityWindowOutOfRange(uint256 communityWindow, uint256 minimum, uint256 maximum);
+    /// The plan's turns are 1, or more than `maximum` (`MAX_TURN_BUCKETS`): a plan has none (0)
+    /// or shares its window's first half out in 2 to `maximum` buckets.
+    error TurnsOutOfRange(uint256 turnBuckets, uint256 maximum);
 
-    constructor(address weth_, address uniswapV2Factory_, address uniswapV3Factory_, Market[] memory markets_) {
+    constructor(
+        address weth_,
+        address uniswapV2Factory_,
+        address uniswapV3Factory_,
+        address registry_,
+        Market[] memory markets_
+    ) {
         if (markets_.length == 0) revert NoMarkets();
         // Calling a function on an address with no code fails in a way `try` cannot catch;
         // the right answer to a mistyped factory is this error, not an opaque revert.
         if (uniswapV2Factory_.code.length == 0 || uniswapV3Factory_.code.length == 0) revert NotAUniswapFactory();
+        // A vault's staticcall to an address with no code succeeds with no answer, which it
+        // counts as "not eligible": a mistyped registry would not fail, it would quietly shut
+        // every holder out of every window. So it is refused here, where it can be named.
+        if (registry_.code.length == 0) revert NotARegistry();
         for (uint256 i; i < markets_.length; i++) {
             for (uint256 j; j < i; j++) {
                 if (markets_[j].tokenOut == markets_[i].tokenOut) revert DuplicateMarket(i);
@@ -179,7 +221,8 @@ contract SpdexVaultFactory is VaultLimits {
         weth = weth_;
         uniswapV2Factory = uniswapV2Factory_;
         uniswapV3Factory = uniswapV3Factory_;
-        implementation = address(new SpdexDcaVault(weth_));
+        registry = registry_;
+        implementation = address(new SpdexDcaVault(weth_, registry_));
     }
 
     /// How many markets `markets` holds.
@@ -220,10 +263,21 @@ contract SpdexVaultFactory is VaultLimits {
         uint256 maxBuys,
         uint256 startAt,
         uint256 keeperReward,
-        uint256 maxSlippageBps
+        uint256 maxSlippageBps,
+        uint256 communityWindow,
+        uint256 turnBuckets
     ) external payable returns (address vault) {
         Args memory a = _args(
-            msg.sender, marketIndex, amountPerBuy, interval, maxBuys, startAt, keeperReward, maxSlippageBps
+            msg.sender,
+            marketIndex,
+            amountPerBuy,
+            interval,
+            maxBuys,
+            startAt,
+            keeperReward,
+            maxSlippageBps,
+            communityWindow,
+            turnBuckets
         );
         _checkPlan(a);
         // Funding at creation: at most the whole budget. More is refused rather than
@@ -259,10 +313,21 @@ contract SpdexVaultFactory is VaultLimits {
         uint256 maxBuys,
         uint256 startAt,
         uint256 keeperReward,
-        uint256 maxSlippageBps
+        uint256 maxSlippageBps,
+        uint256 communityWindow,
+        uint256 turnBuckets
     ) external view returns (address) {
         Args memory a = _args(
-            owner, marketIndex, amountPerBuy, interval, maxBuys, startAt, keeperReward, maxSlippageBps
+            owner,
+            marketIndex,
+            amountPerBuy,
+            interval,
+            maxBuys,
+            startAt,
+            keeperReward,
+            maxSlippageBps,
+            communityWindow,
+            turnBuckets
         );
         return
             ClonesWithArgs.predict(
@@ -281,7 +346,9 @@ contract SpdexVaultFactory is VaultLimits {
         uint256 maxBuys,
         uint256 startAt,
         uint256 keeperReward,
-        uint256 maxSlippageBps
+        uint256 maxSlippageBps,
+        uint256 communityWindow,
+        uint256 turnBuckets
     ) private view returns (Args memory a) {
         if (marketIndex >= markets.length) revert UnknownMarket(marketIndex, markets.length);
         Market storage m = markets[marketIndex];
@@ -295,6 +362,8 @@ contract SpdexVaultFactory is VaultLimits {
         a.interval = interval;
         a.maxBuys = maxBuys;
         a.maxSlippageBps = maxSlippageBps;
+        a.communityWindow = communityWindow;
+        a.turnBuckets = turnBuckets;
     }
 
     /// The bounds every plan must keep: the vault's limits, applied once, here.
@@ -320,6 +389,19 @@ contract SpdexVaultFactory is VaultLimits {
         if (a.startAt > block.timestamp + MAX_START_DRIFT || a.startAt + MAX_START_DRIFT < block.timestamp) {
             revert StartOutOfRange();
         }
+        // Every plan has a window (decision 4 of `docs/V2_UPGRADE.md`), long enough to mean
+        // something and short enough to end inside its slot: see "The vaults". The interval
+        // was bounded below, so a quarter of it is at least 75 seconds, and some window
+        // always fits.
+        uint256 longest = a.interval / 4 < MAX_COMMUNITY_WINDOW ? a.interval / 4 : MAX_COMMUNITY_WINDOW;
+        if (a.communityWindow < MIN_COMMUNITY_WINDOW || a.communityWindow > longest) {
+            revert CommunityWindowOutOfRange(a.communityWindow, MIN_COMMUNITY_WINDOW, longest);
+        }
+        // No turns, or at least two: one bucket would be every address, a plan without turns
+        // spelt another way.
+        if (a.turnBuckets == 1 || a.turnBuckets > MAX_TURN_BUCKETS) {
+            revert TurnsOutOfRange(a.turnBuckets, MAX_TURN_BUCKETS);
+        }
     }
 
     function _termsOf(Args memory a) private pure returns (Terms memory) {
@@ -332,7 +414,9 @@ contract SpdexVaultFactory is VaultLimits {
             maxBuys: a.maxBuys,
             startAt: a.startAt,
             keeperReward: a.keeperReward,
-            maxSlippageBps: a.maxSlippageBps
+            maxSlippageBps: a.maxSlippageBps,
+            communityWindow: a.communityWindow,
+            turnBuckets: a.turnBuckets
         });
     }
 

@@ -3,33 +3,57 @@
  *
  * A vault plan's buys are not signed by anyone this app controls: a contract
  * holds the budget and makes each buy itself, whoever triggers it. What the
- * user's wallet does sign are four transactions the host composes around it —
- * create the vault (optionally funding it in the same transaction), fund it,
- * close it and take everything back, and trigger a due buy themselves. Each
- * moves the user's money or decides where it will sit, so each passes through
- * here, for the reason tips and budget transfers do: the host wrote them, and
- * that has never been an exemption. The terms come from a config that may have
- * arrived in a link, and the vault's address and state from reads over the
- * network; a bug in any of them looks, at the moment of signing, exactly like
- * an attack.
+ * user's wallet does sign are the transactions the host composes around it:
+ * four about the user's own vault — create it (optionally funding it in the
+ * same transaction), fund it, close it and take everything back, and trigger
+ * a due buy themselves — a batch of due buys in other people's vaults, and a
+ * proof that an address held SPX. Each moves the user's money, decides where
+ * it will sit, or spends a network fee on what the host says it does, so each
+ * passes through here, for the reason tips and budget transfers do: the host
+ * wrote them, and that has never been an exemption. The terms come from a
+ * config that may have arrived in a link, the vault's address and state and
+ * the proof from reads over the network, and an address to prove may have
+ * been typed in; a bug in any of them looks, at the moment of signing,
+ * exactly like an attack.
+ *
+ * ## Every release
+ *
+ * Releases are data (`DEPLOYMENTS`, `@spdex/vault`'s releases.ts), and what
+ * a release's vaults can do is its source's (`SOURCES[source].features`),
+ * read from the ABIs by the build. Nothing here names a release: it asks
+ * whether a release's `execute` takes `rewardTo`, whether its terms carry a
+ * community window and turns. v1's factory and every vault it made run
+ * unchanged for good: a 112-byte clone of terms, and `execute()`, which pays
+ * the buy fee to whoever calls. v2's adds a community window and its turns to
+ * each vault's terms (117 bytes) and `execute(rewardTo)`, which pays whoever
+ * its caller names and, inside the window, only the owner or an eligible SPX
+ * holder. Every release's vault is still funded, closed and triggered here;
+ * vaults are created only on the latest release, and a batch carries only
+ * vaults that take `rewardTo`, through the batcher bound to no factory.
  *
  * ## What is proved without the chain
  *
  * Every call is compared byte for byte with a fresh encoding by the same
  * functions the host uses (`@spdex/vault`), and aimed at the one place it may
  * go: a creation at the factory `factoryAddress(deployment)` computes — an
- * address that commits to the factory's code and its list of markets — and
- * everything else at the plan's vault.
+ * address that commits to the factory's code, its list of markets and the
+ * registry its vaults ask — a batch at the batcher `batcherAddress(weth)`
+ * computes, a proof at a listed release's registry, and everything else at
+ * the plan's vault.
  *
  * Whether that vault is a real one, and the account's, is proved the same way,
- * with no read at all. A vault's address is where the factory's CREATE2 puts a
- * clone carrying its owner and its terms (`predictVault`), so an address equal
- * to the prediction for this account, a nonce and these terms can only be
- * the factory's vault for this account on exactly these terms. The host
- * supplies the owner, nonce and terms from its reads; none of it is believed,
- * because a lie changes the prediction. That is what lets the static layer
- * hold funding to what the terms allow and compare the terms with the plan
- * the user wrote.
+ * with no read at all. A vault's address is where its factory's CREATE2 puts
+ * a clone carrying its owner and its terms (`predictVault`), so an address
+ * equal to the prediction for this account, a nonce and these terms can only
+ * be the factory's vault for this account on exactly these terms. The host
+ * supplies the owner, nonce, terms and release from its reads; none of it is
+ * believed, because a lie changes the prediction: a claim is predicted from
+ * its release's factory, computed from that release's source and recorded
+ * arguments, and its source's clone layout, so a vault claimed as another
+ * release's is a vault that isn't there. That is
+ * what lets the static layer hold funding to what the terms allow, compare
+ * the terms with the plan the user wrote, and encode a buy as its release
+ * takes it.
  *
  * A creation's buy fee (`keeperReward`) is also held to the 0.69% ceiling
  * (`@spdex/vault`'s fee.ts): the whole fee, the network cost included, and
@@ -62,9 +86,13 @@
  *            vault did not need came back.
  *   close    the account only receives, and receives at least what the vault
  *            gave up.
- *   trigger  one buy, credited to this caller; the owner receives at least the
- *            floor read beforehand, the caller at least the reward, and the
- *            vault parts with no more than one buy and that reward.
+ *   trigger  one buy, made by this account and paid to the `rewardTo` it
+ *            names: a v2 vault's owner, who must be the account (Trigger now
+ *            is the owner's own, and its fee comes back to them), or for a
+ *            v1 vault the account itself, which v1 pays whoever calls. The
+ *            owner receives at least the floor read beforehand, the fee's
+ *            recipient at least the fee, and the vault parts with no more
+ *            than one buy and that fee.
  *
  * And for all four: nothing leaves the account beyond the ether it sends, and
  * the account grants no allowance.
@@ -72,28 +100,85 @@
  * ## A batch for other people's vaults
  *
  * The fifth transaction ("Help run the network") makes due buys in strangers'
- * vaults through the batcher bound to the factory, and pays the account their
- * buy fees. There is no plan to hold it to; each vault's own rules protect its
- * owner, whoever triggers it. What is checked is the account's side:
+ * vaults through the batcher, and each vault pays the account its buy fee
+ * directly. There is no plan to hold it to; each vault's own rules protect
+ * its owner, whoever triggers it. What is checked is the account's side.
+ *
+ * The batcher is bound to no factory: it calls whatever it is given and
+ * measures what the account earned, so nothing on chain any longer stops a
+ * batch from calling a contract that only looks like a vault. Such a contract
+ * could behave one way in a test-run and another in the block — burn the
+ * account's gas, or move a token the account once approved it for — so the
+ * Guard proves every address in the batch statically, as it proves the
+ * account's own vault: the host hands over a claim for each (owner, nonce,
+ * terms, release), and each must be where its release's factory puts that
+ * vault (`predictVault`). Only a factory can have put code there, and a
+ * factory puts nothing there but its vault, on a market from its list. A
+ * claim of a release whose vaults don't take `rewardTo` (v1's) is refused,
+ * since a batch can't pay the account for it.
  *
  *   static     one call to the computed batcher, no ether, exactly
- *              `executeBatch(vaults, account, minRewards)` with every fee to
- *              the account, 1 to 20 distinct vaults, a least reward of at
- *              least 1 wei, and the exact gas limit and price it is signed
+ *              `executeBatch(vaults, account, minRewards, gasPerVault)` as
+ *              the host encodes it, with every fee to the account, 1 to 20
+ *              distinct vaults, each proved by its claim, a least reward of
+ *              at least 1 wei, and the exact gas limit and price it is signed
  *              with, the limit room enough for every vault and under the
  *              per-transaction cap.
  *   simulated  at that gas limit: the least reward covers the network fee
  *              of the gas the simulation used, at the signed price; the
- *              batcher's one `Batch` credits the account, earns at least the
- *              least reward and passes on no WETH it held before
- *              (`VAULT_BATCH_UNACCOUNTED`); every listed vault
- *              is tried once, and each that buys follows its own `Bought`,
- *              credited to the batcher, at or above its floor, parting with
- *              exactly its buy and fee; the account receives what was earned,
- *              and nothing of its moves.
+ *              batcher's one `Batch`, laid out as a batcher bound to no
+ *              factory lays it out, credits the account, earns at least the
+ *              least reward, and earns exactly what its vaults paid; every
+ *              listed vault is tried once, and each that buys follows its own
+ *              `Bought`, laid out as its release's, made by the batcher and
+ *              paid to the account, at or above its floor, parting with
+ *              exactly its buy and fee; nothing passes through the batcher,
+ *              which is never paid and has no way to pay anyone
+ *              (`VAULT_BATCH_UNACCOUNTED` for anything leaving it); the
+ *              account receives what was earned, and nothing of its moves.
+ *
+ * A vault that refuses because the account may not be paid inside its
+ * community window (`NotEligible`), or not yet in its turn (`NotYourTurn`),
+ * costs only its attempt, as one not yet due does; the batch still has to pay
+ * for itself. A vault that answers nothing (`EmptyReturn`: its address holds
+ * no code yet) is refused: the claim named a vault that isn't there.
  *
  * It is never signed unchecked, whatever `requireSimulation` says: what it
  * earns is known only from its simulation.
+ *
+ * ## A proof of SPX held
+ *
+ * The sixth transaction submits to the SPX holder registry a proof that an
+ * address held at least 690 SPX at the end of a recent block: the account's
+ * own, or any address typed in, since anyone may prove anyone — it states a
+ * fact. It moves no money, and a false proof only reverts at the cost of its
+ * network fee, so it may be signed `unverified`, on the static layer and one
+ * service's word, as closing may; under `requireSimulation` it is refused
+ * without a simulation like anything else. What is checked:
+ *
+ *   static     one call, no ether, to a listed release's registry (the
+ *              latest's, which its factory's address commits to, or one a
+ *              listed release recorded), exactly `prove(holder, header,
+ *              accountProof, storageProof)`; a header the registry can read,
+ *              hashing to the block hash the intent states and carrying its
+ *              block number; at most `MAX_PROOF_NODES` nodes in each proof;
+ *              and the halves tied to that header — the account proof's
+ *              first node hashing to its state root, the storage proof's to
+ *              the storage root the account proof's leaf states — so halves
+ *              of another block's state, which could only revert, are
+ *              refused as the host's own `assembleProof` refuses them.
+ *   the block  the Guard's own read of that block's hash from the person's
+ *              network service (`eth_getBlockByNumber`, `blockHash` in the
+ *              options) is the stated one. A proof built against another
+ *              block — another chain's, or a header made up to hash
+ *              consistently — is refused here, before it is simulated or
+ *              signed, even when everything in it agrees with itself. The
+ *              one check in this file that reads.
+ *   simulated  exactly one `Proven` from the registry, for this holder and
+ *              this block, recording at least 690 SPX and valid for 30 days
+ *              from the block's time; nothing leaves the account or the
+ *              holder, and neither grants an allowance. A proof that would
+ *              change nothing reverts `NotNewer`, which is said in words.
  *
  * ## What it cannot catch
  *
@@ -109,10 +194,31 @@
  * of two services'; without one, a main service that understates the gas and
  * overstates the price in the same breath can still make a batch cost more
  * than it earns, as it can fake any simulation within one service.
+ *
+ * A proof's block hash is read from the main service alone. A main service
+ * that lies about the block and fakes the simulation to match can, without a
+ * second opinion to disagree, get a false proof signed; the registry checks
+ * the hash against the chain's own history, so that proof reverts and costs
+ * only its fee.
+ *
+ * Two things about a proof are left to others, since neither moves money and
+ * a simulation shows both. Whether its block is still one of the 8,191 the
+ * registry can check: the host refuses an older one before building or taking
+ * a proof (`@spdex/vault`'s `buildHolderProof` and `checkPastedProof`), and
+ * signed unchecked anyway it reverts `UnknownBlock` at the cost of its fee.
+ * And whether the holder is an account: the registry records a contract's
+ * proof but never finds a contract eligible, so such a proof lands and earns
+ * nothing; `readHolderStatus` says "contract" before the panel offers one.
+ * This file makes no read but the block's hash.
+ *
+ * And what the registry's eligibility means — that an address held 690 SPX
+ * when a recent block closed, and can show 690 at the moment of a buy,
+ * borrowed or not — is the registry's to decide, not this file's
+ * (docs/V2_UPGRADE.md, decision 17).
  */
 
-import type { SimLog, SimulationOutcome, SimulationProvider } from "@spdex/chain";
-import { NATIVE_TOKEN, SimulationUnavailableError } from "@spdex/chain";
+import type { JsonRpc, SimLog, SimulationOutcome, SimulationProvider } from "@spdex/chain";
+import { NATIVE_TOKEN, SimulationUnavailableError, TOPICS, accountProofStorageRoot, parseHeaderRlp, proofRoot } from "@spdex/chain";
 import {
   BaseUnitsSchema,
   rejected,
@@ -126,31 +232,47 @@ import {
   type Hex,
 } from "@spdex/core";
 import {
+  BATCHERS,
   BUY_FEE_CEILING_BPS,
+  DEPLOYMENTS,
+  LATEST_RELEASE,
   MAINNET_DEPLOYMENT,
   MAX_BATCH_GAS_CEILING,
+  MIN_SPX,
+  PROOF_TTL,
+  SOURCES,
+  V1_MAINNET_DEPLOYMENT,
   batchGasLimit,
   batcherAddress,
+  deploymentOf,
   decodeBatchRevert,
+  decodeVaultError,
   decodeVaultEvent,
+  describeRegistryError,
   encodeClose,
   encodeCreateVault,
   encodeExecute,
   encodeExecuteBatch,
+  encodeExecuteV1,
   encodeFund,
+  encodeProve,
   factoryAddress,
   feeCeiling,
   feeShareText,
   joinBatchLogs,
   predictVault,
+  provenBy,
   termsOfPlan,
   termsProblems,
   vaultBudget,
   vaultsCreatedBy,
   withinFeeCeiling,
   type FactoryDeployment,
+  type SourceFeatures,
+  type V1FactoryDeployment,
   type VaultEvent,
   type VaultPlan,
+  type VaultRelease,
   type VaultTerms,
 } from "@spdex/vault";
 import { deltaFor, observeEffects, type ObservedEffects } from "./effects.js";
@@ -158,19 +280,37 @@ import { applySecondOpinion } from "./second-opinion.js";
 
 // ─── What the host hands over ─────────────────────────────────────────────────
 
-export type VaultAction = "create" | "fund" | "close" | "trigger";
+/**
+ * What the host does with the account's own vault. The static layer admits
+ * these and no other, and `VaultGuard`'s effects check has a case for each and
+ * a `never` for anything else, so an action added here without its checks
+ * fails to compile rather than coming back verified.
+ */
+export const VAULT_ACTIONS = ["create", "fund", "close", "trigger"] as const;
+export type VaultAction = (typeof VAULT_ACTIONS)[number];
+
+/** Every kind of plan `VaultGuard.check` takes: the four above, a batch, and a proof. */
+export const VAULT_PLAN_ACTIONS = [...VAULT_ACTIONS, "batch", "prove"] as const;
 
 /**
  * A vault as the host read it. None of it is trusted: it is accepted only when
- * `address` is where the factory puts a vault for `owner` with `nonce` and
- * `terms` (see the header), and then every field is the vault's own.
+ * `address` is where `release`'s factory puts a vault for `owner` with `nonce`
+ * and `terms` (see the header), and then every field is the vault's own.
  */
 export interface VaultClaim {
   address: Address;
   owner: Address;
   /** The factory nonce the vault was created with; `findVaultNonce` finds it. */
   nonce: bigint;
+  /** Its release's source's shape: v1's have `communityWindow` and `turnBuckets` null, v2's both. */
   terms: VaultTerms;
+  /**
+   * Which release's factory made it, as `readVault` reports it (the factory
+   * that vouches for it): one of `DEPLOYMENTS`. Never inferred here from the
+   * terms' shape: it says which factory and which clone layout the address is
+   * predicted with, so a claim that names the wrong one names no vault at all.
+   */
+  release: VaultRelease;
 }
 
 interface VaultIntentBase {
@@ -208,12 +348,29 @@ export interface VaultCloseIntent extends VaultIntentBase {
   vault: VaultClaim;
 }
 
+/**
+ * "Trigger now": the owner makes their own vault's due buy.
+ *
+ * For a vault whose `execute` takes `rewardTo` (v2 on) the call is
+ * `execute(owner)`, which the community window never refuses and which pays
+ * the buy fee back to the owner; only the owner may send it here, since anyone
+ * else would pay the network fee for a fee that isn't theirs. For a v1 vault
+ * it is `execute()`, which pays whoever calls, and may still be sent by
+ * anyone, as a keeper would.
+ */
 export interface VaultTriggerIntent extends VaultIntentBase {
   action: "trigger";
-  /** Anyone's vault may be triggered; the reward is the caller's either way. */
   vault: VaultClaim;
   /** The least the owner may receive: the vault's `quote().floorOut`, read just before. */
   floorOut: bigint;
+  /**
+   * Who the buy fee is paid to, as the host states it: the vault's owner for
+   * a vault that takes `rewardTo` (the `execute(owner)` it sends), the account
+   * for a v1 vault (which pays whoever calls). Anything else is refused: it
+   * would describe a payment the call does not make, or one the account
+   * shouldn't.
+   */
+  rewardTo: Address;
 }
 
 export type VaultIntent = VaultCreateIntent | VaultFundIntent | VaultCloseIntent | VaultTriggerIntent;
@@ -244,6 +401,14 @@ export interface VaultBatchIntent {
   account: Address;
   /** In the order they are encoded, and tried. */
   vaults: readonly Address[];
+  /**
+   * What the host read about each vault, in the order of `vaults`: its owner,
+   * factory nonce, terms and release, as for the account's own vault. None of
+   * it is believed: each must be where its release's factory puts that vault
+   * (`predictVault`), which is what proves the address is a vault at all, now
+   * that the batcher calls whatever it is given.
+   */
+  claims: readonly VaultClaim[];
   /** Where every buy fee goes: always `account`. */
   rewardTo: Address;
   /**
@@ -277,14 +442,96 @@ export interface VaultBatchTxPlan {
   calls: VaultBatchCall[];
 }
 
-const isBatchPlan = (plan: VaultTxPlan | VaultBatchTxPlan): plan is VaultBatchTxPlan =>
-  (plan.intent as { action?: unknown }).action === "batch";
+/**
+ * A proof that `holder` held at least 690 SPX at the end of block
+ * `blockNumber`, sent to the SPX holder registry: the sixth transaction, and
+ * the only one that moves no money at all.
+ *
+ * Not a `VaultIntentBase`: it belongs to no plan and to no vault. The host
+ * builds it from the person's own network service (`buildHolderProof`) or
+ * from a pasted proof it checked against that service (`checkPastedProof`),
+ * and nothing in it is believed: the call must be exactly this proof, the
+ * header must hash to `blockHash` and carry `blockNumber`, and the Guard asks
+ * the service for that block's hash itself.
+ */
+export interface VaultProveIntent {
+  version: 1;
+  action: "prove";
+  chainId: number;
+  /** Signs, sends and pays the network fee: the connected wallet. */
+  account: Address;
+  /** Whose holding is proven: the account, or any address the person typed in. */
+  holder: Address;
+  /** The block proven: `finalized`, as the person's own service named it. */
+  blockNumber: bigint;
+  /** That block's hash, as the person's own service reported it. */
+  blockHash: Hex;
+  /** The block's header, RLP-encoded: rebuilt by the app, or pasted. */
+  header: Hex;
+  /** From the block's state root to SPX's account. */
+  accountProof: readonly Hex[];
+  /** From SPX's storage root to the holder's balance. */
+  storageProof: readonly Hex[];
+}
+
+/** A proof sent to the registry: exactly one call, from `intent.account`. */
+export interface VaultProveTxPlan {
+  version: 1;
+  intent: VaultProveIntent;
+  calls: Call[];
+}
+
+/**
+ * The most nodes either half of a proof may have. A mainnet proof of SPX's
+ * account is nine nodes deep and of a balance six; a trie sixteen deep would
+ * hold more accounts than there are atoms to spare. A paste with more is not a
+ * proof of Ethereum's state, and would only make calldata someone pays for.
+ */
+export const MAX_PROOF_NODES = 16;
+
+/** Every plan VaultGuard checks. */
+export type AnyVaultTxPlan = VaultTxPlan | VaultBatchTxPlan | VaultProveTxPlan;
+
+const actionOf = (plan: AnyVaultTxPlan): unknown => (plan.intent as { action?: unknown } | undefined)?.action;
+const isBatchPlan = (plan: AnyVaultTxPlan): plan is VaultBatchTxPlan => actionOf(plan) === "batch";
+const isProvePlan = (plan: AnyVaultTxPlan): plan is VaultProveTxPlan => actionOf(plan) === "prove";
 
 export interface VaultGuardOptions {
   chainId: number;
   requireSimulation: boolean;
-  /** Which factory, and so which markets: mainnet's by default, which the local fork shares. */
+  /**
+   * The latest release's factory's arguments, and so its markets, its registry
+   * and the WETH the batcher is built for: mainnet's by default, which the
+   * local fork shares. Every vault created is created on it, every batch goes
+   * to the batcher built for its WETH, and a proof to its registry or another
+   * listed release's. Earlier releases are proved against their recorded
+   * arguments, on the same chain.
+   */
   deployment?: FactoryDeployment;
+  /** The arguments releases without a registry (v1's) are proved against: mainnet's by default. */
+  v1Deployment?: V1FactoryDeployment;
+  /**
+   * The hash the person's own network service gives block `blockNumber`
+   * (`eth_getBlockByNumber`), or null when it gives none; may throw.
+   * `readBlockHash` reads it. Read by the Guard itself, never handed over by
+   * the flow that built the proof: it is what tells a proof of the chain's
+   * block from one that only agrees with itself. Without it, or without an
+   * answer, every proof is refused; nothing else here needs it.
+   */
+  blockHash?: (blockNumber: bigint) => Promise<Hex | null>;
+}
+
+/**
+ * Block `blockNumber`'s hash as `rpc` gives it, for `VaultGuardOptions.blockHash`;
+ * null when the service has no such block, or answers with another block or
+ * something that isn't a hash. Errors propagate: the Guard refuses on them.
+ */
+export async function readBlockHash(rpc: JsonRpc, blockNumber: bigint): Promise<Hex | null> {
+  const block = (await rpc("eth_getBlockByNumber", [`0x${blockNumber.toString(16)}`, false])) as { hash?: unknown; number?: unknown } | null;
+  if (typeof block !== "object" || block === null) return null;
+  const { hash, number } = block;
+  if (typeof number !== "string" || !/^0x[0-9a-fA-F]+$/.test(number) || BigInt(number) !== blockNumber) return null;
+  return typeof hash === "string" && BYTES32.test(hash) ? (hash.toLowerCase() as Hex) : null;
 }
 
 // ─── Small, careful readers ───────────────────────────────────────────────────
@@ -310,24 +557,126 @@ const UINT256_MAX = (1n << 256n) - 1n;
 /** A whole number a contract could hold: a bigint from zero to 2^256 − 1, so no encoder throws on it. */
 const isAmount = (value: unknown): value is bigint => typeof value === "bigint" && value >= 0n && value <= UINT256_MAX;
 
+const BYTES32 = /^0x[0-9a-fA-F]{64}$/;
+/** Bytes, at least one: a header, or one node of a proof. */
+const SOME_BYTES = /^0x(?:[0-9a-fA-F]{2})+$/;
+
 const TERM_AMOUNTS = ["amountPerBuy", "interval", "maxBuys", "startAt", "keeperReward", "maxSlippageBps"] as const;
 
-/** Terms whose every field is the right kind of thing, so arithmetic on them cannot throw or coerce. */
-function termsAreWellFormed(terms: unknown): terms is VaultTerms {
+/** A release `DEPLOYMENTS` lists; anything else is no release, and fails closed. */
+const isListedRelease = (value: unknown): value is VaultRelease => typeof value === "string" && DEPLOYMENTS.some((d) => d.id === value);
+
+/** What a listed release's vaults can do: its source's features. */
+const featuresOfRelease = (release: VaultRelease): SourceFeatures => SOURCES[deploymentOf(release).source].features;
+
+/**
+ * Terms whose every field is the right kind of thing for `release`'s source,
+ * so arithmetic on them cannot throw or coerce: a community window and turns
+ * where the source's terms carry them, `null` where they don't. Terms of
+ * another source's shape are no vault of this release's, whatever the claim
+ * says.
+ */
+function termsAreWellFormed(terms: unknown, release: VaultRelease): terms is VaultTerms {
   if (typeof terms !== "object" || terms === null) return false;
   const t = terms as Record<string, unknown>;
+  const features = featuresOfRelease(release);
   return (
     isUsableAddress(t["tokenOut"]) &&
     isUsableAddress(t["pair"]) &&
     isUsableAddress(t["oraclePool"]) &&
-    TERM_AMOUNTS.every((field) => isAmount(t[field]))
+    TERM_AMOUNTS.every((field) => isAmount(t[field])) &&
+    (features.communityWindow ? isAmount(t["communityWindow"]) : t["communityWindow"] === null) &&
+    (features.turns ? isAmount(t["turnBuckets"]) : t["turnBuckets"] === null)
   );
 }
 
+/** A creation's plan: the latest release's, so with a community window and turns, every figure whole and non-negative. */
 function planIsWellFormed(plan: unknown): plan is VaultPlan {
   if (typeof plan !== "object" || plan === null) return false;
   const p = plan as Record<string, unknown>;
-  return isAmount(p["marketIndex"]) && TERM_AMOUNTS.every((field) => isAmount(p[field]));
+  return (
+    isAmount(p["marketIndex"]) && isAmount(p["communityWindow"]) && isAmount(p["turnBuckets"]) && TERM_AMOUNTS.every((field) => isAmount(p[field]))
+  );
+}
+
+/**
+ * Where each contract a vault transaction may go is, for one Guard: every
+ * listed release's factory, the batcher, and the registries proofs may go to.
+ * Computed from each release's source and arguments, never read, and each
+ * only when first needed: each hashes a creation code.
+ */
+class ReleaseContracts {
+  readonly #factories = new Map<VaultRelease, Address>();
+  #batcher: Address | null = null;
+
+  constructor(
+    readonly deployment: FactoryDeployment,
+    readonly v1Deployment: V1FactoryDeployment,
+  ) {}
+
+  /**
+   * A listed release's factory: the latest's from `deployment`, the only one
+   * vaults are created on; a release without a registry (v1's) from
+   * `v1Deployment`; any other from its recorded markets and registry, on
+   * `deployment`'s chain.
+   */
+  factoryOf(release: VaultRelease): Address {
+    let address = this.#factories.get(release);
+    if (address === undefined) {
+      const recorded = deploymentOf(release);
+      const { weth, uniswapV2Factory, uniswapV3Factory } = this.deployment;
+      const args: FactoryDeployment | V1FactoryDeployment =
+        release === LATEST_RELEASE
+          ? this.deployment
+          : recorded.registry === null
+            ? this.v1Deployment
+            : { weth, uniswapV2Factory, uniswapV3Factory, registry: recorded.registry, markets: recorded.markets };
+      address = lower(factoryAddress(args, recorded.source));
+      this.#factories.set(release, address);
+    }
+    return address;
+  }
+
+  /** The latest release's factory, which commits to its markets and its registry: the only one vaults are created on. */
+  get factory(): Address {
+    return this.factoryOf(LATEST_RELEASE);
+  }
+
+  /** v1's factory, from its frozen source: `DEPLOYMENTS`' first, which v1 claims are proved against. */
+  get v1Factory(): Address {
+    return this.factoryOf(DEPLOYMENTS[0]!.id);
+  }
+
+  /**
+   * The batcher every batch goes to: the newest (`BATCHERS`' last, which the
+   * host's `encodeExecuteBatch` targets), built for `deployment`'s WETH and
+   * bound to no factory, so it serves every release whose vaults take
+   * `rewardTo`.
+   */
+  get batcher(): Address {
+    this.#batcher ??= lower(batcherAddress(lower(this.deployment.weth), BATCHERS[BATCHERS.length - 1]!.source));
+    return this.#batcher;
+  }
+
+  /**
+   * The SPX holder registry the latest release's vaults ask: the one its
+   * factory's address commits to. For mainnet's deployment it is
+   * `registryAddress()`, where the registry's own code lands
+   * (`MAINNET_REGISTRY`).
+   */
+  get registry(): Address {
+    return lower(this.deployment.registry);
+  }
+
+  /** Every registry a proof may go to: the latest release's, and each one a listed release records. */
+  get registries(): Address[] {
+    return [...new Set([this.registry, ...DEPLOYMENTS.flatMap((d) => (d.registry === null ? [] : [lower(d.registry)]))])];
+  }
+
+  /** The listed release whose factory `address` is, or null. */
+  releaseOfFactory(address: Address): VaultRelease | null {
+    return DEPLOYMENTS.find((d) => this.factoryOf(d.id) === lower(address))?.id ?? null;
+  }
 }
 
 // ─── The plan against the vault ───────────────────────────────────────────────
@@ -343,8 +692,9 @@ export interface VaultTermsMismatch {
  * Where a vault's terms differ from the plan in the config, field by field;
  * empty when they agree on everything the plan says.
  *
- * The keeper's reward and the slippage allowance are the vault's alone — a
- * plan has no field for either — so they cannot differ. A plan field that is
+ * The keeper's reward, the slippage allowance and a v2 vault's community
+ * window are the vault's alone — a plan has no field for any of them — so they
+ * cannot differ. A plan field that is
  * not a valid number differs from every vault, rather than being skipped.
  * The app shows a non-empty answer as "the vault's terms differ from this
  * plan"; the Guard refuses to fund a vault, or trigger its buy, on one.
@@ -386,23 +736,38 @@ export { findVaultNonce, MAX_VAULT_NONCE_SEARCH } from "@spdex/vault";
  * caller to remember. And like the schedule checks, nothing here assumes the
  * plan or the claim passed a schema — each figure is checked for shape before
  * any arithmetic, and one that fails refuses rather than throws.
+ *
+ * All but one check on a proof: whether its block is the chain's, which takes
+ * a read (`VaultGuardOptions.blockHash`), and which `VaultGuard` makes after
+ * these pass.
  */
 export function runVaultChecks(
-  plan: VaultTxPlan | VaultBatchTxPlan,
+  plan: AnyVaultTxPlan,
   chainId: number,
   deployment: FactoryDeployment = MAINNET_DEPLOYMENT,
-  factory: Address = lower(factoryAddress(deployment)),
-  batcher?: Address,
+  v1Deployment: V1FactoryDeployment = V1_MAINNET_DEPLOYMENT,
 ): GuardViolation[] {
-  // Before the plan check below: a batch has no plan (see VaultBatchIntent).
-  if (isBatchPlan(plan)) return runBatchChecks(plan, chainId, batcher ?? lower(batcherAddress(factory)));
+  return staticChecks(plan, chainId, new ReleaseContracts(deployment, v1Deployment));
+}
+
+function staticChecks(plan: AnyVaultTxPlan, chainId: number, contracts: ReleaseContracts): GuardViolation[] {
+  // Before the plan check below: neither a batch nor a proof has a plan (see
+  // VaultBatchIntent and VaultProveIntent).
+  if (isBatchPlan(plan)) return runBatchChecks(plan, chainId, contracts);
+  if (isProvePlan(plan)) return runProveChecks(plan, chainId, contracts.registries);
+  const { deployment } = contracts;
+  const factory = contracts.factory;
   const { intent } = plan;
   const violations: GuardViolation[] = [];
   const malformed = (message: string, detail?: Record<string, string>) =>
     violations.push({ code: "VAULT_MALFORMED", message, ...(detail === undefined ? {} : { detail }) });
 
+  if (typeof intent !== "object" || intent === null) {
+    malformed("the transaction has no intent to hold it to");
+    return violations;
+  }
   const action = (intent as { action?: unknown }).action;
-  if (action !== "create" && action !== "fund" && action !== "close" && action !== "trigger") {
+  if (!(VAULT_ACTIONS as readonly unknown[]).includes(action)) {
     malformed(`"${String(action)}" is not something spDEX does with a vault`);
     return violations;
   }
@@ -452,7 +817,21 @@ export function runVaultChecks(
 
   /** The call must be exactly `expected`, sent to `to`: the whole calldata, not just the selector. */
   const expectCall = (to: Address, expected: Hex, what: string) => {
-    if (target !== to) malformed(`the ${what} is sent to ${target}, not ${to}`, { expected: to, actual: target });
+    if (target !== to) {
+      const older = intent.action === "create" ? contracts.releaseOfFactory(target as Address) : null;
+      if (older !== null) {
+        // An earlier release's factory still makes vaults for anyone who asks
+        // it — v1's with no community window and a fee paid to whoever calls —
+        // but spDEX creates vaults only on the latest.
+        malformed(`the vault creation is sent to ${older}'s factory, ${target}: vaults are created only on ${LATEST_RELEASE}'s, ${to}`, {
+          expected: to,
+          actual: target,
+          release: older,
+        });
+      } else {
+        malformed(`the ${what} is sent to ${target}, not ${to}`, { expected: to, actual: target });
+      }
+    }
     if (data !== expected.toLowerCase()) {
       malformed(`the call is not the ${what} its intent describes`, { expected, actual: data });
     }
@@ -528,9 +907,17 @@ export function runVaultChecks(
     !isUsableAddress(claim.address) ||
     !isUsableAddress(claim.owner) ||
     !isAmount(claim.nonce) ||
-    !termsAreWellFormed(claim.terms)
+    !isListedRelease(claim.release)
   ) {
-    malformed("the transaction does not say which vault, whose, and on what terms");
+    malformed("the transaction does not say which vault, whose, from which release and on what terms");
+    return violations;
+  }
+  const release = claim.release;
+  const features = featuresOfRelease(release);
+  if (!termsAreWellFormed(claim.terms, release)) {
+    // A v1 vault has no community window and a v2 vault always has one, and
+    // its turns: terms of another shape are another source's, or none at all.
+    malformed(`the vault's terms are not a ${release} vault's`, { release });
     return violations;
   }
   const vault = lower(claim.address);
@@ -538,14 +925,15 @@ export function runVaultChecks(
 
   let predicted: Address | null = null;
   try {
-    predicted = lower(predictVault({ factory, owner, nonce: claim.nonce, terms: claim.terms }));
+    predicted = lower(predictVault({ factory: contracts.factoryOf(release), owner, nonce: claim.nonce, terms: claim.terms }));
   } catch {
     // Terms too large to pack into a clone: no factory vault has them.
   }
   if (predicted !== vault) {
-    malformed(`${vault} is not the factory's vault for ${owner} on these terms`, {
+    malformed(`${vault} is not ${release}'s factory's vault for ${owner} on these terms`, {
       vault,
       owner,
+      release,
       ...(predicted === null ? {} : { predicted }),
     });
     // Every check below reads the claim, which is now unproved.
@@ -620,7 +1008,28 @@ export function runVaultChecks(
     return violations;
   }
 
-  expectCall(vault, encodeExecute(), "buy");
+  // Who the buy fee goes to, which the release's source decides. A vault
+  // whose `execute` takes `rewardTo` pays the address its call names, and
+  // Trigger now names the owner: the one `rewardTo` its community window
+  // never refuses, and one that gains the sender nothing — so only the owner
+  // sends it, as only the owner funds. A v1 vault pays whoever calls, so its
+  // fee is the account's.
+  const takesRewardTo = features.executeTakesRewardTo;
+  const rewardTo = intent.rewardTo;
+  if (!isUsableAddress(rewardTo)) {
+    malformed("the buy names nobody to pay its fee to", { rewardTo: String(rewardTo) });
+  } else if (takesRewardTo && lower(rewardTo) !== owner) {
+    malformed(`the buy fee would go to ${lower(rewardTo)}, not the vault's owner`, { rewardTo: lower(rewardTo), owner });
+  } else if (!takesRewardTo && lower(rewardTo) !== account) {
+    malformed(`a ${release} vault pays its buy fee to whoever sends the buy, the account, not ${lower(rewardTo)}`, {
+      rewardTo: lower(rewardTo),
+      account,
+    });
+  }
+  if (takesRewardTo && owner !== account) {
+    malformed(`the vault belongs to ${owner}: only its owner triggers a buy whose fee goes back to the owner`, { owner, account });
+  }
+  expectCall(vault, takesRewardTo ? encodeExecute(owner) : encodeExecuteV1(), "buy");
   // With nobody's price in front of them, a buy with no floor would accept
   // any price. The vault keeps its own, and this is the host's reading of it.
   if (typeof intent.floorOut !== "bigint" || intent.floorOut <= 0n) {
@@ -647,12 +1056,15 @@ function mismatchWords(mismatch: VaultTermsMismatch): string {
 }
 
 /**
- * A batch's static checks: one call to the batcher `factory` is bound to —
- * computed, never read from a registry — carrying no ether and exactly the
- * `executeBatch` its intent describes, every buy fee to the account, and the
- * exact gas limit and price the simulation runs at and the wallet signs.
+ * A batch's static checks: one call to the batcher — computed, never read
+ * from a registry — carrying no ether and exactly the `executeBatch` its
+ * intent describes as the host encodes it, every buy fee to the account, every
+ * vault proved by its claim to be one a listed factory made and one that takes
+ * `rewardTo`, and the exact gas limit and price the simulation runs at and the
+ * wallet signs.
  */
-function runBatchChecks(plan: VaultBatchTxPlan, chainId: number, batcher: Address): GuardViolation[] {
+function runBatchChecks(plan: VaultBatchTxPlan, chainId: number, contracts: ReleaseContracts): GuardViolation[] {
+  const batcher = contracts.batcher;
   const { intent } = plan;
   const violations: GuardViolation[] = [];
   const malformed = (message: string, detail?: Record<string, string>) =>
@@ -701,6 +1113,64 @@ function runBatchChecks(plan: VaultBatchTxPlan, chainId: number, batcher: Addres
       seen.add(vault.toLowerCase());
     }
   }
+
+  // Each vault proved, as the account's own vault is (see the header): the
+  // batcher calls whatever it is given, so nothing on chain would refuse a
+  // contract that only looks like a vault.
+  const claims = intent.claims as unknown;
+  if (!Array.isArray(claims) || !Array.isArray(vaults) || claims.length !== vaults.length) {
+    malformed("the batch does not say whose each vault is, from which release and on what terms", {
+      claims: Array.isArray(claims) ? String(claims.length) : "none",
+      vaults: Array.isArray(vaults) ? String(vaults.length) : "none",
+    });
+    listOk = false;
+  } else {
+    for (const [index, claim] of (claims as unknown[]).entries()) {
+      const at = { index: String(index), vault: String(vaults[index]) };
+      const c = claim as Partial<VaultClaim> | null;
+      if (
+        typeof c !== "object" ||
+        c === null ||
+        !isUsableAddress(c.address) ||
+        !isUsableAddress(c.owner) ||
+        !isAmount(c.nonce) ||
+        !isListedRelease(c.release) ||
+        !termsAreWellFormed(c.terms, c.release)
+      ) {
+        malformed(`vault ${index} is not described as a listed release's vault: whose, which nonce, which release, on what terms`, at);
+        listOk = false;
+        continue;
+      }
+      if (!sameAddress(c.address, vaults[index])) {
+        malformed(`vault ${index}'s claim is for ${lower(c.address)}, not ${String(vaults[index])}`, { ...at, claimed: lower(c.address) });
+        listOk = false;
+        continue;
+      }
+      const features = featuresOfRelease(c.release);
+      if (!features.executeTakesRewardTo || !features.communityWindow) {
+        // A v1 vault pays whoever calls it: through a batcher that takes a
+        // `rewardTo`, the call isn't even its `execute()`.
+        malformed(`vault ${index} is a ${c.release} vault, which a batch can't pay the account for`, { ...at, release: c.release });
+        listOk = false;
+        continue;
+      }
+      let predicted: Address | null = null;
+      try {
+        predicted = lower(predictVault({ factory: contracts.factoryOf(c.release), owner: lower(c.owner), nonce: c.nonce, terms: c.terms }));
+      } catch {
+        // Terms too large to pack into a clone: no factory vault has them.
+      }
+      if (predicted !== lower(c.address)) {
+        malformed(`vault ${index}, ${lower(c.address)}, is not ${c.release}'s factory's vault for ${lower(c.owner)} on the terms claimed`, {
+          ...at,
+          release: c.release,
+          ...(predicted === null ? {} : { predicted }),
+        });
+        listOk = false;
+      }
+    }
+  }
+
   const minRewardsOk = isAmount(intent.minRewards) && intent.minRewards >= 1n;
   if (!minRewardsOk) {
     // Zero accepts a batch that earns nothing — one someone else's copy got
@@ -750,13 +1220,143 @@ function runBatchChecks(plan: VaultBatchTxPlan, chainId: number, batcher: Addres
     let expected: Hex | null = null;
     try {
       // Lowercased: the encoder checks a mixed-case address's checksum, and
-      // the bytes are the same either way.
-      expected = encodeExecuteBatch(intent.vaults.map(lower), lower(intent.rewardTo), intent.minRewards);
+      // the bytes are the same either way. As the host encodes it for this
+      // batcher, the gas each vault is given included: a batch that gives a
+      // vault more is one that lets it burn more of the account's gas.
+      expected = encodeExecuteBatch(intent.vaults.map(lower), lower(intent.rewardTo), intent.minRewards, { batcher });
     } catch {
       // Left null: nothing equals it.
     }
     if (expected === null || String(call.data).toLowerCase() !== expected.toLowerCase()) {
       malformed("the call is not the batch its intent describes", { ...(expected === null ? {} : { expected }), actual: String(call.data).toLowerCase() });
+    }
+  }
+  return violations;
+}
+
+/**
+ * A proof's static checks: one call to one of `registries` — the latest
+ * release's first, the one its factory's vaults ask, then any a listed
+ * release records — carrying no ether and exactly the `prove` its intent
+ * describes, with a header that is the block the intent names. Whether that
+ * block is the chain's is the one thing left, and `VaultGuard` reads it.
+ */
+function runProveChecks(plan: VaultProveTxPlan, chainId: number, registries: readonly Address[]): GuardViolation[] {
+  const { intent } = plan;
+  const violations: GuardViolation[] = [];
+  const malformed = (message: string, detail?: Record<string, string>) =>
+    violations.push({ code: "VAULT_MALFORMED", message, ...(detail === undefined ? {} : { detail }) });
+
+  if (intent.chainId !== chainId) {
+    violations.push({
+      code: "CHAIN_MISMATCH",
+      message: `the proof targets chain ${String(intent.chainId)}, the host is on ${chainId}`,
+      detail: { expected: String(chainId), actual: String(intent.chainId) },
+    });
+  }
+  if (!isUsableAddress(intent.account)) {
+    malformed("the proof names no account to send it", { account: String(intent.account) });
+    return violations;
+  }
+  // The registry refuses the zero address too, but only after the fee is paid.
+  const holderOk = isUsableAddress(intent.holder);
+  if (!holderOk) malformed("the proof names no holder", { holder: String(intent.holder) });
+
+  // ── The block ──
+
+  const blockNumber = intent.blockNumber;
+  const blockHash = typeof intent.blockHash === "string" ? intent.blockHash.toLowerCase() : null;
+  const blockOk = isAmount(blockNumber) && blockHash !== null && BYTES32.test(blockHash);
+  if (!blockOk) {
+    malformed("the proof does not say which block it is of", { blockNumber: String(blockNumber), blockHash: String(intent.blockHash) });
+  }
+  const header = typeof intent.header === "string" ? parseHeaderRlp(intent.header) : null;
+  if (header === null) {
+    // What the registry would refuse as `BadHeader`, said before anyone pays to hear it.
+    malformed("the proof's header can't be read as a block's");
+  } else if (blockOk) {
+    // A proof built against another block than the one the intent names:
+    // the hash it would be checked against on chain is not this header's.
+    if (header.hash !== blockHash) {
+      malformed(`the proof's header hashes to ${header.hash}, not block ${blockNumber}'s ${blockHash} it is sent with`, {
+        blockNumber: blockNumber.toString(),
+        expected: blockHash!,
+        actual: header.hash,
+      });
+    }
+    if (header.number !== blockNumber) {
+      malformed(`the proof's header is block ${header.number}'s, not block ${blockNumber}'s`, {
+        expected: blockNumber.toString(),
+        actual: header.number.toString(),
+      });
+    }
+  }
+
+  // ── The proof's two halves ──
+
+  const nodesOk = (nodes: unknown, what: string): nodes is readonly Hex[] => {
+    if (!Array.isArray(nodes) || nodes.length === 0 || nodes.length > MAX_PROOF_NODES || !nodes.every((n) => typeof n === "string" && SOME_BYTES.test(n))) {
+      malformed(`the ${what} proof is not 1 to ${MAX_PROOF_NODES} nodes of bytes`, {
+        nodes: Array.isArray(nodes) ? String(nodes.length) : "none",
+      });
+      return false;
+    }
+    return true;
+  };
+  const accountProofOk = nodesOk(intent.accountProof, "account");
+  const storageProofOk = nodesOk(intent.storageProof, "storage");
+
+  // Each half starts where the one before it says: the account proof from the header's state root, the balance proof
+  // from the storage root the account's leaf states. Halves of another block's state agree with themselves and with
+  // the calldata, and can only revert, at about 650,000 gas; the host's own `assembleProof` refuses them, and is not
+  // believed here either.
+  if (header !== null && accountProofOk) {
+    const accountRoot = proofRoot(intent.accountProof);
+    if (accountRoot !== header.stateRoot) {
+      malformed(`the proof does not start from block ${header.number}'s state root: it is a proof of another state`, {
+        expected: header.stateRoot,
+        actual: String(accountRoot),
+      });
+    } else if (storageProofOk) {
+      const storageRoot = accountProofStorageRoot(intent.accountProof);
+      const balanceRoot = proofRoot(intent.storageProof);
+      if (storageRoot === null || balanceRoot !== storageRoot) {
+        malformed("the balance proof does not start from the storage root its account proof states", {
+          expected: storageRoot ?? "none",
+          actual: String(balanceRoot),
+        });
+      }
+    }
+  }
+
+  // ── The call ──
+
+  if (plan.calls.length !== 1) {
+    malformed(`a proof is one call, not ${plan.calls.length}`);
+    return violations;
+  }
+  const call = plan.calls[0]!;
+  const target = String(call.to).toLowerCase() as Address;
+  if (!registries.includes(target)) {
+    malformed(`the proof is sent to ${target}, not the SPX holder registry ${registries[0]}`, { expected: registries[0]!, actual: target });
+  }
+  if (call.value !== 0n) {
+    malformed(`the proof attaches ${String(call.value)} wei, and a proof takes none`, { value: String(call.value) });
+  }
+  if (holderOk && header !== null && accountProofOk && storageProofOk) {
+    let expected: Hex | null = null;
+    try {
+      expected = encodeProve({
+        holder: lower(intent.holder),
+        header: intent.header,
+        accountProof: [...intent.accountProof],
+        storageProof: [...intent.storageProof],
+      });
+    } catch {
+      // Left null: nothing equals it.
+    }
+    if (expected === null || String(call.data).toLowerCase() !== expected.toLowerCase()) {
+      malformed("the call is not the proof its intent describes", { ...(expected === null ? {} : { expected }), actual: String(call.data).toLowerCase() });
     }
   }
   return violations;
@@ -805,6 +1405,52 @@ function readMovements(logs: SimLog[], weth: Address): Movements {
   return { effects, wrapped, undecodable };
 }
 
+/** What arrived at an address, and what left it, of one token: counted apart, never netted. */
+interface GrossFlow {
+  token: Address;
+  received: bigint;
+  sent: bigint;
+}
+
+/**
+ * Every token that moved in or out of `who`, gross: a balance that rose and
+ * fell again by the same amount nets to nothing in `observeEffects`, and
+ * "nothing passes through" is a claim about each movement, not the sum. WETH
+ * wrapped for `who` counts as arriving, unwrapped as leaving; ether by value
+ * arrives as `traceTransfers`' pseudo-logs, which are `Transfer`s too. A log
+ * that can't be read is left to `readMovements`, which counts it undecodable.
+ */
+function grossFlows(logs: SimLog[], who: Address, weth: Address): GrossFlow[] {
+  const flows = new Map<Address, GrossFlow>();
+  const add = (token: Address, received: bigint, sent: bigint) => {
+    const flow = flows.get(token) ?? { token, received: 0n, sent: 0n };
+    flow.received += received;
+    flow.sent += sent;
+    flows.set(token, flow);
+  };
+  const addressIn = (topic: string | undefined): Address | null =>
+    topic !== undefined && BYTES32.test(topic) ? lower(`0x${topic.slice(26)}`) : null;
+  const amountIn = (data: string): bigint | null => (BYTES32.test(data.slice(0, 66)) ? BigInt(data.slice(0, 66)) : null);
+  for (const log of logs) {
+    const topic = log.topics[0]?.toLowerCase();
+    const token = lower(log.address);
+    if (topic === TOPICS.transfer) {
+      const from = addressIn(log.topics[1]);
+      const to = addressIn(log.topics[2]);
+      const amount = amountIn(log.data);
+      if (amount === null) continue;
+      if (to === who) add(token, amount, 0n);
+      if (from === who) add(token, 0n, amount);
+    } else if (token === weth && (topic === WETH_DEPOSIT || topic === WETH_WITHDRAWAL) && addressIn(log.topics[1]) === who) {
+      const amount = amountIn(log.data);
+      if (amount === null) continue;
+      if (topic === WETH_DEPOSIT) add(weth, amount, 0n);
+      else add(weth, 0n, amount);
+    }
+  }
+  return [...flows.values()];
+}
+
 const etherOf = (moved: Movements, account: Address): bigint => deltaFor(moved.effects, NATIVE_TOKEN, account);
 const wethOf = (moved: Movements, weth: Address, account: Address): bigint =>
   deltaFor(moved.effects, weth, account) + (moved.wrapped.get(account) ?? 0n);
@@ -819,34 +1465,48 @@ const wethOf = (moved: Movements, weth: Address, account: Address): bigint =>
  */
 export class VaultGuard {
   readonly #deployment: FactoryDeployment;
+  readonly #contracts: ReleaseContracts;
   readonly #factory: Address;
   readonly #weth: Address;
-  #batcher: Address | null = null;
 
   constructor(
     private readonly simulation: SimulationProvider,
     private readonly options: VaultGuardOptions,
   ) {
     this.#deployment = options.deployment ?? MAINNET_DEPLOYMENT;
+    this.#contracts = new ReleaseContracts(this.#deployment, options.v1Deployment ?? V1_MAINNET_DEPLOYMENT);
     // Computed once: it hashes the factory's whole creation code.
-    this.#factory = lower(factoryAddress(this.#deployment));
+    this.#factory = this.#contracts.factory;
     this.#weth = lower(this.#deployment.weth);
   }
 
-  /** The factory this Guard holds creations to. */
+  /** The factory this Guard holds creations to: the latest release's, the only one vaults are created on. */
   get factory(): Address {
     return this.#factory;
   }
 
-  /** The batcher bound to that factory: the only place a batch may go. Computed, never read. */
-  get batcher(): Address {
-    this.#batcher ??= lower(batcherAddress(this.#factory));
-    return this.#batcher;
+  /** v1's factory, frozen: the one v1 claims are proved against. Computed, never read. */
+  get v1Factory(): Address {
+    return this.#contracts.v1Factory;
   }
 
-  async check(plan: VaultTxPlan | VaultBatchTxPlan): Promise<GuardVerdict> {
+  /**
+   * The batcher, bound to no factory, built for this Guard's WETH: the only
+   * place a batch may go, and where the host sends one. Computed, never read.
+   */
+  get batcher(): Address {
+    return this.#contracts.batcher;
+  }
+
+  /** The SPX holder registry the latest release's vaults ask: where the host sends a proof. */
+  get registry(): Address {
+    return this.#contracts.registry;
+  }
+
+  async check(plan: AnyVaultTxPlan): Promise<GuardVerdict> {
     if (isBatchPlan(plan)) return this.#checkBatch(plan);
-    const staticViolations = runVaultChecks(plan, this.options.chainId, this.#deployment, this.#factory);
+    if (isProvePlan(plan)) return this.#checkProof(plan);
+    const staticViolations = staticChecks(plan, this.options.chainId, this.#contracts);
     if (staticViolations.length > 0) return rejected(staticViolations);
 
     // Non-null: the static layer refuses anything but exactly one call.
@@ -910,7 +1570,7 @@ export class VaultGuard {
    * earns is known only from its simulation.
    */
   async #checkBatch(plan: VaultBatchTxPlan): Promise<GuardVerdict> {
-    const staticViolations = runVaultChecks(plan, this.options.chainId, this.#deployment, this.#factory, this.batcher);
+    const staticViolations = staticChecks(plan, this.options.chainId, this.#contracts);
     if (staticViolations.length > 0) return rejected(staticViolations);
     const never = (message: string, detail?: Record<string, string>): GuardVerdict =>
       rejected([
@@ -965,6 +1625,188 @@ export class VaultGuard {
   }
 
   /**
+   * A proof of SPX held: static, then the block's hash from the person's own
+   * service, then simulated. It moves no money, so it follows
+   * `requireSimulation` as closing does: without a simulation, or on one
+   * service's when a second was set and didn't answer, it is `unverified`
+   * unless the setting says otherwise. A wrong proof costs its fee and nothing
+   * else; a Guard that refused it outright would keep a holder from proving
+   * on a service that can't test-run.
+   */
+  async #checkProof(plan: VaultProveTxPlan): Promise<GuardVerdict> {
+    const staticViolations = staticChecks(plan, this.options.chainId, this.#contracts);
+    if (staticViolations.length > 0) return rejected(staticViolations);
+    const { intent } = plan;
+
+    const wrongBlock = await this.#checkProofBlock(intent.blockNumber, intent.blockHash.toLowerCase() as Hex);
+    if (wrongBlock !== null) return rejected([wrongBlock]);
+
+    const neverUnchecked = this.options.requireSimulation;
+    const unchecked = (violation: GuardViolation): GuardVerdict => (neverUnchecked ? rejected([violation]) : unverified([violation]));
+    if (!(await this.simulation.isAvailable())) {
+      return unchecked({
+        code: "SIMULATION_UNAVAILABLE",
+        message: "this RPC cannot simulate transactions, so the proof has not been verified",
+        detail: { provider: this.simulation.kind },
+      });
+    }
+    let outcome: SimulationOutcome;
+    try {
+      outcome = await this.simulation.simulate({ chainId: this.options.chainId, account: intent.account, calls: plan.calls });
+    } catch (error) {
+      return unchecked({
+        code: "SIMULATION_UNAVAILABLE",
+        message:
+          error instanceof SimulationUnavailableError
+            ? error.message
+            : `simulation failed: ${error instanceof Error ? error.message : String(error)}`,
+      });
+    }
+
+    let judged: GuardVerdict;
+    if (outcome.status === "reverted") {
+      // The registry's own refusal in words — `NotNewer` above all, which
+      // a proof that would change nothing meets — when the service reported
+      // the revert data; the verifier's errors as "does not match".
+      const error = outcome.returnData === undefined ? null : decodeVaultError(outcome.returnData);
+      const words = describeRegistryError(error);
+      judged = rejected([
+        {
+          code: "SIMULATION_REVERTED",
+          message: words === null ? (outcome.revertReason ?? "the proof reverts") : `the proof would revert: ${words}`,
+          ...(error === null || words === null ? {} : { detail: { reason: error.name } }),
+        },
+      ]);
+    } else {
+      // The registry the static layer held the call to: the latest's, or a listed release's.
+      judged = this.#checkProofEffects(intent, lower(plan.calls[0]!.to), outcome.logs);
+    }
+    // Last, after this service's own checks (see second-opinion.ts).
+    return applySecondOpinion(judged, outcome, { neverUnchecked });
+  }
+
+  /**
+   * Is `blockHash` block `blockNumber`'s hash on the person's own service?
+   * Null when it is; the refusal otherwise. A proof's header hashing to the
+   * hash it is sent with shows only that the two agree with each other: this
+   * is what ties them to the chain.
+   */
+  async #checkProofBlock(blockNumber: bigint, blockHash: Hex): Promise<GuardViolation | null> {
+    let actual: Hex | null = null;
+    let failure: string | null = null;
+    try {
+      actual = this.options.blockHash === undefined ? null : await this.options.blockHash(blockNumber);
+    } catch (error) {
+      failure = error instanceof Error ? error.message : String(error);
+    }
+    if (actual === null) {
+      return {
+        code: "VAULT_MALFORMED",
+        message: `block ${blockNumber}'s hash could not be read from your network service, so the proof is not known to be of the chain's block`,
+        detail: { blockNumber: blockNumber.toString(), blockHash, ...(failure === null ? {} : { failure }) },
+      };
+    }
+    if (typeof actual !== "string" || actual.toLowerCase() !== blockHash) {
+      return {
+        code: "VAULT_MALFORMED",
+        message: `your network service says block ${blockNumber} is ${String(actual).toLowerCase()}, not ${blockHash}: the proof is built against another block`,
+        detail: { blockNumber: blockNumber.toString(), expected: String(actual).toLowerCase(), actual: blockHash },
+      };
+    }
+    return null;
+  }
+
+  /**
+   * What a proof did, from its simulated logs: the registry's one `Proven`,
+   * for this holder and this block, and nothing else of anyone's moving.
+   */
+  #checkProofEffects(intent: VaultProveIntent, registry: Address, logs: SimLog[]): GuardVerdict {
+    const account = lower(intent.account);
+    const holder = lower(intent.holder);
+    const moved = readMovements(logs, this.#weth);
+    const violations: GuardViolation[] = [];
+    const push = (code: GuardViolation["code"], message: string, detail?: Record<string, string>) =>
+      violations.push({ code, message, ...(detail === undefined ? {} : { detail }) });
+
+    if (moved.undecodable > 0) {
+      push("UNDECODABLE_EFFECTS", `${moved.undecodable} transfer, approval or wrap events could not be decoded`, {
+        count: String(moved.undecodable),
+      });
+    }
+
+    // ── Nothing of the account's or the holder's moves ──
+
+    // A proof reads a past block's state and writes one timestamp: no token,
+    // no ether, no allowance, the holder's SPX least of all.
+    for (const [who, party] of [
+      ["the account", account],
+      ["the holder", holder],
+    ] as const) {
+      if (who === "the holder" && holder === account) continue;
+      const etherLost = -etherOf(moved, party);
+      if (etherLost > 0n) push("UNEXPECTED_ETH_TRANSFER", `${etherLost} wei leaves ${who}, and a proof sends none`, { account: party, amount: etherLost.toString() });
+      const wethLost = -wethOf(moved, this.#weth, party);
+      if (wethLost > 0n) push("UNEXPECTED_TOKEN_TRANSFER", `${wethLost} of WETH leaves ${who}`, { account: party, token: this.#weth, amount: wethLost.toString() });
+      for (const delta of moved.effects.deltas.values()) {
+        if (delta.account !== party || delta.delta >= 0n || delta.token === NATIVE_TOKEN || delta.token === this.#weth) continue;
+        push("UNEXPECTED_TOKEN_TRANSFER", `${-delta.delta} of ${delta.token} leaves ${who}`, {
+          account: party,
+          token: delta.token,
+          amount: (-delta.delta).toString(),
+        });
+      }
+      for (const granted of moved.effects.approvals) {
+        if (granted.owner !== party || granted.amount === 0n) continue;
+        push("UNEXPECTED_APPROVAL", `the proof has ${who} grant ${granted.spender} an allowance of ${granted.token}`, {
+          token: granted.token,
+          spender: granted.spender,
+        });
+      }
+    }
+
+    // ── The registry's record ──
+
+    // Only the registry's own logs say what the registry did: anyone can
+    // emit a log shaped like `Proven`.
+    const proven = provenBy(registry, logs);
+    if (proven.length === 0) {
+      push("VAULT_NOT_DELIVERED", "the registry records no proof", { registry });
+    } else if (proven.length > 1) {
+      push("VAULT_MALFORMED", `the registry records ${proven.length} proofs, not one`, { registry, count: String(proven.length) });
+    } else {
+      const record = proven[0]!;
+      // Non-null: the static layer refused a header it couldn't read.
+      const header = parseHeaderRlp(intent.header)!;
+      const validUntil = header.timestamp + PROOF_TTL;
+      if (record.holder !== holder) {
+        push("VAULT_MALFORMED", `the registry records a proof for ${record.holder}, not ${holder}`, { expected: holder, actual: record.holder });
+      }
+      if (record.blockNumber !== intent.blockNumber) {
+        push("VAULT_MALFORMED", `the registry records a proof of block ${record.blockNumber}, not ${intent.blockNumber}`, {
+          expected: intent.blockNumber.toString(),
+          actual: record.blockNumber.toString(),
+        });
+      }
+      if (record.balance < MIN_SPX) {
+        // The registry refuses a holding below the minimum (`BelowMinimum`):
+        // a record of one is not the registry's code at work.
+        push("VAULT_MALFORMED", `the registry records ${record.balance} SPX held, below the ${MIN_SPX} a proof needs`, {
+          balance: record.balance.toString(),
+          minimum: MIN_SPX.toString(),
+        });
+      }
+      if (record.validUntil !== validUntil) {
+        push("VAULT_MALFORMED", `the registry records the proof valid until ${record.validUntil}, not ${validUntil}, 30 days from the block's time`, {
+          expected: validUntil.toString(),
+          actual: record.validUntil.toString(),
+        });
+      }
+    }
+
+    return violations.length > 0 ? rejected(violations) : verified();
+  }
+
+  /**
    * What a batch did, from its simulated logs: the batcher's own `Batch`, each
    * vault's `Bought` joined to the batcher's `Triggered` by position, and the
    * balances they moved.
@@ -975,6 +1817,9 @@ export class VaultGuard {
     const batcher = this.batcher;
     const weth = this.#weth;
     const listed = intent.vaults.map(lower);
+    // The static layer proved each claim, in the order of `vaults`: what each
+    // vault's `Bought` must be laid out as is its release's source's.
+    const sourceOf = new Map(intent.claims.map((c) => [lower(c.address), deploymentOf(c.release).source] as const));
     const moved = readMovements(logs, weth);
     const violations: GuardViolation[] = [];
     const push = (code: GuardViolation["code"], message: string, detail?: Record<string, string>) =>
@@ -1022,6 +1867,11 @@ export class VaultGuard {
     let earned: bigint | null = null;
     if (batch !== null) {
       earned = batch.earned;
+      if (!SOURCES[batch.source].features.sharedBatcher) {
+        // v1's layout, with its `swept`, from the address of a batcher bound to
+        // no factory: not what that code emits, so not a batch it ran.
+        push("VAULT_MALFORMED", `the batcher reports a ${batch.source} batch, and it is a batcher bound to no factory`, { batcher, source: batch.source });
+      }
       if (batch.caller !== account || batch.rewardTo !== account) {
         push("VAULT_MALFORMED", `the batch is credited to ${batch.rewardTo}, called by ${batch.caller}, not the account sending it`, {
           caller: batch.caller,
@@ -1044,12 +1894,32 @@ export class VaultGuard {
           minRewards: intent.minRewards.toString(),
         });
       }
-      if (batch.swept !== 0n) {
-        push(
-          "VAULT_BATCH_UNACCOUNTED",
-          `the batcher holds ${batch.swept} wei of WETH someone sent it, and the batch would pass it to the account`,
-          { swept: batch.swept.toString() },
-        );
+    }
+
+    // ── Nothing passes through the batcher ──
+
+    // The batcher is never paid by a batch it runs, and has no way to pay
+    // anyone: each vault pays the account directly. Counted gross, in and
+    // out, since a fee that arrived and left again nets to nothing: anything
+    // arriving at it is a fee paid elsewhere than the `Bought` says, and
+    // anything leaving it is money nobody can say whose it is
+    // (`VAULT_BATCH_UNACCOUNTED`), which the account is never made the
+    // receiver of.
+    for (const flow of grossFlows(logs, batcher, weth)) {
+      const what = flow.token === weth ? "WETH" : flow.token === NATIVE_TOKEN ? "ether" : flow.token;
+      if (flow.received > 0n) {
+        push("VAULT_MALFORMED", `${flow.received} of ${what} is paid to the batcher, which a batch never pays`, {
+          token: flow.token,
+          amount: flow.received.toString(),
+        });
+      }
+      if (flow.sent > 0n) {
+        push("VAULT_BATCH_UNACCOUNTED", `${flow.sent} of ${what} leaves the batcher, which passes on nothing`, {
+          token: flow.token,
+          amount: flow.sent.toString(),
+          // In wei, read by the app as what the batch would pass on (lib/errors.ts).
+          ...(flow.token === weth ? { swept: flow.sent.toString() } : {}),
+        });
       }
     }
 
@@ -1057,6 +1927,7 @@ export class VaultGuard {
 
     const seen = new Map<Address, "triggered" | "not">();
     let triggered = 0n;
+    let paid = 0n;
     for (const { event, bought } of run?.triggered ?? []) {
       triggered += 1n;
       const vault = event.vault;
@@ -1070,8 +1941,22 @@ export class VaultGuard {
         push("VAULT_MALFORMED", `${vault} is reported bought with no buy of its own right before`, { vault });
         continue;
       }
+      paid += bought.reward;
+      const expectedSource = sourceOf.get(vault);
+      if (bought.source !== expectedSource) {
+        // The claim proved which release's vault this is, and so which code
+        // logs its buy: a buy laid out otherwise is not that code's.
+        push("VAULT_MALFORMED", `${vault}'s buy is laid out as a ${bought.source} vault's, and it is a ${String(expectedSource)} vault`, {
+          vault,
+          expected: String(expectedSource),
+          actual: bought.source,
+        });
+      }
       if (bought.keeper !== batcher) {
-        push("VAULT_MALFORMED", `${vault}'s buy is credited to ${bought.keeper}, not the batcher`, { vault, keeper: bought.keeper });
+        push("VAULT_MALFORMED", `${vault}'s buy is made by ${bought.keeper}, not the batcher`, { vault, keeper: bought.keeper });
+      }
+      if (bought.rewardTo !== account) {
+        push("VAULT_MALFORMED", `${vault}'s buy fee is paid to ${bought.rewardTo}, not the account`, { vault, rewardTo: bought.rewardTo, account });
       }
       if (bought.amountOut < bought.floorOut) {
         push("VAULT_NOT_DELIVERED", `${vault} delivers ${bought.amountOut}, below its floor of ${bought.floorOut}`, {
@@ -1101,7 +1986,11 @@ export class VaultGuard {
       }
       if (seen.has(vault)) push("VAULT_MALFORMED", `the batch tries ${vault} twice`, { vault });
       seen.set(vault, "not");
-      if (event.reasonName === "NotFromFactory" || event.reasonName === "NotTried") {
+      // `NotTried`: the gas ran out, which the limit exists to rule out.
+      // `EmptyReturn`: the call found no code, so the claim named a vault that
+      // isn't there. `NotFromFactory` is only v1's batcher's, and never this
+      // one's.
+      if (event.reasonName === "NotFromFactory" || event.reasonName === "NotTried" || event.reasonName === "EmptyReturn") {
         push("VAULT_MALFORMED", `the batcher reports ${vault} as ${event.reasonName}`, { vault, reason: event.reasonName });
       }
       // A vault that didn't buy parts with nothing.
@@ -1118,6 +2007,17 @@ export class VaultGuard {
       push("VAULT_MALFORMED", `the batch reports ${batch.bought} buys and ${triggered} are triggered`, {
         bought: batch.bought.toString(),
         triggered: triggered.toString(),
+      });
+    }
+    // `earned` is how much the account's WETH rose while the batch ran, as
+    // the batcher measured it. Every vault in it is proved, and pays only its
+    // fee to the account, so that is exactly the fees their `Bought`s
+    // report: a figure that differs is money from somewhere else, or not that
+    // batcher's figure at all.
+    if (batch !== null && batch.earned !== paid) {
+      push("VAULT_MALFORMED", `the batch reports earning ${batch.earned} wei, and its vaults pay ${paid}`, {
+        earned: batch.earned.toString(),
+        paid: paid.toString(),
       });
     }
 
@@ -1244,6 +2144,13 @@ export class VaultGuard {
       case "trigger":
         this.#checkBuy(intent, account, logs, moved, push);
         break;
+      default: {
+        // An action the static layer admitted with no effects check of its own
+        // here: never verified on the generic checks above alone. Adding one
+        // to `VaultIntent` without a case here fails to compile.
+        const unhandled: never = intent;
+        push("VAULT_MALFORMED", `nothing here checks what "${String((unhandled as { action?: unknown }).action)}" does`);
+      }
     }
 
     return violations.length > 0 ? rejected(violations) : verified();
@@ -1348,7 +2255,11 @@ export class VaultGuard {
     }
   }
 
-  /** One buy, credited to this caller, delivering at least the floor to the owner and the reward to the caller. */
+  /**
+   * One buy, made by this account, delivering at least the floor to the owner
+   * and the fee to whoever the release pays: the owner of a vault that takes
+   * `rewardTo`, named by the call, or a v1 vault's caller.
+   */
   #checkBuy(
     intent: VaultTriggerIntent,
     account: Address,
@@ -1359,7 +2270,13 @@ export class VaultGuard {
     const weth = this.#weth;
     const vault = lower(intent.vault.address);
     const owner = lower(intent.vault.owner);
-    const { terms } = intent.vault;
+    const { terms, release } = intent.vault;
+    const source = deploymentOf(release).source;
+    const takesRewardTo = SOURCES[source].features.executeTakesRewardTo;
+    // Who the fee goes to: the owner, whom Trigger now names on a vault that
+    // takes `rewardTo` (the static layer held `rewardTo` to that), or v1's
+    // caller.
+    const paidTo = takesRewardTo ? owner : account;
 
     // The vault is proved genuine, so its own `Bought` is its word on what it
     // did; the balances below are the check on that word.
@@ -1372,11 +2289,26 @@ export class VaultGuard {
       push("VAULT_NOT_DELIVERED", "the vault makes no buy", { vault });
     } else if (buys.length > 1) {
       push("VAULT_MALFORMED", `the vault makes ${buys.length} buys in one transaction`, { vault });
-    } else if (buys[0]!.keeper !== account) {
-      push("VAULT_MALFORMED", `the buy's fee is credited to ${buys[0]!.keeper}, not the account triggering it`, {
-        keeper: buys[0]!.keeper,
-        account,
-      });
+    } else {
+      const bought = buys[0]!;
+      if (bought.source !== source) {
+        // A v1 vault cannot log v2's `Bought`, nor the reverse: the buy is
+        // not the one this vault's code makes.
+        push("VAULT_MALFORMED", `the vault's buy is laid out as a ${bought.source} vault's, and the vault is ${release}'s`, {
+          vault,
+          expected: source,
+          actual: bought.source,
+        });
+      }
+      if (bought.keeper !== account) {
+        push("VAULT_MALFORMED", `the buy is made by ${bought.keeper}, not the account triggering it`, { keeper: bought.keeper, account });
+      }
+      if (bought.rewardTo !== paidTo) {
+        push("VAULT_MALFORMED", `the buy's fee is paid to ${bought.rewardTo}, not ${takesRewardTo ? "the vault's owner" : "the account triggering it"}`, {
+          rewardTo: bought.rewardTo,
+          expected: paidTo,
+        });
+      }
     }
 
     const received = deltaFor(moved.effects, lower(terms.tokenOut), owner);
@@ -1387,12 +2319,15 @@ export class VaultGuard {
         floorOut: intent.floorOut.toString(),
       });
     }
-    const rewarded = wethOf(moved, weth, account);
+    // Measured where the fee goes. For Trigger now on a v2 vault that is the
+    // owner, who is the account; the balance is the check on the `Bought`.
+    const rewarded = wethOf(moved, weth, paidTo);
     if (rewarded < terms.keeperReward) {
-      push("VAULT_NOT_DELIVERED", `the caller receives ${rewarded} of WETH, not the buy fee of ${terms.keeperReward}`, {
-        received: rewarded.toString(),
-        reward: terms.keeperReward.toString(),
-      });
+      push(
+        "VAULT_NOT_DELIVERED",
+        `${takesRewardTo ? "the vault's owner" : "the caller"} receives ${rewarded} of WETH, not the buy fee of ${terms.keeperReward}`,
+        { account: paidTo, received: rewarded.toString(), reward: terms.keeperReward.toString() },
+      );
     }
 
     // The vault parts with one buy and its reward, and nothing else.

@@ -17,14 +17,15 @@ import type { PreparedFees } from "@spdex/chain";
 import type { Address } from "@spdex/core";
 import {
   BUY_FEE_CEILING_BPS,
-  BUY_FEE_MARKUP_BPS,
+  BUY_FEE_SHARE_BPS,
   CHEAP_BATCHED_BUY_THRESHOLD,
-  FULL_BUY_FEE,
-  FULL_FEE_BUY_THRESHOLD,
-  atFeeCeiling,
+  NETWORK_PART,
+  SOURCES,
+  V1_BUY_FEE_MARKUP_BPS,
   coversCheapBatchedBuy,
   feeShareBps,
   type BuyFee,
+  type SourceId,
 } from "@spdex/vault";
 import { ethText, ethUpTo } from "../../lib/dca/format.js";
 import { percentText, type FeeRead } from "../../lib/dca/form.js";
@@ -43,30 +44,33 @@ import {
   type VaultTerms,
 } from "../../lib/dca/vault.js";
 import { dateTime } from "../../lib/dca/view.js";
+import { localClock } from "../../lib/steps.js";
 import { fiatCostText, type MoneyView } from "../../lib/money/convert.js";
+import { COMMUNITY_KEEPING_TEXT } from "../../lib/network/batch.js";
 import { bpsPercentText, formatCount, formatNumber } from "../../lib/money/format.js";
 
 /**
  * The buy fee's ceiling, "0.69", and what it asks for beyond the network
- * cost, "10", as the copy states them: from the release's constants, so the
- * words can't drift from the fee. Functions rather than constants, like every
- * figure below: the page's number format ("0,69" in German) is only known
- * once the money settings are read, after this module loads.
+ * cost, "0.25" of the buy, as the copy states them: from the release's
+ * constants, so the words can't drift from the fee. v1's vaults keep v1's
+ * rule, a tenth of the network cost ("10"), and their cards say that one.
+ * Functions rather than constants, like every figure below: the page's number
+ * format ("0,69" in German) is only known once the money settings are read,
+ * after this module loads.
  */
 const ceilingPercent = (): string => bpsPercentText(Number(BUY_FEE_CEILING_BPS));
-const markupPercent = (): string => bpsPercentText(Number(BUY_FEE_MARKUP_BPS));
+const sharePercent = (): string => bpsPercentText(Number(BUY_FEE_SHARE_BPS));
+const v1MarkupPercent = (): string => bpsPercentText(Number(V1_BUY_FEE_MARKUP_BPS));
 
 /**
  * The buy fee's rule in one phrase, for every sentence that states it: "a
- * fixed amount for network fees plus 10% of that, never more than 0.69% of
- * the buy". "Fixed", because the network part is a release constant
- * (`buyFee`), the same for every plan and every buy; "network cost plus 10%"
- * read as if it followed the gas price of the moment up to the ceiling. "Of
- * that", because a bare "plus 10%" beside "of the buy" read as a tenth of
- * the buy.
+ * fixed amount for network fees plus 0.25% of the buy, never more than 0.69%
+ * of the buy". "Fixed", because the network part is a release constant
+ * (`buyFee`), the same for every plan and every buy; "network cost plus …"
+ * read as if it followed the gas price of the moment up to the ceiling.
  */
 export const vaultFeeRule = (): string =>
-  `a fixed amount for network fees plus ${markupPercent()}% of that, never more than ${ceilingPercent()}% of the buy`;
+  `a fixed amount for network fees plus ${sharePercent()}% of the buy, never more than ${ceilingPercent()}% of the buy`;
 
 /**
  * The words a vault adds, for `<Term tip={…}>`.
@@ -79,11 +83,20 @@ export const VAULT_TIPS = {
   vault:
     "A small contract you create for one plan. It holds the plan's budget and makes each buy when anyone triggers a due one — no spDEX tab needed, though somebody has to trigger it. Its terms are fixed when it's made: nobody, not spDEX, can change them or take the funds. Only you can close it and take back what's left.",
   keeper:
+    "Whoever makes a due buy happen: a bot (for example one that makes many vaults' buys in one transaction, which costs less per buy), a spDEX tab, or you. " +
+    `${COMMUNITY_KEEPING_TEXT} ` +
+    "Nobody is obliged to make a buy: a buy time nobody triggers is skipped. A keeper picks only the moment, inside a due buy time, and who its own fee goes to; the vault fixes the amount, the price floor and where the tokens go.",
+  /** "Keeper" on a v1 vault's card: a v1 vault pays whoever triggers it, and has no community window. */
+  keeperV1:
     "Whoever sends the transaction that makes a due buy happen: a bot (for example one that makes many vaults' buys in one transaction, which costs less per buy), a spDEX tab, or you. The vault pays them the buy fee. Nobody is obliged to: a buy time nobody triggers is skipped. A keeper picks only the moment, inside a due buy time; the vault fixes the amount, the price floor and where the tokens go.",
   // The last sentence is the disclosure the how list makes, here too: this
   // tip is the only explanation of the fee on a vault's card.
   get fee(): string {
-    return `Set once, when the vault is created, and paid from its budget as WETH to whoever triggers each buy: a fixed estimate of one buy's network fee when many buys share a transaction, plus ${markupPercent()}% of that estimate, and never more than ${ceilingPercent()}% of the buy. No vault can be created with more, and nobody can change it afterwards, spDEX included. Whoever triggers a buy may be a keeper run by spDEX's developers, who keep what's left of it after the network fee.`;
+    return `Set once, when the vault is created, and paid from its budget as WETH to the keeper that makes each buy — or back to you when you trigger it: a fixed estimate of one buy's network fee when many buys share a transaction, plus ${sharePercent()}% of the buy, and never more than ${ceilingPercent()}% of the buy. No vault can be created with more, and nobody can change it afterwards, spDEX included. The keeper may be one run by spDEX's developers, who keep what's left of it after the network fee.`;
+  },
+  /** The fee tip on a v1 vault's card: v1's rule, which that vault keeps for good. */
+  get feeV1(): string {
+    return `Set once, when the vault was created, and paid from its budget as WETH to whoever triggers each buy: a fixed estimate of one buy's network fee when many buys share a transaction, plus ${v1MarkupPercent()}% of that estimate, and never more than ${ceilingPercent()}% of the buy. Nobody can change it, spDEX included. Whoever triggers a buy may be a keeper run by spDEX's developers, who keep what's left of it after the network fee.`;
   },
   weth: "Wrapped Ether: ETH as a token, always worth exactly 1 ETH. A vault holds its budget, and pays its buy fees, as WETH; closing it sends what's left back to you as ETH.",
   tenMinuteAverage:
@@ -91,16 +104,66 @@ export const VAULT_TIPS = {
 } as const satisfies Record<string, string>;
 
 /**
- * Gas the vault factory's one-time deployment uses: 3,562,618 measured on the
- * shared fork through the deterministic deployer (this release's factory, the
- * one that keeps a list of its vaults), rounded up. For the cost sentence
- * only; the wallet sets the real limit.
+ * "Keeper" on a card for a vault built from `source`: one that pays the
+ * `rewardTo` its trigger names, with a community window (v2 on), or one that
+ * pays whoever triggers it (v1). By what the source can do, not its name.
  */
-export const FACTORY_DEPLOY_GAS = 3_570_000n;
+export function keeperTipFor(source: SourceId): string {
+  return SOURCES[source].features.executeTakesRewardTo ? VAULT_TIPS.keeper : VAULT_TIPS.keeperV1;
+}
 
-/** "3.6" ("3,6" in German): the factory's deployment gas in millions, as the setup banner says it. */
-export const factoryDeployMillions = (): string =>
-  formatNumber(Number(FACTORY_DEPLOY_GAS) / 1e6, { minimumFractionDigits: 1, maximumFractionDigits: 1 });
+/**
+ * The buy fee's tip by the rule a source's plans were offered, which each of
+ * its vaults keeps for good. Keyed by source and typed so: a new source does
+ * not compile without its own sentence, since what fee its plans are offered
+ * is a release decision (`SOURCE_BUYS` in @spdex/vault); a release built from
+ * an existing source shares its row.
+ */
+const FEE_TIPS: Record<SourceId, () => string> = {
+  v1: () => VAULT_TIPS.feeV1,
+  v2: () => VAULT_TIPS.fee,
+};
+
+/** The buy fee's tip on a card for a vault built from `source`. */
+export const feeTipFor = (source: SourceId): string => FEE_TIPS[source]();
+
+/**
+ * A vault with turns, in one line: "The first half of each community window
+ * is shared out in turns among 4 groups of SPX holders; then any holder can
+ * earn the fee, and after the window anyone can." Null for a vault without
+ * turns (0, every vault spDEX creates until decision 29 of docs/V2_UPGRADE.md
+ * calls for them) and for one whose source has none.
+ */
+export function vaultTurnsLine(turnBuckets: number | null): string | null {
+  if (turnBuckets === null || turnBuckets === 0) return null;
+  return `The first half of each community window is shared out in turns among ${formatCount(turnBuckets)} groups of SPX holders; then any holder can earn the fee, and after the window anyone can.`;
+}
+
+/**
+ * Gas the vault factory's one-time deployment uses: about 3,850,000 for this
+ * release's, estimated on the shared fork as a plain creation (3,894,464) and
+ * scaled as v1's estimate was to its measured 3,562,618 through the
+ * deterministic deployer, rounded up. For the cost sentence only; the wallet
+ * sets the real limit.
+ */
+export const FACTORY_DEPLOY_GAS = 3_850_000n;
+
+/**
+ * Gas the SPX holder registry's one-time deployment uses, the factory's first
+ * step where it isn't on the chain yet: about 1,760,000, estimated the same
+ * way (1,777,825 as a plain creation).
+ */
+export const REGISTRY_DEPLOY_GAS = 1_760_000n;
+
+/**
+ * What setting vaults up on a network deploys, in gas: the factory, and the
+ * registry before it when `registryMissing`.
+ */
+export const setupGas = (registryMissing: boolean): bigint => FACTORY_DEPLOY_GAS + (registryMissing ? REGISTRY_DEPLOY_GAS : 0n);
+
+/** "3.9" ("3,9" in German): the setup's gas in millions, as the setup banner says it. */
+export const factoryDeployMillions = (registryMissing = false): string =>
+  formatNumber(Number(setupGas(registryMissing)) / 1e6, { minimumFractionDigits: 1, maximumFractionDigits: 1 });
 
 /**
  * Gas a wallet plan's buy of SPX with ETH uses: what confirming each buy
@@ -156,8 +219,13 @@ function buyFeeSentence(fee: BuyFee, money: MoneyView | undefined): string {
   return `Buy fee: ${lead} a buy${fee.atCeiling ? ", the most it can be" : ""}, ${FEE_PAYEE}.`;
 }
 
-/** Who the buy fee goes to, said wherever the fee is: whoever triggers the buy, maybe spDEX's developers. */
-export const FEE_PAYEE = "paid to whoever triggers it — maybe spDEX's developers";
+/**
+ * Who a new vault's buy fee goes to, said wherever the fee is: the keeper
+ * that makes the buy, maybe spDEX's developers'. Who may be paid first, SPX
+ * holders in each buy's community window, is said once, by the window's own
+ * line (`communityWindowLine`), not again beside every fee.
+ */
+export const FEE_PAYEE = "paid to the keeper that makes it — maybe spDEX's developers";
 
 /**
  * The two ways a Recurring plan runs, as their choice cards are titled.
@@ -267,9 +335,11 @@ function fromAmountText(threshold: bigint, money: MoneyView | undefined): string
  *   this small, is less than one batched buy's network cost even at a cheap
  *   block. Nothing obliges a keeper to pay the difference, so the honest
  *   word is "may".
- * - **Depends on low network fees** (held at the ceiling, and covering a
- *   cheap batched buy): less than the fixed amount larger buys pay, so a
- *   keeper's cost is covered only while fees stay low, and none is promised.
+ * - **Depends on low network fees** (held at the ceiling below the network
+ *   part, and covering a cheap batched buy): less than one batched buy's
+ *   network cost at the release's reference fee, which larger buys pay in
+ *   full, so a keeper's cost is covered only while fees stay low, and none is
+ *   promised.
  * - **Your wallet is cheaper** (fees read, and the fee more than twice what a
  *   wallet buy's gas costs now): at fees this low a vault costs more than
  *   confirming each buy, and the person should know that the fee is what the
@@ -292,7 +362,7 @@ export function vaultFeeNotes(fee: BuyFee, input: { amountPerBuy: bigint; fees: 
     notes.push({
       testId: "dca-form-vault-held",
       banner: { tone: "ok", title: "Small buys depend on low network fees" },
-      text: `Held at ${ceilingPercent()}%, their buy fee may not cover a keeper's cost unless network fees are low. ${fromAmountText(FULL_FEE_BUY_THRESHOLD, input.money)} a buy avoids this.`,
+      text: `Held at ${ceilingPercent()}%, their buy fee may not cover a keeper's cost unless network fees are low. ${fromAmountText(HELD_BELOW, input.money)} a buy avoids this.`,
     });
   }
   const wallet = walletBuyGasCost(input.fees);
@@ -308,15 +378,23 @@ export function vaultFeeNotes(fee: BuyFee, input: { amountPerBuy: bigint; fees: 
 }
 
 /**
+ * The least buy whose fee, held at the 0.69% ceiling, still covers one
+ * batched buy's network cost at the release's reference fee (`NETWORK_PART`):
+ * about 0.00274 ETH. Below it, a fee is "held" under that cost.
+ */
+export const HELD_BELOW = (NETWORK_PART * 10_000n + BUY_FEE_CEILING_BPS - 1n) / BUY_FEE_CEILING_BPS;
+
+/**
  * Which of the two buy-fee warnings a fee earns, the form's and a card's
  * alike: "small" when it is less than one batched buy's network cost even at
  * a cheap block, "held" when it covers that but the ceiling holds it under
- * what larger buys pay, or null. A fee at the ceiling that is the full fee,
- * as the smallest buy the ceiling spares pays, is not held.
+ * that cost at the release's reference fee, which larger buys pay in full
+ * (`NETWORK_PART`), or null. Only the ceiling can hold a fee under the network
+ * part: unheld, a fee is that part and its share of the buy.
  */
 function feeTier(reward: bigint, amountPerBuy: bigint): "small" | "held" | null {
   if (!coversCheapBatchedBuy(reward)) return "small";
-  return atFeeCeiling(reward, amountPerBuy) && reward < FULL_BUY_FEE ? "held" : null;
+  return amountPerBuy > 0n && reward < NETWORK_PART ? "held" : null;
 }
 
 /**
@@ -381,9 +459,13 @@ export function triggerCostText(fees: FeeRead, reward: bigint, firstBuy: boolean
   return "That network fee is more than the buy fee, so waiting for a keeper costs you less.";
 }
 
-/** What the factory's one-time deployment costs at today's fees, or null when fees aren't read. */
-export function deployFee(fees: PreparedFees | null): bigint | null {
-  return fees === null ? null : FACTORY_DEPLOY_GAS * feePerGasNow(fees);
+/**
+ * What setting vaults up costs at today's fees — the factory's one-time
+ * deployment, and the registry's before it when `registryMissing` — or null
+ * when fees aren't read.
+ */
+export function deployFee(fees: PreparedFees | null, registryMissing = false): bigint | null {
+  return fees === null ? null : setupGas(registryMissing) * feePerGasNow(fees);
 }
 
 /**
@@ -435,6 +517,9 @@ export function closeConfirmText(figures: Pick<VaultFigures, "balance">): string
  * (a vault simply waiting for its next buy time), or words the chain's own
  * phrasing would make awkward — a buy due by the clock carried forward that no
  * block has shown yet reads as a wait for that block, not as an ISO timestamp.
+ * A vault without a community window (v1) is anyone's once due; one with a
+ * window is SPX holders' first, which its due banner says
+ * (`communityWindowLiveText`), so its wait says no more than that it waits.
  */
 export function vaultLine(status: VaultCardStatus, state: VaultPlanState): string {
   const figures = state.kind === "active" || state.kind === "someone-else" ? state : null;
@@ -442,9 +527,8 @@ export function vaultLine(status: VaultCardStatus, state: VaultPlanState): strin
     return "The next buy is due about now. It can be triggered once the network's next block shows it.";
   }
   if (status.vault === "waiting") {
-    return figures !== null && figures.buysDone === 0
-      ? "Waiting for the first buy time. Then anyone can trigger it."
-      : "Waiting for the next buy time. Then anyone can trigger it.";
+    const wait = figures !== null && figures.buysDone === 0 ? "Waiting for the first buy time." : "Waiting for the next buy time.";
+    return figures !== null && !SOURCES[figures.source].features.communityWindow ? `${wait} Then anyone can trigger it.` : wait;
   }
   return status.reason ?? "";
 }
@@ -513,10 +597,76 @@ export function retryPayeeText(): string {
  * The line above "Create and fund vault": the limits a newcomer must see
  * before the one click that puts the whole budget into an unaudited vault
  * (UI rule R6). A plan imported from a settings link reaches
- * this card without ever seeing the Recurring form that says them.
+ * this card without ever seeing the Recurring form that says them. Anyone can
+ * make a due buy, but SPX holders have first claim for its community window:
+ * both halves stay in view.
  */
 export function retryRulesText(cap: string): string {
-  return `Anyone can make its due buys; nobody has to. Only closing it stops it. At most ${cap}.`;
+  return `Anyone can make its due buys, SPX holders first; nobody has to. Only closing it stops it. At most ${cap}.`;
+}
+
+// ── The community window ──────────────────────────────────────────────────
+
+/**
+ * A community window's length after "its first": "30 minutes", "75 seconds",
+ * "minute", "hour". Whole minutes as minutes, anything else in seconds.
+ */
+function windowLength(seconds: number): string {
+  if (seconds === 60) return "minute";
+  if (seconds === 3_600) return "hour";
+  return seconds % 60 === 0 ? `${formatCount(seconds / 60)} minutes` : `${formatCount(seconds)} seconds`;
+}
+
+/**
+ * The one line every vault plan shows, Simple and Expert alike: who may earn
+ * its fee, and for how long (decision 3 of docs/V2_UPGRADE.md). "SPX holders
+ * can earn this plan's fee for its first 30 minutes after each buy falls due;
+ * then anyone can." Earn, not "be paid": the owner's own Trigger now is paid
+ * the fee back, which is no one earning it.
+ */
+export function communityWindowLine(seconds: number): string {
+  return `SPX holders can earn this plan's fee for its first ${windowLength(seconds)} after each buy falls due; then anyone can.`;
+}
+
+/** Expert's one hint beside the window's choice, as decision 26 words it. */
+export const COMMUNITY_WINDOW_HINT =
+  "Shorter: your buy happens sooner when no holder is online. Longer: holders have more time to earn your fee.";
+
+/** "1 min", "75 s": a window in the select's short form. */
+function windowShort(seconds: number): string {
+  return seconds % 60 === 0 ? `${formatCount(seconds / 60)} min` : `${formatCount(seconds)} s`;
+}
+
+/** An option of Expert's window select: "30 min", or "A quarter of the interval (75 s)". */
+export function windowOptionLabel(option: { value: string; seconds: number }): string {
+  return option.value === "quarter" ? `A quarter of the interval (${windowShort(option.seconds)})` : windowShort(option.seconds);
+}
+
+/**
+ * The due banner's line on a vault while its buy is inside its community
+ * window: "Community window until 14:32, then open to anyone." Inside the
+ * first half of a window shared out in turns, it says that too: "This buy's
+ * turn until 14:17, for SPX holders in its group; then any SPX holder until
+ * 14:32, then anyone." Null for a vault without a window (v1), one whose buy
+ * isn't due by the clock, after the window, and when the chain's clock is
+ * unknown. The times are chain time, shown in this device's clock
+ * (`deviceTimeOf`), as the card's other times.
+ */
+export function communityWindowLiveText(
+  figures: Pick<VaultFigures, "source" | "windowEndsAt" | "nextBuyAt"> & Partial<Pick<VaultFigures, "turnEndsAt">>,
+  chainNow: number | null,
+  nowMs: number,
+): string | null {
+  const { windowEndsAt, nextBuyAt } = figures;
+  if (!SOURCES[figures.source].features.communityWindow || windowEndsAt === null || nextBuyAt === null || chainNow === null) return null;
+  if (chainNow < nextBuyAt || chainNow >= windowEndsAt) return null;
+  const windowEnds = localClock(deviceTimeOf(windowEndsAt, chainNow, nowMs));
+  const turnEndsAt = figures.turnEndsAt ?? null;
+  if (turnEndsAt !== null && chainNow < turnEndsAt) {
+    const turnEnds = localClock(deviceTimeOf(turnEndsAt, chainNow, nowMs));
+    return `This buy's turn until ${turnEnds}, for SPX holders in its group; then any SPX holder until ${windowEnds}, then anyone.`;
+  }
+  return `Community window until ${windowEnds}, then open to anyone.`;
 }
 
 /** One row of a vault's history, as the card lists it. */

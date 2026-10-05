@@ -1,10 +1,15 @@
 import { describe, expect, it } from "vitest";
 import {
   onBuyDueClick,
+  onProofLapseClick,
   showBuyDue,
+  showProofLapse,
   BUY_DUE_BODY,
+  BUY_DUE_KIND,
+  BUY_DUE_MESSAGE,
   BUY_DUE_TAG,
   BUY_DUE_TITLE,
+  PROOF_LAPSE_MESSAGE,
   createBuyDueNotifier,
   NOTIFY_KEY,
   NOTIFY_PREF,
@@ -141,6 +146,45 @@ describe("the buy-due notification", () => {
     second();
     showBuyDue();
     expect(calls).toEqual(["first", "second"]);
+  });
+});
+
+describe("the proof-lapse reminder, on the same path", () => {
+  it("says only its own words, with nothing to fetch, and fires once per lapse while the tab is hidden", () => {
+    const { api, shown } = fakeApi();
+    const notifier = createBuyDueNotifier({ Notification: api, document: hidden }, PROOF_LAPSE_MESSAGE);
+    notifier.update(true);
+    notifier.update(true);
+    expect(shown).toHaveLength(1);
+    expect(shown[0]!.title).toBe("spDEX: your SPX proof lapses soon");
+    expect(shown[0]!.options).toEqual({ body: "Prove it again in Community keeping, under Help run the network.", tag: "spdex-proof-lapse" });
+    // Lapsed, or proven again: it closes.
+    notifier.update(false);
+    expect(shown[0]!.closed).toBe(true);
+    // Never while the tab is in front.
+    expect(createBuyDueNotifier({ Notification: api, document: visible }, PROOF_LAPSE_MESSAGE).notify()).toBe(false);
+  });
+
+  it("never replaces a due buy's notification: its own tag, and the buy-due words stay the default", () => {
+    expect(PROOF_LAPSE_MESSAGE.tag).not.toBe(BUY_DUE_MESSAGE.tag);
+    expect(BUY_DUE_MESSAGE).toEqual({ title: BUY_DUE_TITLE, body: BUY_DUE_BODY, tag: BUY_DUE_TAG });
+    expect(BUY_DUE_KIND.message).toBe(BUY_DUE_MESSAGE);
+    expect(BUY_DUE_KIND.pref).toBe(NOTIFY_PREF);
+    const { api, shown } = fakeApi();
+    createBuyDueNotifier({ Notification: api, document: hidden }).update(true);
+    expect(shown[0]!.options).toEqual({ body: BUY_DUE_BODY, tag: BUY_DUE_TAG });
+  });
+
+  it("lets the page say what a click on it shows, apart from a due buy's", () => {
+    const calls: string[] = [];
+    const lapse = onProofLapseClick(() => calls.push("lapse"));
+    const buy = onBuyDueClick(() => calls.push("buy"));
+    showProofLapse();
+    showBuyDue();
+    lapse();
+    buy();
+    showProofLapse();
+    expect(calls).toEqual(["lapse", "buy"]);
   });
 });
 

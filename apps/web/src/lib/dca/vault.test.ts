@@ -11,23 +11,28 @@
  */
 
 import { describe, expect, it, vi } from "vitest";
-import { NATIVE_TOKEN, TOKENS, type JsonRpc, type PreparedFees } from "@spdex/chain";
+import { NATIVE_TOKEN, TOKENS, transactionHash, type JsonRpc, type PreparedFees } from "@spdex/chain";
 import type { Address, DcaPlan, GuardVerdict, Hex, SpdexConfig } from "@spdex/core";
 import { addDcaPlan, recommendedConfig, updateDcaPlan } from "@spdex/config";
 import { runVaultChecks } from "@spdex/guard";
 import {
   DEPLOYMENTS,
   MAINNET_DEPLOYMENT,
-  batcherAddress,
+  MAINNET_REGISTRY,
+  V1_MAINNET_FACTORY,
+  LISTED_BATCHERS,
+  MAINNET_BATCHER,
   buyFee,
   decodeVaultEvent,
   encodeClose,
   encodeCreateVault,
   encodeExecute,
+  encodeExecuteV1,
   encodeFund,
   factoryAddress,
   predictVault,
   termsOfPlan,
+  v1BuyFee,
   VAULT_LOGS_FROM_BLOCK,
   type VaultAvailability,
   type VaultState,
@@ -59,6 +64,14 @@ import {
   triggerVaultTx,
   vaultCardStatus,
   vaultClaim,
+  vaultFactories,
+  defaultVaultWindow,
+  quarterVaultWindow,
+  vaultWindowChoiceOf,
+  vaultWindowOf,
+  vaultWindowOptions,
+  vaultWindowValue,
+  factoryCountsOf,
   deviceTimeOf,
   vaultAverageStat,
   vaultBoughtStat,
@@ -74,7 +87,11 @@ import {
   vaultRemovalWarning,
   vaultRetryTerms,
   vaultStartAt,
+  vaultStartLead,
+  VAULT_CREATION_SECONDS,
   vaultSupportFrom,
+  deployVaultFactory,
+  factoryRefusalBeforeRegistry,
   keepVaultPlans,
   createVault,
   closedAndEmpty,
@@ -105,9 +122,14 @@ const OWNER = "0x00000000000000000000000000000000000000a1" as Address;
 const STRANGER = "0x00000000000000000000000000000000000000b2" as Address;
 const MARKET = MAINNET_DEPLOYMENT.markets[0]!;
 const AMOUNT = ETHER / 100n;
-/** This release's buy fee for AMOUNT (`buyFee`): 122,000 gas at 0.15 gwei and a tenth more, 0.21% of the buy. */
-const REWARD = 20_130_000_000_000n;
+/**
+ * This release's buy fee for AMOUNT (`buyFee`): 126,000 gas at 0.15 gwei
+ * (0.0000189 ETH) and 0.25% of the buy (0.000025 ETH), 0.44% of the buy.
+ */
+const REWARD = 43_900_000_000_000n;
 const START = 1_000_000;
+/** An hourly plan's default window: a quarter of the interval, 15 minutes. */
+const WINDOW = 900n;
 
 const TERMS: VaultTerms = {
   tokenOut: MARKET.tokenOut,
@@ -119,9 +141,16 @@ const TERMS: VaultTerms = {
   startAt: BigInt(START),
   keeperReward: REWARD,
   maxSlippageBps: 200n,
+  communityWindow: WINDOW,
+  turnBuckets: 0n,
 };
 const NONCE = 3n;
 const VAULT = predictVault({ factory: FACTORY, owner: OWNER, nonce: NONCE, terms: TERMS });
+
+/** The same plan as a v1 vault, on v1's frozen factory, with v1's fee and no window. */
+const V1_FACTORY = V1_MAINNET_FACTORY;
+const V1_TERMS: VaultTerms = { ...TERMS, keeperReward: v1BuyFee(AMOUNT).reward, communityWindow: null, turnBuckets: null };
+const V1_VAULT = predictVault({ factory: V1_FACTORY, owner: OWNER, nonce: NONCE, terms: V1_TERMS });
 
 const PLAN: DcaPlan = {
   id: "dca-vault",
@@ -138,28 +167,63 @@ const PLAN: DcaPlan = {
 };
 const { vault: _none, ...UNCREATED } = PLAN;
 
-/** A vault two buys in, funded for the other three, waiting for its next window. */
+/** A v2 vault two buys in, funded for the other three, waiting for its next buy, which opens a 15-minute window. */
 function state(overrides: Partial<Omit<VaultState, "status">> & { status?: Partial<VaultState["status"]> } = {}): VaultState {
   const { status, ...rest } = overrides;
   return {
     address: VAULT,
+    release: "v2",
+    source: "v2",
     owner: OWNER,
     terms: TERMS,
     closed: false,
     buysDone: 2n,
     totalOut: 123_456n,
     totalRewards: 2n * REWARD,
+    windowBuys: 1n,
     quote: { spotOut: 1_000n, floorOut: 900n, oracleDepth: 20n * ETHER },
     fromFactory: true,
+    factory: FACTORY,
     chainTime: 1_005_000n,
     ...rest,
-    status: { due: false, nextBuyAt: 1_007_200n, buysLeft: 3n, wethBalance: 3n * (AMOUNT + REWARD), funded: true, ...status },
+    status: {
+      due: false,
+      nextBuyAt: 1_007_200n,
+      buysLeft: 3n,
+      wethBalance: 3n * (AMOUNT + REWARD),
+      funded: true,
+      dueSince: 1_007_200n,
+      windowEndsAt: 1_008_100n,
+      turnEndsAt: 1_007_200n,
+      turn: 0n,
+      ...status,
+    },
   };
 }
 
-/** Due now by the vault's own clock, the price inside the floor: a trigger would buy. */
+/** Due now by the vault's own clock, the price inside the floor, inside its window: a trigger would buy. */
 const dueNow = (overrides: Parameters<typeof state>[0] = {}) =>
-  state({ ...overrides, status: { due: true, nextBuyAt: 1_004_000n, ...overrides.status } });
+  state({ ...overrides, status: { due: true, nextBuyAt: 1_004_000n, dueSince: 1_004_000n, windowEndsAt: 1_004_900n, ...overrides.status } });
+
+/** The same, a v1 vault: no window, vouched for by v1's factory. */
+const v1State = (overrides: Parameters<typeof state>[0] = {}) =>
+  state({
+    address: V1_VAULT,
+    release: "v1",
+    source: "v1",
+    terms: V1_TERMS,
+    windowBuys: null,
+    factory: V1_FACTORY,
+    ...overrides,
+    status: {
+      dueSince: null,
+      windowEndsAt: null,
+      turnEndsAt: null,
+      turn: null,
+      wethBalance: 3n * (AMOUNT + V1_TERMS.keeperReward),
+      ...overrides.status,
+    },
+  });
 
 const word = (value: bigint) => value.toString(16).padStart(64, "0");
 
@@ -181,6 +245,14 @@ describe("where vaults are offered", () => {
     expect(vaultDeployment(1)).toBe(MAINNET_DEPLOYMENT);
     expect(vaultDeployment(CHAIN)).toBe(MAINNET_DEPLOYMENT);
     expect(vaultDeployment(11155111)).toBeNull();
+  });
+
+  /** New vaults on v2 alone; a v1 vault holds and buys for good, so it is read, funded and closed from v1's factory. */
+  it("reads vaults from every release's factory, newest first, and creates on the newest alone", () => {
+    expect(vaultFactories(CHAIN)).toEqual([FACTORY, V1_FACTORY]);
+    expect(vaultFactories(1)).toEqual([FACTORY, V1_FACTORY]);
+    expect(vaultFactories(11155111)).toBeNull();
+    expect(factoryAddress(vaultDeployment(CHAIN)!)).toBe(vaultFactories(CHAIN)![0]);
   });
 });
 
@@ -214,7 +286,7 @@ describe("chain time", () => {
     const clock = await readChainClock(rpc, 5_000);
     expect(clock.seconds).toBe(pending);
     // "In 5 minutes" is five minutes after the next block, not after the last one.
-    expect(vaultStartAt(1_300, 1_000, clock.seconds)).toBe(pending + 300);
+    expect(vaultStartAt(1_300, 1_000, clock.seconds, 1_800)).toBe(pending + 300);
     // A pending block behind the latest is a stale view, not the chain's time.
     const stale = scripted({
       eth_getBlockByNumber: ([tag]) => ({ timestamp: `0x${(tag === "pending" ? latest - 50 : latest).toString(16)}` }),
@@ -234,16 +306,49 @@ describe("chain time", () => {
     // The device is five days ahead of the chain, as the local fork is.
     const device = 1_790_000_000;
     const chain = device - 5 * 86_400;
-    expect(vaultStartAt(device, device, chain)).toBe(chain);
-    expect(vaultStartAt(device + 3_600, device, chain)).toBe(chain + 3_600);
-    expect(vaultStartAt(device - 60, device, chain)).toBe(chain);
+    // A daily plan's 30-minute window outlasts any creation: now is now.
+    expect(vaultStartAt(device, device, chain, 1_800)).toBe(chain);
+    expect(vaultStartAt(device + 3_600, device, chain, 1_800)).toBe(chain + 3_600);
+    expect(vaultStartAt(device - 60, device, chain, 1_800)).toBe(chain);
+  });
+
+  /**
+   * A first buy "now" falls due at `startAt`, and its community window ends
+   * `communityWindow` later. A 5-minute plan's 75 seconds were over before a
+   * creation slower than that landed, and its first buy was open to anyone
+   * from the creation's block: v2's first claim lost on the very buy the
+   * 2026-10-02 incident took.
+   */
+  it("holds a short window's first buy back, so that it keeps a community window after a slow creation", () => {
+    const device = 1_790_000_000;
+    const chain = device - 5 * 86_400;
+    expect(VAULT_CREATION_SECONDS).toBe(120);
+    // 120 s to land, and still the factory's shortest window (60 s) after it.
+    expect(vaultStartLead(75)).toBe(105);
+    expect(vaultStartLead(60)).toBe(120);
+    expect(vaultStartLead(179)).toBe(1);
+    expect(vaultStartLead(180)).toBe(0);
+    expect(vaultStartLead(1_800)).toBe(0);
+    for (const window of [60, 75, 179, 180, 225, 900, 1_800, 3_600]) {
+      const startAt = vaultStartAt(device, device, chain, window);
+      // A creation that lands up to 120 s after the clock was read finds the
+      // first buy's window open for at least a minute.
+      expect(startAt + window - (chain + VAULT_CREATION_SECONDS)).toBeGreaterThanOrEqual(60);
+      // And no later than it needs to be: a window of 3 minutes or more is due at once.
+      expect(startAt).toBe(chain + Math.max(0, 180 - window));
+    }
+    // A start the person picked further ahead than that keeps its time; one
+    // nearer than the lead is held back to it.
+    expect(vaultStartAt(device + 600, device, chain, 75)).toBe(chain + 600);
+    expect(vaultStartAt(device + 30, device, chain, 75)).toBe(chain + 105);
+    expect(vaultStartAt(device - 60, device, chain, 75)).toBe(chain + 105);
   });
 });
 
 describe("the terms a vault is created with", () => {
-  const choices = { maxSlippageBps: DEFAULT_VAULT_SLIPPAGE_BPS, keeperReward: REWARD };
+  const choices = { maxSlippageBps: DEFAULT_VAULT_SLIPPAGE_BPS, keeperReward: REWARD, communityWindow: 900 };
 
-  it("are the plan's figures, the one market, and the two choices a plan has no field for", () => {
+  it("are the plan's figures, the one market, and the three choices a plan has no field for", () => {
     expect(vaultPlanOf(PLAN, choices)).toEqual({
       marketIndex: 0n,
       amountPerBuy: AMOUNT,
@@ -252,8 +357,24 @@ describe("the terms a vault is created with", () => {
       startAt: BigInt(START),
       keeperReward: REWARD,
       maxSlippageBps: 200n,
+      communityWindow: WINDOW,
+      // No turns: dormant until decision 29 of docs/V2_UPGRADE.md calls for them.
+      turnBuckets: 0n,
     });
     expect(termsOfPlan(vaultPlanOf(PLAN, choices))).toEqual(TERMS);
+  });
+
+  it("refuse a community window the factory wouldn't take, in words that say what to change", () => {
+    const refusal = "The community window must be 1 minute to an hour, and no more than a quarter of the time between buys.";
+    // An hourly plan: a quarter of the interval is 15 minutes.
+    expect(vaultPlanProblems(PLAN, { ...choices, communityWindow: 900 }, START)).toEqual([]);
+    expect(vaultPlanProblems(PLAN, { ...choices, communityWindow: 901 }, START)).toEqual([refusal]);
+    expect(vaultPlanProblems(PLAN, { ...choices, communityWindow: 59 }, START)).toEqual([refusal]);
+    expect(vaultPlanProblems(PLAN, { ...choices, communityWindow: 60 }, START)).toEqual([]);
+    // A daily plan: an hour at most, though a quarter of its interval is six.
+    const daily = { ...PLAN, intervalSeconds: 86_400 };
+    expect(vaultPlanProblems(daily, { ...choices, communityWindow: 3_600 }, START)).toEqual([]);
+    expect(vaultPlanProblems(daily, { ...choices, communityWindow: 3_601 }, START)).toEqual([refusal]);
   });
 
   it("find nothing wrong with a plan the factory would take", () => {
@@ -276,6 +397,56 @@ describe("the terms a vault is created with", () => {
     ]);
     // Judged against chain time: two years on, the same start is refused.
     expect(vaultPlanProblems(PLAN, choices, START + 2 * 366 * 86_400)).toEqual(["The first buy must be within a year of now."]);
+  });
+});
+
+describe("the community window a plan gets", () => {
+  /** 30 minutes, or a quarter of the interval when that is shorter (decision 3); never under the factory's minute. */
+  it("defaults to 30 minutes, or a quarter of a shorter plan's interval", () => {
+    expect(defaultVaultWindow(300)).toBe(75);
+    expect(defaultVaultWindow(3_600)).toBe(900);
+    expect(defaultVaultWindow(7_200)).toBe(1_800);
+    expect(defaultVaultWindow(86_400)).toBe(1_800);
+    expect(defaultVaultWindow(0)).toBeNull();
+    expect(defaultVaultWindow(1.5)).toBeNull();
+    // "A quarter of the interval", capped at an hour.
+    expect(quarterVaultWindow(300)).toBe(75);
+    expect(quarterVaultWindow(3_600)).toBe(900);
+    expect(quarterVaultWindow(86_400)).toBe(3_600);
+  });
+
+  /** Expert's presets (decision 26): any above a quarter of the interval disabled; the quarter always offered. */
+  it("offers Expert the presets, disabling those above a quarter of the interval", () => {
+    const options = (interval: number) => vaultWindowOptions(interval).map((o) => `${o.value}:${o.seconds}${o.disabled ? "!" : ""}`);
+    expect(options(300)).toEqual(["60:60", "300:300!", "900:900!", "1800:1800!", "3600:3600!", "quarter:75"]);
+    expect(options(1_800)).toEqual(["60:60", "300:300", "900:900!", "1800:1800!", "3600:3600!", "quarter:450"]);
+    // A quarter that is a preset already isn't offered twice: an hourly plan's
+    // is "15 min", and a daily plan's is capped at the hour, which "A quarter
+    // of the interval (60 min)" said was a quarter of a day.
+    expect(options(3_600)).toEqual(["60:60", "300:300", "900:900", "1800:1800!", "3600:3600!"]);
+    expect(options(86_400)).toEqual(["60:60", "300:300", "900:900", "1800:1800", "3600:3600"]);
+    expect(vaultWindowOptions(Number.NaN)).toEqual([]);
+  });
+
+  it("resolves a choice against the plan's interval, and shows the default as the option it equals", () => {
+    expect(vaultWindowOf("default", 86_400)).toBe(1_800);
+    expect(vaultWindowOf("quarter", 300)).toBe(75);
+    // A preset is taken as chosen, even once the interval no longer allows it: the form refuses it then.
+    expect(vaultWindowOf(1_800, 3_600)).toBe(1_800);
+    expect(vaultWindowValue("default", 86_400)).toBe("1800");
+    expect(vaultWindowValue("default", 3_600)).toBe("900");
+    expect(vaultWindowValue("default", 300)).toBe("quarter");
+    expect(vaultWindowValue("quarter", 86_400)).toBe("3600");
+    expect(vaultWindowValue("quarter", 1_800)).toBe("quarter");
+    expect(vaultWindowValue(60, 300)).toBe("60");
+    // Every value the select is given is one of its options.
+    for (const interval of [300, 600, 1_800, 3_600, 7_200, 86_400, 604_800]) {
+      const values = vaultWindowOptions(interval).map((o) => o.value);
+      for (const choice of ["default", "quarter", 60] as const) expect(values).toContain(vaultWindowValue(choice, interval));
+    }
+    expect(vaultWindowChoiceOf("quarter")).toBe("quarter");
+    expect(vaultWindowChoiceOf("300")).toBe(300);
+    expect(vaultWindowChoiceOf("nonsense")).toBe("default");
   });
 });
 
@@ -316,7 +487,7 @@ describe("what a vault costs", () => {
   });
 
   it("refuses a buy too small to pay a buy fee, before the factory would take it", () => {
-    const choices = { maxSlippageBps: DEFAULT_VAULT_SLIPPAGE_BPS, keeperReward: 0n };
+    const choices = { maxSlippageBps: DEFAULT_VAULT_SLIPPAGE_BPS, keeperReward: 0n, communityWindow: 900 };
     const small = { ...PLAN, amountPerBuy: (MIN_VAULT_BUY_WEI - 1n).toString() };
     expect(vaultPlanProblems(small, choices, START)).toEqual(["Each buy must be at least 0.000001 ETH so it can pay a buy fee."]);
     expect(vaultPlanProblems({ ...PLAN, amountPerBuy: MIN_VAULT_BUY_WEI.toString() }, choices, START)).toEqual([]);
@@ -330,6 +501,7 @@ describe("whether a vault can be offered", () => {
     available: true,
     factory: FACTORY,
     factoryDeployed: true,
+    registryDeployed: true,
     factoryDeployable: null,
     market: { index: 0, ...MARKET },
     marketHealthy: true,
@@ -359,6 +531,73 @@ describe("whether a vault can be offered", () => {
     });
   });
 
+  /**
+   * The factory names the SPX holder registry, and its constructor refuses one
+   * with no code: where neither is there, its listing checks can't run until
+   * the registry is, and setting up is the registry, then the factory.
+   */
+  it("offers the setup where the registry the factory needs is missing too", () => {
+    const support = vaultSupportFrom(
+      CHAIN,
+      availability({
+        available: false,
+        factoryDeployed: false,
+        registryDeployed: false,
+        factoryDeployable: null,
+        reasons: ["the vault factory is not deployed on this chain yet, nor the SPX holder registry it needs first"],
+      }),
+    );
+    expect(support.kind).toBe("deployable");
+    // Not where the factory's own deployment would be refused.
+    expect(vaultSupportFrom(CHAIN, availability({ available: false, factoryDeployed: false, registryDeployed: true, factoryDeployable: false })).kind).toBe(
+      "unavailable",
+    );
+  });
+
+  /**
+   * Where neither is deployed, the setup is two transactions, the registry's
+   * first (about 1.76M gas). The factory's market checks ran only after it
+   * had landed, so a factory they refuse was found out with the registry
+   * already paid for. They now run before, as if the registry were there.
+   */
+  describe("before the registry's deployment is paid for", () => {
+    const keccak = (text: string) => transactionHash(`0x${[...new TextEncoder().encode(text)].map((b) => b.toString(16).padStart(2, "0")).join("")}`);
+    const PAIR_REFUSED = `${keccak("PairNotFromUniswap(uint256)").slice(0, 10)}${"0".repeat(64)}`;
+    const NOT_A_REGISTRY = keccak("NotARegistry()").slice(0, 10);
+    const reverting = (data: string) => () => {
+      throw Object.assign(new Error("execution reverted"), { data });
+    };
+    const OVERRIDE = { [MAINNET_REGISTRY]: { code: "0x00" } };
+
+    it("test-runs the factory as if the registry were there, and says what its market would refuse", async () => {
+      const rpc = scripted({ eth_call: reverting(PAIR_REFUSED) });
+      expect(await factoryRefusalBeforeRegistry(rpc, MAINNET_DEPLOYMENT, MAINNET_REGISTRY)).toBe("market 0's pair is not the one Uniswap v2 lists on this chain");
+      expect(rpc.calls).toHaveLength(1);
+      expect(rpc.calls[0]!.params[2]).toEqual(OVERRIDE);
+      expect(await factoryRefusalBeforeRegistry(scripted({ eth_call: () => "0x" }), MAINNET_DEPLOYMENT, MAINNET_REGISTRY)).toBeNull();
+    });
+
+    it("says nothing it can't tell: a service with no state override, or one that ignored it", async () => {
+      expect(await factoryRefusalBeforeRegistry(scripted({ eth_call: reverting(NOT_A_REGISTRY) }), MAINNET_DEPLOYMENT, MAINNET_REGISTRY)).toBeNull();
+      const noOverrides = scripted({
+        eth_call: () => {
+          throw new Error("too many arguments, want at most 2");
+        },
+      });
+      expect(await factoryRefusalBeforeRegistry(noOverrides, MAINNET_DEPLOYMENT, MAINNET_REGISTRY)).toBeNull();
+    });
+
+    it("sends nothing, the registry included, for a factory its market would refuse", async () => {
+      const rpc = scripted({ eth_getCode: () => "0x", eth_call: reverting(PAIR_REFUSED) });
+      const send = vi.fn();
+      const sender: TxSender = { account: "0x00000000000000000000000000000000000000aa", kind: "wallet", send, confirm: { rpc, timeoutMs: 5_000 } };
+      await expect(deployVaultFactory({ rpc, sender, chainId: CHAIN })).rejects.toThrow(
+        "Deploying the vault factory would be refused right now: market 0's pair is not the one Uniswap v2 lists on this chain. Nothing was sent.",
+      );
+      expect(send).not.toHaveBeenCalled();
+    });
+  });
+
   it("says why when something else is in the way", () => {
     const support = vaultSupportFrom(
       CHAIN,
@@ -380,10 +619,11 @@ describe("whether a vault can be offered", () => {
   });
 
   it("offers the deployment on a chain where the factory's address has no code, having simulated it", async () => {
-    // The factory's address answers with no code; the plain creation that
-    // `simulateFactoryDeployment` runs succeeds; the market read fails.
+    // The factory's address answers with no code, the registry's with some;
+    // the plain creation that `simulateFactoryDeployment` runs succeeds; the
+    // market read fails.
     const rpc = scripted({
-      eth_getCode: () => "0x",
+      eth_getCode: ([address]) => (address === MAINNET_REGISTRY ? "0x6080" : "0x"),
       eth_call: (params) => {
         const call = params[0] as { to?: string };
         if (call.to === undefined) return "0x6080";
@@ -427,11 +667,40 @@ describe("a vault plan's vault, as its card shows it", () => {
       canTrigger: false,
       clock: { seconds: 1_005_000, readAtMs: 7_000 },
       mismatches: [],
+      release: "v2",
+      source: "v2",
+      factory: FACTORY,
+      communityWindow: 900,
+      dueSince: 1_007_200,
+      windowEndsAt: 1_008_100,
+      windowBuys: 1,
+      turnBuckets: 0,
+      turnEndsAt: null,
     });
     // In words, and at this device's time: the keeper's log line ("next buy
     // due at 2026-…Z (chain time)") no longer reaches the card.
     if (read.kind === "active") expect(read.waitingFor).toMatch(/^Its next buy isn't due until /);
     if (read.kind === "active") expect(read.waitingFor).not.toMatch(/chain time|T\d\d:/);
+  });
+
+  /** A v1 vault is shown as it always was: no window, and nothing unknown made to look like none. */
+  it("reads a v1 vault, vouched for by v1's factory, with no window", () => {
+    const read = vaultPlanState({ plan: { ...PLAN, vault: V1_VAULT }, account: OWNER, read: v1State(), readAtMs: 0 });
+    expect(read).toMatchObject({
+      kind: "active",
+      release: "v1",
+      source: "v1",
+      factory: V1_FACTORY,
+      communityWindow: null,
+      dueSince: null,
+      windowEndsAt: null,
+      windowBuys: null,
+      turnBuckets: null,
+      turnEndsAt: null,
+      mismatches: [],
+    });
+    // A v2 vault whose window count couldn't be read: unknown, never none.
+    expect(vaultPlanState({ plan: PLAN, account: OWNER, read: state({ windowBuys: null }), readAtMs: 0 })).toMatchObject({ windowBuys: null });
   });
 
   it("can't say whose it is with no wallet connected, and is someone else's for another account", () => {
@@ -497,7 +766,7 @@ describe("a vault plan's vault, as its card shows it", () => {
 
   it("is not read at all on another chain, or where vaults aren't offered, or before the vault exists", async () => {
     const rpc = scripted({});
-    const base = { account: OWNER, factory: FACTORY };
+    const base = { account: OWNER };
     expect(await readVaultPlan(rpc, { ...base, plan: PLAN, chainId: 1 })).toMatchObject({ kind: "unavailable", code: "chain" });
     expect(await readVaultPlan(rpc, { ...base, plan: { ...PLAN, chainId: 11155111 }, chainId: 11155111 })).toMatchObject({
       kind: "unavailable",
@@ -508,7 +777,7 @@ describe("a vault plan's vault, as its card shows it", () => {
   });
 
   it("is unknown, never empty, when the read fails", async () => {
-    const read = await readVaultPlan(scripted({}), { plan: PLAN, chainId: CHAIN, account: OWNER, factory: FACTORY });
+    const read = await readVaultPlan(scripted({}), { plan: PLAN, chainId: CHAIN, account: OWNER });
     expect(read).toMatchObject({ kind: "unavailable", code: "unreadable" });
   });
 
@@ -524,7 +793,7 @@ describe("a vault plan's vault, as its card shows it", () => {
         throw new Error(`Unexpected token 'd', "down" is not valid JSON`);
       },
     });
-    const read = await readVaultPlan(down, { plan: PLAN, chainId: CHAIN, account: OWNER, factory: FACTORY });
+    const read = await readVaultPlan(down, { plan: PLAN, chainId: CHAIN, account: OWNER });
     expect(read).toMatchObject({ kind: "unavailable", code: "unreadable", detail: expect.stringContaining("is not valid JSON") });
     if (read.kind === "unavailable") {
       expect(read.reason).toBe(
@@ -643,7 +912,7 @@ describe("keeping vault plans through a reset, an import or a shared link", () =
     expect(out.config.preset).toBe("custom");
     expect(out.kept).toHaveLength(1);
     expect(out.kept[0]).toMatchObject({ reason: "dropped" });
-    expect(out.kept[0]!.text).toMatch(/^"Buying SPX" stays: its vault \(0x[0-9a-f]{4}…[0-9a-f]{4}\) still holds 0\.0300604 WETH and goes on buying whenever anyone triggers it, and only closing it stops it\. Close it, then delete the plan\.$/);
+    expect(out.kept[0]!.text).toMatch(/^"Buying SPX" stays: its vault \(0x[0-9a-f]{4}…[0-9a-f]{4}\) still holds 0\.0301317 WETH and goes on buying whenever anyone triggers it, and only closing it stops it\. Close it, then delete the plan\.$/);
     // What goes is counted as before: the wallet plan.
     expect(removedPlanCount(cfg(PLAN, walletPlan), out.config)).toBe(1);
   });
@@ -693,7 +962,7 @@ describe("keeping vault plans through a reset, an import or a shared link", () =
 });
 
 describe("retrying a vault's creation from its card", () => {
-  const plan = { amountPerBuy: AMOUNT.toString(), maxBuys: 5 };
+  const plan = { amountPerBuy: AMOUNT.toString(), maxBuys: 5, intervalSeconds: 3_600 };
   const today = buyFee(AMOUNT).reward;
 
   /**
@@ -707,6 +976,7 @@ describe("retrying a vault's creation from its card", () => {
       keeperReward: today,
       keptReward: false,
       fund: 5n * (AMOUNT + today),
+      communityWindow: 900,
     });
     expect(vaultRetryTerms({ plan, draft: null, chosen: 100 }).maxSlippageBps).toBe(100);
     // Only the chips the form offers.
@@ -715,7 +985,13 @@ describe("retrying a vault's creation from its card", () => {
 
   it("uses the choices this browser kept while their fee is no more than today's, and today's otherwise", () => {
     const draft = { maxSlippageBps: 300, keeperReward: today.toString() };
-    expect(vaultRetryTerms({ plan, draft })).toEqual({ maxSlippageBps: 300, keeperReward: today, keptReward: true, fund: 5n * (AMOUNT + today) });
+    expect(vaultRetryTerms({ plan, draft })).toEqual({
+      maxSlippageBps: 300,
+      keeperReward: today,
+      keptReward: true,
+      fund: 5n * (AMOUNT + today),
+      communityWindow: 900,
+    });
     // A pick on the card wins over the draft's.
     expect(vaultRetryTerms({ plan, draft, chosen: 100 }).maxSlippageBps).toBe(100);
     // Lower than today's: the person's own, kept.
@@ -734,13 +1010,29 @@ describe("retrying a vault's creation from its card", () => {
 
   it("knows no buy fee only for an amount that isn't a buy", () => {
     for (const amountPerBuy of ["0", "ten"]) {
-      expect(vaultRetryTerms({ plan: { amountPerBuy, maxBuys: 5 }, draft: null, chosen: 200 })).toEqual({
+      expect(vaultRetryTerms({ plan: { amountPerBuy, maxBuys: 5, intervalSeconds: 3_600 }, draft: null, chosen: 200 })).toEqual({
         maxSlippageBps: 200,
         keeperReward: null,
         keptReward: false,
         fund: null,
+        communityWindow: 900,
       });
     }
+  });
+
+  /**
+   * The window is fixed in the vault for good too: the one chosen when the
+   * plan was set up, while the factory would take it for the plan's interval,
+   * else the plan's default — never one the factory would refuse. A draft from
+   * before vaults had one gets the default.
+   */
+  it("keeps the window this browser kept while it fits the plan, and the plan's default otherwise", () => {
+    const draft = { maxSlippageBps: 300, keeperReward: today.toString() };
+    expect(vaultRetryTerms({ plan, draft: { ...draft, communityWindow: 300 } }).communityWindow).toBe(300);
+    expect(vaultRetryTerms({ plan, draft: { ...draft, communityWindow: 1_800 } }).communityWindow).toBe(900);
+    expect(vaultRetryTerms({ plan, draft }).communityWindow).toBe(900);
+    expect(vaultRetryTerms({ plan: { ...plan, intervalSeconds: 300 }, draft: null }).communityWindow).toBe(75);
+    expect(vaultRetryTerms({ plan: { ...plan, intervalSeconds: Number.NaN }, draft: null }).communityWindow).toBeNull();
   });
 });
 
@@ -788,12 +1080,12 @@ describe("a vault plan's figures", () => {
 
   /**
    * A batcher's address would name a contract, not whoever sent the batch, so
-   * a buy it triggered says so — for every release's batcher, and for the one
-   * bound to the factory this app uses, however the address is cased.
+   * a buy it triggered says so — for every batcher spDEX lists, v1's and the
+   * one every later release shares, however the address is cased.
    */
   it("says a buy a batcher triggered was triggered in a batch", () => {
     const base = { hash: `0x${"1".repeat(64)}` as Hex, blockNumber: 1n, logIndex: 0, at: null };
-    const batchers = [...DEPLOYMENTS.map((d) => d.batcher), batcherAddress(FACTORY)];
+    const batchers = [...DEPLOYMENTS.map((d) => d.batcher), ...LISTED_BATCHERS, MAINNET_BATCHER];
     for (const batcher of batchers) {
       for (const keeper of [batcher.toLowerCase(), `0x${batcher.slice(2).toUpperCase()}`] as Address[]) {
         const buy = { ...base, kind: "bought" as const, amountIn: AMOUNT, amountOut: 1_307_850_000n, keeper, reward: 4n * 10n ** 14n };
@@ -829,22 +1121,36 @@ describe("before a vault plan is removed", () => {
 });
 
 describe("where a vault came from", () => {
-  it("finds the nonce that puts a vault with its terms at its address, below the owner's count", async () => {
+  it("finds the nonce that puts a vault with its terms at its address, below the owner's count on its factory", async () => {
     const rpc = scripted({ eth_call: () => `0x${word(5n)}` });
-    expect(await vaultClaim(rpc, FACTORY, state())).toEqual({ address: VAULT, owner: OWNER, nonce: NONCE, terms: TERMS });
+    expect(await vaultClaim(rpc, state())).toEqual({ address: VAULT, owner: OWNER, nonce: NONCE, terms: TERMS, release: "v2" });
+    // The count is asked of the factory that vouched for it.
+    expect((rpc.calls[0]!.params[0] as { to: string }).to).toBe(FACTORY);
   });
 
-  it("finds none for a vault the factory didn't make on these terms", async () => {
+  /** A v1 vault is v1's factory's, with v1's layout: claimed as v1, so the Guard proves it there. */
+  it("claims a v1 vault on v1's factory, as v1", async () => {
     const rpc = scripted({ eth_call: () => `0x${word(5n)}` });
-    expect(await vaultClaim(rpc, FACTORY, state({ terms: { ...TERMS, maxBuys: 6n } }))).toBeNull();
+    expect(await vaultClaim(rpc, v1State())).toEqual({ address: V1_VAULT, owner: OWNER, nonce: NONCE, terms: V1_TERMS, release: "v1" });
+    expect((rpc.calls[0]!.params[0] as { to: string }).to).toBe(V1_FACTORY);
+    // Its release from its terms when the read named no factory.
+    expect(await vaultClaim(rpc, { address: V1_VAULT, owner: OWNER, terms: V1_TERMS })).toMatchObject({ release: "v1" });
+  });
+
+  it("finds none for a vault the factory didn't make on these terms, or one claimed on the other release's factory", async () => {
+    const rpc = scripted({ eth_call: () => `0x${word(5n)}` });
+    expect(await vaultClaim(rpc, state({ terms: { ...TERMS, maxBuys: 6n } }))).toBeNull();
     // Nor below a count that doesn't reach its nonce.
-    expect(await vaultClaim(scripted({ eth_call: () => `0x${word(NONCE)}` }), FACTORY, state())).toBeNull();
+    expect(await vaultClaim(scripted({ eth_call: () => `0x${word(NONCE)}` }), state())).toBeNull();
+    // v2 terms said to be vouched for by v1's factory: nothing to claim.
+    expect(await vaultClaim(rpc, state({ factory: V1_FACTORY }))).toBeNull();
   });
 });
 
 describe("the four transactions", () => {
-  const choices = { maxSlippageBps: 200, keeperReward: REWARD };
-  const claim = { address: VAULT, owner: OWNER, nonce: NONCE, terms: TERMS };
+  const choices = { maxSlippageBps: 200, keeperReward: REWARD, communityWindow: 900 };
+  const claim = { address: VAULT, owner: OWNER, nonce: NONCE, terms: TERMS, release: "v2" as const };
+  const v1Claim = { address: V1_VAULT, owner: OWNER, nonce: NONCE, terms: V1_TERMS, release: "v1" as const };
 
   it("creates the plan's vault where the factory will put it, and passes the Guard's static checks", () => {
     const terms = vaultPlanOf(UNCREATED, choices);
@@ -877,20 +1183,41 @@ describe("the four transactions", () => {
     expect(close.calls).toEqual([{ to: VAULT, data: encodeClose(), value: 0n }]);
     expect(runVaultChecks(close, CHAIN)).toEqual([]);
 
-    // Anyone may trigger a due buy; the tokens go to the owner either way.
-    const trigger = triggerVaultTx({ chainId: CHAIN, account: STRANGER, plan: PLAN, claim, floorOut: 900n });
-    expect(trigger.calls).toEqual([{ to: VAULT, data: encodeExecute(), value: 0n }]);
+    // Trigger now on a v2 vault: execute(owner), which its community window
+    // never refuses, the fee named back to the owner.
+    const trigger = triggerVaultTx({ chainId: CHAIN, account: OWNER, plan: PLAN, claim, floorOut: 900n });
+    expect(trigger.calls).toEqual([{ to: VAULT, data: encodeExecute(OWNER), value: 0n }]);
+    expect(trigger.intent).toMatchObject({ action: "trigger", rewardTo: OWNER });
+    expect(runVaultChecks(trigger, CHAIN)).toEqual([]);
+    // From anyone else it is refused: the card offers it to the owner alone.
+    const theirs = triggerVaultTx({ chainId: CHAIN, account: STRANGER, plan: PLAN, claim, floorOut: 900n });
+    expect(theirs.calls[0]!.data).toBe(encodeExecute(OWNER));
+    expect(runVaultChecks(theirs, CHAIN).map((v) => v.code)).toContain("VAULT_MALFORMED");
+  });
+
+  /** A v1 vault is funded, closed and triggered as it always was: no move to v2 (decision 27). */
+  it("funds, closes and triggers a v1 vault with v1's calls, each passing the Guard's static checks", () => {
+    const v1Plan = { ...PLAN, vault: V1_VAULT };
+    const perBuy = AMOUNT + V1_TERMS.keeperReward;
+    const fund = fundVaultTx({ chainId: CHAIN, account: OWNER, plan: v1Plan, claim: v1Claim, buysDone: 2n, wethBalance: perBuy, value: 2n * perBuy });
+    expect(runVaultChecks(fund, CHAIN)).toEqual([]);
+    expect(runVaultChecks(closeVaultTx({ chainId: CHAIN, account: OWNER, plan: v1Plan, claim: v1Claim }), CHAIN)).toEqual([]);
+    // execute(), selector 0x61461954, which pays whoever sends it: the owner, here.
+    const trigger = triggerVaultTx({ chainId: CHAIN, account: OWNER, plan: v1Plan, claim: v1Claim, floorOut: 900n });
+    expect(trigger.calls).toEqual([{ to: V1_VAULT, data: encodeExecuteV1(), value: 0n }]);
+    expect(trigger.calls[0]!.data).toBe("0x61461954");
+    expect(trigger.intent).toMatchObject({ rewardTo: OWNER });
     expect(runVaultChecks(trigger, CHAIN)).toEqual([]);
   });
 });
 
 describe("sending a vault transaction", () => {
   const HASH = `0x${"ab".repeat(32)}` as Hex;
-  const claim = { address: VAULT, owner: OWNER, nonce: NONCE, terms: TERMS };
+  const claim = { address: VAULT, owner: OWNER, nonce: NONCE, terms: TERMS, release: "v2" as const };
   const close = closeVaultTx({ chainId: CHAIN, account: OWNER, plan: PLAN, claim });
   const fund = fundVaultTx({ chainId: CHAIN, account: OWNER, plan: PLAN, claim, buysDone: 2n, wethBalance: 0n, value: AMOUNT });
   const verified: GuardVerdict = { level: "verified", signable: true, violations: [], warnings: [] };
-  const receiptLogs = [{ address: VAULT, topics: [VAULT_EVENT_TOPICS.Closed], data: `0x${word(123n)}` }];
+  const receiptLogs = [{ address: VAULT, topics: [VAULT_EVENT_TOPICS.v2.Closed], data: `0x${word(123n)}` }];
 
   function sender(rpc: JsonRpc, account: Address = OWNER) {
     const send = vi.fn(async () => ({ hash: HASH, via: "wallet" as const }));
@@ -1009,7 +1336,7 @@ describe("sending a vault transaction", () => {
     const { tx, send } = sender(chain());
     const trigger = triggerVaultTx({ chainId: CHAIN, account: OWNER, plan: PLAN, claim, floorOut: 900n });
     await sendVaultTx(trigger, { engine: { checkVault: async () => verified }, sender: tx, rpc: chain(), sendLabel: "" });
-    expect(send).toHaveBeenCalledWith({ to: VAULT, data: encodeExecute(), value: 0n, chainId: CHAIN, gasFloor: 384_000n });
+    expect(send).toHaveBeenCalledWith({ to: VAULT, data: encodeExecute(OWNER), value: 0n, chainId: CHAIN, gasFloor: 396_000n });
     await sendVaultTx(fund, { engine: { checkVault: async () => verified }, sender: tx, rpc: chain(), sendLabel: "" });
     expect(send).toHaveBeenLastCalledWith({ to: VAULT, data: encodeFund(), value: AMOUNT, chainId: CHAIN });
   });
@@ -1018,7 +1345,7 @@ describe("sending a vault transaction", () => {
 describe("creating a vault", () => {
   const HASH = `0x${"ef".repeat(32)}` as Hex;
   const verified: GuardVerdict = { level: "verified", signable: true, violations: [], warnings: [] };
-  const choices = { maxSlippageBps: 200, keeperReward: REWARD };
+  const choices = { maxSlippageBps: 200, keeperReward: REWARD, communityWindow: 900 };
   const plan: DcaPlan = { ...UNCREATED, startAt: 1_005_000 };
 
   /** An endpoint for one creation: chain time, the factory's nonce, and the receipt's logs. */
@@ -1066,6 +1393,16 @@ describe("a vault's refusals, in words", () => {
     expect(vaultErrorText(null)).toBeNull();
   });
 
+  it("names v2's refusals: a fee paid to someone who may not be paid it inside the window, or to no one", () => {
+    expect(vaultErrorText({ name: "NotEligible", args: [STRANGER, 1n] })).toBe(
+      "Inside its community window, a buy's fee can be paid only to a community keeper (an account proven to hold 690 SPX) or the vault's owner.",
+    );
+    expect(vaultErrorText({ name: "BadRewardTo", args: [STRANGER] })).toBe("A buy's fee can't be paid to that address.");
+    expect(vaultErrorText({ name: "CommunityWindowOutOfRange", args: [] })).toMatch(/^The community window must be 1 minute to an hour/);
+    // NotEligible(address,uint256), 0x5863fc24, inside a revert.
+    expect(revertText(`reverted: 0x5863fc24${word(BigInt(STRANGER))}${word(5n)}`)).toMatch(/^Inside its community window/);
+  });
+
   it("finds the vault's error inside a revert message", () => {
     expect(revertText(`reverted with 0xe86f59ea${word(5n)}`)).toBe("The vault's next buy isn't due yet.");
     expect(revertText("0x82b42900")).toBe("Only the vault's owner can do that.");
@@ -1075,23 +1412,39 @@ describe("a vault's refusals, in words", () => {
 });
 
 describe("the vault's event topics", () => {
-  it("are the vault's own: each decodes as its event", () => {
+  /** Re-exported from @spdex/vault, never copied by hand: v2's `Bought` has its own topic, and a reader that missed it hid every v2 buy. */
+  it("are each release's own: each decodes as its event, v2's Bought with who was paid and when it fell due", () => {
     const keeper = `0x${"0".repeat(24)}${STRANGER.slice(2)}`;
-    // Bought's data: amountIn, amountOut, reward, floorOut, buyNumber, oracleDepth.
-    const data = `0x${[AMOUNT, 777n, REWARD, 700n, 3n, 20n * ETHER].map(word).join("")}`;
-    expect(decodeVaultEvent({ address: VAULT, topics: [VAULT_EVENT_TOPICS.Bought, `0x${word(4n)}`, keeper], data })).toMatchObject({
+    const holder = `0x${"0".repeat(24)}${OWNER.slice(2)}`;
+    // v1's Bought data: amountIn, amountOut, reward, floorOut, buyNumber, oracleDepth.
+    const v1 = `0x${[AMOUNT, 777n, REWARD, 700n, 3n, 20n * ETHER].map(word).join("")}`;
+    expect(decodeVaultEvent({ address: VAULT, topics: [VAULT_EVENT_TOPICS.v1.Bought, `0x${word(4n)}`, keeper], data: v1 })).toMatchObject({
       name: "Bought",
+      source: "v1",
       slot: 4n,
       amountIn: AMOUNT,
       amountOut: 777n,
       keeper: STRANGER,
+      rewardTo: STRANGER,
       reward: REWARD,
       floorOut: 700n,
       buyNumber: 3n,
       oracleDepth: 20n * ETHER,
+      dueSince: null,
     });
-    expect(decodeVaultEvent({ address: VAULT, topics: [VAULT_EVENT_TOPICS.Funded], data: `0x${word(9n)}` })).toMatchObject({ name: "Funded", amount: 9n });
-    expect(decodeVaultEvent({ address: VAULT, topics: [VAULT_EVENT_TOPICS.Closed], data: `0x${word(9n)}` })).toMatchObject({ name: "Closed", amount: 9n });
+    // v2's adds rewardTo (indexed) and dueSince.
+    const v2 = `0x${[AMOUNT, 777n, REWARD, 700n, 3n, 20n * ETHER, 1_004_000n].map(word).join("")}`;
+    expect(decodeVaultEvent({ address: VAULT, topics: [VAULT_EVENT_TOPICS.v2.Bought, `0x${word(4n)}`, keeper, holder], data: v2 })).toMatchObject({
+      name: "Bought",
+      source: "v2",
+      keeper: STRANGER,
+      rewardTo: OWNER,
+      dueSince: 1_004_000n,
+    });
+    expect(VAULT_EVENT_TOPICS.v1.Bought).not.toBe(VAULT_EVENT_TOPICS.v2.Bought);
+    expect(VAULT_EVENT_TOPICS.v1.Funded).toBe(VAULT_EVENT_TOPICS.v2.Funded);
+    expect(decodeVaultEvent({ address: VAULT, topics: [VAULT_EVENT_TOPICS.v2.Funded], data: `0x${word(9n)}` })).toMatchObject({ name: "Funded", amount: 9n });
+    expect(decodeVaultEvent({ address: VAULT, topics: [VAULT_EVENT_TOPICS.v2.Closed], data: `0x${word(9n)}` })).toMatchObject({ name: "Closed", amount: 9n });
   });
 });
 
@@ -1099,10 +1452,23 @@ describe("a vault's history", () => {
   const HEAD = 50_000n;
   const HEAD_TIME = 2_000_000;
   const hex = (n: bigint) => `0x${n.toString(16)}`;
-  const keeper = `0x${"0".repeat(24)}${STRANGER.slice(2)}`;
-  const bought = (block: bigint, index = 0, emitter: string = VAULT) => ({
+  const topic = (address: Address) => `0x${"0".repeat(24)}${address.slice(2)}`;
+  const keeper = topic(STRANGER);
+  /** A block's time on this scripted chain: twelve seconds a block back from the head. */
+  const timeOf = (block: bigint) => HEAD_TIME - Number(HEAD - block) * 12;
+  /** A v2 buy: by `who.keeper`, paid to `who.rewardTo`, due since `who.dueSince` (the block's time by default). */
+  const bought = (block: bigint, index = 0, emitter: string = VAULT, who: { keeper?: Address; rewardTo?: Address; dueSince?: number } = {}) => ({
     address: emitter,
-    topics: [VAULT_EVENT_TOPICS.Bought, `0x${word(1n)}`, keeper],
+    topics: [VAULT_EVENT_TOPICS.v2.Bought, `0x${word(1n)}`, topic(who.keeper ?? STRANGER), topic(who.rewardTo ?? who.keeper ?? STRANGER)],
+    data: `0x${[AMOUNT, 777n, REWARD, 700n, 1n, 20n * ETHER, BigInt(who.dueSince ?? timeOf(block))].map(word).join("")}`,
+    blockNumber: hex(block),
+    transactionHash: `0x${block.toString(16).padStart(64, "0")}`,
+    logIndex: hex(BigInt(index)),
+  });
+  /** A v1 buy, as v1's vaults log it: no rewardTo, no dueSince. */
+  const boughtV1 = (block: bigint, index = 0) => ({
+    address: VAULT,
+    topics: [VAULT_EVENT_TOPICS.v1.Bought, `0x${word(1n)}`, keeper],
     data: `0x${[AMOUNT, 777n, REWARD, 700n, 1n, 20n * ETHER].map(word).join("")}`,
     blockNumber: hex(block),
     transactionHash: `0x${block.toString(16).padStart(64, "0")}`,
@@ -1110,16 +1476,20 @@ describe("a vault's history", () => {
   });
   const funded = (block: bigint) => ({
     address: VAULT,
-    topics: [VAULT_EVENT_TOPICS.Funded],
+    topics: [VAULT_EVENT_TOPICS.v2.Funded],
     data: `0x${word(5n)}`,
     blockNumber: hex(block),
     transactionHash: `0x${"f".repeat(64)}`,
     logIndex: "0x0",
   });
 
-  /** An endpoint holding `logs`, refusing any range wider than `maxRange` blocks. */
-  function chain(logs: ReturnType<typeof bought>[], maxRange = 1_000_000n) {
+  /** An endpoint holding `logs`, refusing any range wider than `maxRange` blocks; `senders` are transactions' senders, by hash. */
+  function chain(logs: ReturnType<typeof bought>[], maxRange = 1_000_000n, senders: Record<string, Address> = {}) {
     return scripted({
+      eth_getTransactionByHash: (params) => {
+        const from = senders[params[0] as string];
+        return from === undefined ? null : { from };
+      },
       eth_blockNumber: () => hex(HEAD),
       eth_getBlockByNumber: (params) => {
         const block = BigInt(params[0] as string);
@@ -1210,6 +1580,84 @@ describe("a vault's history", () => {
     expect(history.note).toMatch(/wouldn't serve the vault's older logs \(block range too large\)/);
   });
 
+  it("reads both releases' buys, asking for both Bought topics, and says which release each is", async () => {
+    const rpc = chain([boughtV1(49_000n), bought(49_500n)]);
+    const history = await readVaultHistory(rpc, { vault: VAULT, buysDone: 2, startAt: HEAD_TIME - 100_000, chainId: 1 });
+    expect(history.missingBuys).toBe(0);
+    expect(history.entries.map((e) => [e.source, e.rewardTo, e.dueSince])).toEqual([
+      ["v2", STRANGER, timeOf(49_500n)],
+      ["v1", STRANGER, null],
+    ]);
+    const filter = rpc.calls.find((c) => c.method === "eth_getLogs")!.params[0] as { topics: string[][] };
+    expect(filter.topics[0]).toEqual(expect.arrayContaining([VAULT_EVENT_TOPICS.v1.Bought, VAULT_EVENT_TOPICS.v2.Bought, VAULT_EVENT_TOPICS.v2.Funded]));
+  });
+
+  /**
+   * Who made each buy (`buyMaker`): the owner's own, the owner's fee returned
+   * by someone else, a community keeper inside the window, anyone after it, a
+   * keeper on v1. Inside or after is the block's time against when the buy
+   * fell due and the vault's window; an owner-paid buy through a batcher asks
+   * its transaction's sender, and only that.
+   */
+  it("says who made each buy, given the vault's owner and window, reading a sender only where it decides", async () => {
+    const BATCHER = DEPLOYMENTS.at(-1)!.batcher.toLowerCase() as Address;
+    const HOLDER = "0x00000000000000000000000000000000000000d4" as Address;
+    const hashOf = (block: bigint) => `0x${block.toString(16).padStart(64, "0")}`;
+    const logs = [
+      bought(49_990n, 0, VAULT, { keeper: BATCHER, rewardTo: HOLDER, dueSince: timeOf(49_990n) - 100 }),
+      bought(49_980n, 0, VAULT, { keeper: STRANGER, rewardTo: STRANGER, dueSince: timeOf(49_980n) - 900 }),
+      bought(49_970n, 0, VAULT, { keeper: OWNER, rewardTo: OWNER }),
+      bought(49_960n, 0, VAULT, { keeper: STRANGER, rewardTo: OWNER }),
+      bought(49_950n, 0, VAULT, { keeper: BATCHER, rewardTo: OWNER }),
+      bought(49_940n, 0, VAULT, { keeper: BATCHER, rewardTo: OWNER }),
+      boughtV1(49_930n),
+    ];
+    const rpc = chain(logs, 1_000_000n, { [hashOf(49_950n)]: OWNER, [hashOf(49_940n)]: STRANGER });
+    const history = await readVaultHistory(rpc, {
+      vault: VAULT,
+      buysDone: 7,
+      startAt: HEAD_TIME - 100_000,
+      chainId: 1,
+      owner: OWNER,
+      communityWindow: WINDOW,
+    });
+    expect(history.entries.map((e) => e.maker)).toEqual(["community", "open", "owner", "returned", "owner", "returned", "caller"]);
+    expect(history.entries.map((e) => e.communityWindow)).toEqual([900, 900, 900, 900, 900, 900, null]);
+    expect(history.entries.map((e) => e.sender)).toEqual([null, null, null, null, OWNER, STRANGER, null]);
+    // Only the two owner-paid batch buys needed their senders.
+    expect(rpc.calls.filter((c) => c.method === "eth_getTransactionByHash").map((c) => c.params[0])).toEqual(
+      expect.arrayContaining([hashOf(49_950n), hashOf(49_940n)]),
+    );
+    expect(rpc.calls.filter((c) => c.method === "eth_getTransactionByHash")).toHaveLength(2);
+  });
+
+  it("leaves who made a buy unknown, never guessed, without the vault's owner, the window or the block's time", async () => {
+    const logs = [bought(49_990n, 0, VAULT, { rewardTo: STRANGER, dueSince: timeOf(49_990n) - 100 })];
+    const unowned = await readVaultHistory(chain(logs), { vault: VAULT, buysDone: 1, startAt: HEAD_TIME - 100_000, chainId: 1 });
+    expect(unowned.entries[0]).toMatchObject({ maker: null, communityWindow: null });
+    const noWindow = await readVaultHistory(chain(logs), { vault: VAULT, buysDone: 1, startAt: HEAD_TIME - 100_000, chainId: 1, owner: OWNER });
+    expect(noWindow.entries[0]!.maker).toBeNull();
+    const base = chain(logs);
+    const untimed: JsonRpc = async (method, params) => {
+      if (method === "eth_getBlockByNumber" && params[0] === hex(49_990n)) throw new Error("unavailable");
+      return base(method, params);
+    };
+    const history = await readVaultHistory(untimed, {
+      vault: VAULT,
+      buysDone: 1,
+      startAt: HEAD_TIME - 100_000,
+      chainId: 1,
+      owner: OWNER,
+      communityWindow: WINDOW,
+    });
+    expect(history.entries[0]).toMatchObject({ at: null, maker: null });
+    // An unreadable sender leaves an owner-paid batch buy's maker unknown too.
+    const BATCHER = DEPLOYMENTS.at(-1)!.batcher.toLowerCase() as Address;
+    const viaBatch = [bought(49_990n, 0, VAULT, { keeper: BATCHER, rewardTo: OWNER })];
+    const silent = await readVaultHistory(chain(viaBatch), { vault: VAULT, buysDone: 1, startAt: HEAD_TIME - 100_000, chainId: 1, owner: OWNER, communityWindow: WINDOW });
+    expect(silent.entries[0]).toMatchObject({ maker: null, sender: null });
+  });
+
   it("shows a buy with no date when its block's time can't be read", async () => {
     const rpc = chain([bought(49_999n)]);
     const flaky: JsonRpc = async (method, params) => {
@@ -1226,16 +1674,33 @@ describe("remembering a creation", () => {
     const items = new Map<string, string>();
     return { getItem: (k: string) => items.get(k) ?? null, setItem: (k: string, v: string) => void items.set(k, v), items };
   }
-  const creation: VaultCreation = { owner: OWNER, vault: VAULT, nonce: "3", hash: null, at: 1_000 };
+  const creation: VaultCreation = { owner: OWNER, vault: VAULT, factory: FACTORY, nonce: "3", hash: null, at: 1_000 };
 
   it("keeps a plan's choices and its creation, by chain and plan, and forgets them on request", () => {
     const storage = memory();
     const drafts = new VaultDrafts(storage);
-    drafts.set(CHAIN, "dca-vault", { maxSlippageBps: 200, keeperReward: "400", fund: "1000", creation });
-    expect(drafts.get(CHAIN, "dca-vault")).toEqual({ maxSlippageBps: 200, keeperReward: "400", fund: "1000", creation });
+    drafts.set(CHAIN, "dca-vault", { maxSlippageBps: 200, keeperReward: "400", communityWindow: 900, fund: "1000", creation });
+    expect(drafts.get(CHAIN, "dca-vault")).toEqual({ maxSlippageBps: 200, keeperReward: "400", communityWindow: 900, fund: "1000", creation });
     expect(drafts.get(1, "dca-vault")).toBeNull();
     drafts.set(CHAIN, "dca-vault", null);
     expect(drafts.get(CHAIN, "dca-vault")).toBeNull();
+  });
+
+  /** Drafts written before vaults had a window, or a factory recorded, still read: a creation under way at the upgrade must settle. */
+  it("reads a draft from before releases were told apart, and refuses a window or factory that can't be one", () => {
+    const storage = memory();
+    const { factory: _f, ...older } = creation;
+    storage.items.set("spdex.vault.drafts.v1", JSON.stringify({ [`${CHAIN}:old`]: { maxSlippageBps: 200, keeperReward: "400", fund: "1000", creation: older } }));
+    expect(new VaultDrafts(storage).get(CHAIN, "old")).toEqual({ maxSlippageBps: 200, keeperReward: "400", fund: "1000", creation: older });
+    for (const draft of [
+      { maxSlippageBps: 200, keeperReward: "400", fund: "1000", communityWindow: 59 },
+      { maxSlippageBps: 200, keeperReward: "400", fund: "1000", communityWindow: 3_601 },
+      { maxSlippageBps: 200, keeperReward: "400", fund: "1000", communityWindow: "900" },
+      { maxSlippageBps: 200, keeperReward: "400", fund: "1000", creation: { ...creation, factory: "v2" } },
+    ]) {
+      storage.items.set("spdex.vault.drafts.v1", JSON.stringify({ [`${CHAIN}:bad`]: draft }));
+      expect(new VaultDrafts(storage).get(CHAIN, "bad")).toBeNull();
+    }
   });
 
   it("reads nothing from storage it can't use, and never throws", () => {
@@ -1254,51 +1719,53 @@ describe("remembering a creation", () => {
 
   it("is failed when the creation reverted on chain", async () => {
     const rpc = scripted({ ...noCode, eth_getTransactionReceipt: () => ({ status: "0x0", logs: [] }) });
-    const outcome = await settleCreation(rpc, { plan: UNCREATED, creation: { ...creation, hash: `0x${"cd".repeat(32)}` }, factory: FACTORY, nowMs: 2_000 });
+    const outcome = await settleCreation(rpc, { plan: UNCREATED, creation: { ...creation, hash: `0x${"cd".repeat(32)}` }, nowMs: 2_000 });
     expect(outcome).toEqual({ kind: "failed", note: "The last attempt to create the vault failed on chain; only its network fee was spent. Create it again." });
   });
 
   it("is still pending while the network holds it, or within the grace", async () => {
     const held = scripted({ ...noCode, eth_getTransactionReceipt: () => null, eth_getTransactionByHash: () => ({ hash: "0x" }) });
-    expect(await settleCreation(held, { plan: UNCREATED, creation: { ...creation, hash: `0x${"cd".repeat(32)}` }, factory: FACTORY, nowMs: 10 ** 12 })).toEqual({
+    expect(await settleCreation(held, { plan: UNCREATED, creation: { ...creation, hash: `0x${"cd".repeat(32)}` }, nowMs: 10 ** 12 })).toEqual({
       kind: "pending",
     });
     const unknown = scripted({ ...noCode });
-    expect(await settleCreation(unknown, { plan: UNCREATED, creation, factory: FACTORY, nowMs: creation.at + CREATION_GRACE_MS - 1 })).toEqual({
+    expect(await settleCreation(unknown, { plan: UNCREATED, creation, nowMs: creation.at + CREATION_GRACE_MS - 1 })).toEqual({
       kind: "pending",
     });
   });
 
   it("is failed once the grace has passed with no trace of it", async () => {
     const unknown = scripted({ ...noCode, eth_getTransactionReceipt: () => null, eth_getTransactionByHash: () => null });
-    const outcome = await settleCreation(unknown, { plan: UNCREATED, creation: { ...creation, hash: `0x${"cd".repeat(32)}` }, factory: FACTORY, nowMs: creation.at + CREATION_GRACE_MS });
+    const outcome = await settleCreation(unknown, { plan: UNCREATED, creation: { ...creation, hash: `0x${"cd".repeat(32)}` }, nowMs: creation.at + CREATION_GRACE_MS });
     // Unknown, said as unknown: a creation sent through a wallet's own
     // private service can land later, and a retry then makes a second vault.
     expect(outcome).toMatchObject({ kind: "failed", note: expect.stringMatching(/^spDEX hasn't seen the last attempt .* wait for it rather than creating a second vault\.$/) });
     expect(outcome).not.toMatchObject({ note: expect.stringMatching(/never reached the network|nothing was spent/) });
   });
 
-  /** The factory's `VaultCreated` for `owner`'s vault at `vault` on `TERMS`, as a receipt carries it. */
-  const vaultCreated = (emitter: string, owner: Address) => {
+  /**
+   * A factory's `VaultCreated` for `owner`'s vault, as a receipt carries it:
+   * v2's (`TERMS`, with its window) by default, or v1's (`V1_TERMS`, without).
+   */
+  const vaultCreated = (emitter: string, owner: Address, release: "v1" | "v2" = "v2") => {
     const address = (a: string) => word(BigInt(a));
+    const terms = release === "v1" ? V1_TERMS : TERMS;
     return {
       address: emitter,
-      topics: [
-        "0xb888b71d90fcdc2e1651a455bddf729f7b1b568ec746d390afa2c35ac599e961",
-        `0x${address(owner)}`,
-        `0x${address(VAULT)}`,
-      ],
+      topics: [VAULT_EVENT_TOPICS[release].VaultCreated, `0x${address(owner)}`, `0x${address(release === "v1" ? V1_VAULT : VAULT)}`],
       data: `0x${[
         word(0n),
-        address(TERMS.tokenOut),
-        address(TERMS.pair),
-        address(TERMS.oraclePool),
-        word(TERMS.amountPerBuy),
-        word(TERMS.interval),
-        word(TERMS.maxBuys),
-        word(TERMS.startAt),
-        word(TERMS.keeperReward),
-        word(TERMS.maxSlippageBps),
+        address(terms.tokenOut),
+        address(terms.pair),
+        address(terms.oraclePool),
+        word(terms.amountPerBuy),
+        word(terms.interval),
+        word(terms.maxBuys),
+        word(terms.startAt),
+        word(terms.keeperReward),
+        word(terms.maxSlippageBps),
+        ...(terms.communityWindow === null ? [] : [word(terms.communityWindow)]),
+        ...(terms.turnBuckets === null ? [] : [word(terms.turnBuckets)]),
         // funded: what the creation sent, which it doesn't here.
         word(0n),
       ].join("")}`,
@@ -1311,15 +1778,34 @@ describe("remembering a creation", () => {
     const late = creation.at + CREATION_GRACE_MS;
     const receipt = (logs: unknown[]) =>
       scripted({ ...noCode, eth_getTransactionReceipt: () => ({ status: "0x1", logs }), eth_getTransactionByHash: () => null });
-    expect(await settleCreation(receipt([vaultCreated(FACTORY, OWNER)]), { plan: UNCREATED, creation: { ...creation, hash }, factory: FACTORY, nowMs: late })).toEqual({
+    expect(await settleCreation(receipt([vaultCreated(FACTORY, OWNER)]), { plan: UNCREATED, creation: { ...creation, hash }, nowMs: late })).toEqual({
       kind: "created",
       vault: VAULT,
     });
     // A look-alike from another emitter, or the factory's word about another owner, is not this creation.
     for (const log of [vaultCreated(STRANGER, OWNER), vaultCreated(FACTORY, STRANGER)]) {
-      const outcome = await settleCreation(receipt([log]), { plan: UNCREATED, creation: { ...creation, hash }, factory: FACTORY, nowMs: late });
+      const outcome = await settleCreation(receipt([log]), { plan: UNCREATED, creation: { ...creation, hash }, nowMs: late });
       expect(outcome.kind).toBe("failed");
     }
+    // Nor is another release's factory's word, when the creation says where it was sent.
+    expect((await settleCreation(receipt([vaultCreated(V1_FACTORY, OWNER, "v1")]), { plan: UNCREATED, creation: { ...creation, hash }, nowMs: late })).kind).toBe(
+      "failed",
+    );
+  });
+
+  /** One sent before the app created on v2, recorded without its factory: every release's factory is asked. */
+  it("settles a creation recorded before releases were told apart, under whichever release's factory made it", async () => {
+    const hash = `0x${"cd".repeat(32)}` as Hex;
+    const { factory: _f, ...older } = { ...creation, vault: V1_VAULT, hash };
+    const receipt = scripted({
+      ...noCode,
+      eth_getTransactionReceipt: () => ({ status: "0x1", logs: [vaultCreated(V1_FACTORY, OWNER, "v1")] }),
+      eth_getTransactionByHash: () => null,
+    });
+    expect(await settleCreation(receipt, { plan: UNCREATED, creation: older, nowMs: creation.at + CREATION_GRACE_MS })).toEqual({
+      kind: "created",
+      vault: V1_VAULT,
+    });
   });
 });
 
@@ -1367,7 +1853,7 @@ describe("vaults on chain no plan points at", () => {
 
   it("closes through the vault Guard's checks with that plan, as a card's close does, for its owner only", () => {
     const plan = planFromVault({ vault: VAULT, terms: TERMS, chainId: CHAIN });
-    const claim = { address: VAULT, owner: OWNER, nonce: NONCE, terms: TERMS };
+    const claim = { address: VAULT, owner: OWNER, nonce: NONCE, terms: TERMS, release: "v2" as const };
     expect(runVaultChecks(closeVaultTx({ chainId: CHAIN, account: OWNER, plan, claim }), CHAIN)).toEqual([]);
     expect(runVaultChecks(closeVaultTx({ chainId: CHAIN, account: STRANGER, plan, claim }), CHAIN).map((v) => v.code)).toContain(
       "VAULT_MALFORMED",
@@ -1454,23 +1940,44 @@ describe("vaults on chain no plan points at", () => {
     expect(vaultSearchNote({ vaults: [], expected: 2n, complete: false, refusal: "eth_getLogs is disabled" }, 1)).toEqual({
       missing: 1,
       expected: 2,
-      text: "1 of your 2 vaults isn't shown here: this network service wouldn't let spDEX search the vault factory's records.",
+      text: "1 of your 2 vaults isn't shown here: this network service wouldn't let spDEX search the vault factories' records.",
       refusal: "eth_getLogs is disabled",
     });
   });
 
   it("counts a vault on the page toward a search's count only when its address proves it one of those counted", () => {
-    // VAULT is OWNER's with nonce 3: the fourth vault OWNER created.
+    // VAULT is OWNER's with nonce 3: the fourth vault OWNER created on v2's factory.
     const shown = [{ vault: VAULT, terms: TERMS }];
-    expect(provenVaults({ shown, expected: 4n, factory: FACTORY, account: OWNER })).toEqual([VAULT]);
+    const counted = (v2: bigint, v1 = 0n) => [
+      { factory: FACTORY, expected: v2 },
+      { factory: V1_FACTORY, expected: v1 },
+    ];
+    expect(provenVaults({ shown, counts: counted(4n), account: OWNER })).toEqual([VAULT]);
     // Made after a count of three was read: the account's, but not one of the three, and it mustn't stand in for one.
-    expect(provenVaults({ shown, expected: 3n, factory: FACTORY, account: OWNER })).toEqual([]);
+    expect(provenVaults({ shown, counts: counted(3n), account: OWNER })).toEqual([]);
     // Someone else's, or read with other terms than its own: not the account's vault at that address.
-    expect(provenVaults({ shown, expected: 4n, factory: FACTORY, account: STRANGER })).toEqual([]);
-    expect(provenVaults({ shown: [{ vault: VAULT, terms: { ...TERMS, maxBuys: 6n } }], expected: 4n, factory: FACTORY, account: OWNER })).toEqual([]);
+    expect(provenVaults({ shown, counts: counted(4n), account: STRANGER })).toEqual([]);
+    expect(provenVaults({ shown: [{ vault: VAULT, terms: { ...TERMS, maxBuys: 6n } }], counts: counted(4n), account: OWNER })).toEqual([]);
     // Once, whatever its case.
     const upper = VAULT.toUpperCase().replace("0X", "0x") as Address;
-    expect(provenVaults({ shown: [...shown, { vault: upper, terms: TERMS }], expected: 4n, factory: FACTORY, account: OWNER })).toEqual([VAULT]);
+    expect(provenVaults({ shown: [...shown, { vault: upper, terms: TERMS }], counts: counted(4n), account: OWNER })).toEqual([VAULT]);
+    // A v1 vault proves under v1's factory's count, and only there.
+    const v1 = [{ vault: V1_VAULT, terms: V1_TERMS }];
+    expect(provenVaults({ shown: v1, counts: counted(0n, 4n), account: OWNER })).toEqual([V1_VAULT]);
+    expect(provenVaults({ shown: v1, counts: counted(4n, 0n), account: OWNER })).toEqual([]);
+  });
+
+  /** A factory-list search counts only what it found: its total bounds each release's factory, as the one factory's count once did. */
+  it("takes each factory's count from a search across them, and a list search's total for each otherwise", () => {
+    const counts = [
+      { factory: FACTORY, expected: 2n },
+      { factory: V1_FACTORY, expected: 1n },
+    ];
+    expect(factoryCountsOf({ vaults: [], expected: 3n, complete: true, counts } as never)).toEqual(counts);
+    expect(factoryCountsOf({ vaults: [], expected: 3n, complete: true })).toEqual([
+      { factory: FACTORY, expected: 3n },
+      { factory: V1_FACTORY, expected: 3n },
+    ]);
   });
 
   it("searches again after a failure, less often each time, and then stops", () => {
@@ -1514,40 +2021,52 @@ describe("vaults on chain no plan points at", () => {
         throw new Error("rate limited");
       },
     });
-    const found = await readFoundVault(down, { vault: VAULT, chainId: CHAIN, account: OWNER, factory: FACTORY });
+    const found = await readFoundVault(down, { vault: VAULT, chainId: CHAIN, account: OWNER });
     expect(found).toMatchObject({ vault: VAULT, plan: null, state: { kind: "unavailable", code: "unreadable", detail: "rate limited" } });
   });
 
-  /** `VaultCreated`'s topic: keccak256 of its signature, held to the factory's ABI by decoding a log that carries it. */
-  const VAULT_CREATED = "0xb888b71d90fcdc2e1651a455bddf729f7b1b568ec746d390afa2c35ac599e961";
   const pad = (address: string) => `0x${address.slice(2).padStart(64, "0")}`;
-  const createdLog = (vault: Address, block: bigint) => ({
-    address: FACTORY,
-    topics: [VAULT_CREATED, pad(OWNER), pad(vault)],
-    // The market's index, then the terms (a tuple of static words, inline),
-    // then what the creation sent along.
-    data: `0x${[0n, BigInt(TERMS.tokenOut), BigInt(TERMS.pair), BigInt(TERMS.oraclePool), AMOUNT, 3_600n, 5n, BigInt(START), REWARD, 200n, 0n].map(word).join("")}`,
+  /** A factory's `VaultCreated` for OWNER's vault: v2's, from v2's factory, by default; v1's (no window) from v1's. */
+  const createdLog = (vault: Address, block: bigint, release: "v1" | "v2" = "v2") => ({
+    address: release === "v1" ? V1_FACTORY : FACTORY,
+    topics: [VAULT_EVENT_TOPICS[release].VaultCreated, pad(OWNER), pad(vault)],
+    // The market's index, then the terms (a tuple of static words, inline,
+    // v2's ending with the window and its turns), then what the creation sent along.
+    data: `0x${[0n, BigInt(TERMS.tokenOut), BigInt(TERMS.pair), BigInt(TERMS.oraclePool), AMOUNT, 3_600n, 5n, BigInt(START), REWARD, 200n, ...(release === "v1" ? [] : [WINDOW, 0n]), 0n].map(word).join("")}`,
     blockNumber: `0x${block.toString(16)}`,
     logIndex: "0x0",
   });
 
-  it("the test's VaultCreated log is one the factory's ABI decodes", () => {
-    expect(decodeVaultEvent(createdLog(VAULT, 1n))).toMatchObject({ name: "VaultCreated", emitter: FACTORY, owner: OWNER, vault: VAULT, terms: TERMS });
+  it("the test's VaultCreated logs are ones each factory's ABI decodes", () => {
+    expect(decodeVaultEvent(createdLog(VAULT, 1n))).toMatchObject({ name: "VaultCreated", source: "v2", emitter: FACTORY, owner: OWNER, vault: VAULT, terms: TERMS });
+    expect(decodeVaultEvent(createdLog(V1_VAULT, 1n, "v1"))).toMatchObject({
+      name: "VaultCreated",
+      source: "v1",
+      emitter: V1_FACTORY,
+      terms: { communityWindow: null, turnBuckets: null },
+    });
   });
+
+  /** A JSON-RPC endpoint with v2's factory deployed, and v1's when `v1` says so. */
+  const factories = (handlers: Record<string, (params: unknown[]) => unknown>, v1 = false) =>
+    scripted({ eth_getCode: ([address]) => (address === FACTORY || (v1 && address === V1_FACTORY) ? "0x6080" : "0x"), ...handlers });
 
   it("searches only where there is a factory, and never before its first block", async () => {
     const nowhere = scripted({});
-    expect(await searchAccountVaults(nowhere, { chainId: 11155111, account: OWNER, factory: FACTORY })).toBeNull();
+    expect(await searchAccountVaults(nowhere, { chainId: 11155111, account: OWNER })).toBeNull();
     expect(nowhere.calls).toEqual([]);
 
     const undeployed = scripted({ eth_getCode: () => "0x" });
-    expect(await searchAccountVaults(undeployed, { chainId: CHAIN, account: OWNER, factory: FACTORY })).toBeNull();
-    expect(undeployed.calls.map((c) => c.method)).toEqual(["eth_getCode"]);
+    expect(await searchAccountVaults(undeployed, { chainId: CHAIN, account: OWNER })).toBeNull();
+    // Every release's factory is looked for, and neither is there.
+    expect(undeployed.calls.map((c) => [c.method, c.params[0]])).toEqual([
+      ["eth_getCode", FACTORY],
+      ["eth_getCode", V1_FACTORY],
+    ]);
 
     const head = VAULT_LOGS_FROM_BLOCK + 50n;
     const windows: bigint[] = [];
-    const deployed = scripted({
-      eth_getCode: () => "0x6080",
+    const deployed = factories({
       eth_call: () => `0x${word(2n)}`,
       eth_blockNumber: () => `0x${head.toString(16)}`,
       eth_getLogs: (params) => {
@@ -1557,24 +2076,87 @@ describe("vaults on chain no plan points at", () => {
       },
     });
     // Both vaults the factory counts, in one query that starts at its first block, not before.
-    const found = await searchAccountVaults(deployed, { chainId: CHAIN, account: OWNER, factory: FACTORY });
-    expect(found).toEqual({ vaults: [VAULT, at(1)], expected: 2n, complete: true, searchedFrom: VAULT_LOGS_FROM_BLOCK });
+    const found = await searchAccountVaults(deployed, { chainId: CHAIN, account: OWNER });
+    expect(found).toEqual({
+      vaults: [VAULT, at(1)],
+      expected: 2n,
+      complete: true,
+      searchedFrom: VAULT_LOGS_FROM_BLOCK,
+      counts: [{ factory: FACTORY, expected: 2n }],
+    });
     expect(windows).toEqual([VAULT_LOGS_FROM_BLOCK]);
+  });
+
+  /** v2's vaults first, then v1's, each found by its own release's VaultCreated, with each factory's own count. */
+  it("searches both releases' factories and merges them, newest release first, keeping each one's count", async () => {
+    const head = VAULT_LOGS_FROM_BLOCK + 50n;
+    const both = factories(
+      {
+        eth_call: (params) => `0x${word((params[0] as { to: string }).to === V1_FACTORY ? 1n : 2n)}`,
+        eth_blockNumber: () => `0x${head.toString(16)}`,
+        eth_getLogs: (params) => {
+          const filter = params[0] as { address: string; topics: string[] };
+          if (filter.address === V1_FACTORY) {
+            expect(filter.topics[0]).toBe(VAULT_EVENT_TOPICS.v1.VaultCreated);
+            return [createdLog(V1_VAULT, VAULT_LOGS_FROM_BLOCK + 2n, "v1")];
+          }
+          expect(filter.topics[0]).toBe(VAULT_EVENT_TOPICS.v2.VaultCreated);
+          return [createdLog(at(1), VAULT_LOGS_FROM_BLOCK + 3n), createdLog(VAULT, VAULT_LOGS_FROM_BLOCK + 40n)];
+        },
+      },
+      true,
+    );
+    expect(await searchAccountVaults(both, { chainId: CHAIN, account: OWNER })).toEqual({
+      vaults: [VAULT, at(1), V1_VAULT],
+      expected: 3n,
+      complete: true,
+      searchedFrom: VAULT_LOGS_FROM_BLOCK,
+      counts: [
+        { factory: FACTORY, expected: 2n },
+        { factory: V1_FACTORY, expected: 1n },
+      ],
+    });
+  });
+
+  /**
+   * One release's search falling short makes the whole incomplete, and the
+   * note says why from the searches that fell short: older than what the
+   * service let spDEX search only when every one of them read logs.
+   */
+  it("is incomplete when either release's search falls short, and says why from the ones that did", async () => {
+    const head = VAULT_LOGS_FROM_BLOCK + 50n;
+    const refusingV1 = factories(
+      {
+        eth_call: () => `0x${word(1n)}`,
+        eth_blockNumber: () => `0x${head.toString(16)}`,
+        eth_getLogs: (params) => {
+          if ((params[0] as { address: string }).address === V1_FACTORY) throw new Error("logs disabled");
+          return [createdLog(VAULT, VAULT_LOGS_FROM_BLOCK + 40n)];
+        },
+      },
+      true,
+    );
+    const out = await searchAccountVaults(refusingV1, { chainId: CHAIN, account: OWNER });
+    expect(out).toMatchObject({ vaults: [VAULT], expected: 2n, complete: false, refusal: "logs disabled" });
+    expect(out?.searchedFrom).toBeUndefined();
+    expect(vaultSearchNote(out!, 1)?.text).toBe(
+      "1 of your 2 vaults isn't shown here: this network service wouldn't let spDEX search the vault factories' records.",
+    );
   });
 
   it("reads no log when the vaults the page shows are every one the factory counts", async () => {
     // Four counted, and the page shows all four: plans' vaults, read, with their terms.
     const shown = [0n, 1n, 2n, 3n].map((nonce) => ({ vault: predictVault({ factory: FACTORY, owner: OWNER, nonce, terms: TERMS }), terms: TERMS }));
-    const covered = scripted({
-      eth_getCode: () => "0x6080",
+    const covered = factories({
       eth_call: () => `0x${word(4n)}`,
       eth_blockNumber: () => `0x${(VAULT_LOGS_FROM_BLOCK + 50n).toString(16)}`,
     });
-    expect(await searchAccountVaults(covered, { chainId: CHAIN, account: OWNER, factory: FACTORY, known: shown })).toEqual({
+    expect(await searchAccountVaults(covered, { chainId: CHAIN, account: OWNER, known: shown })).toEqual({
       vaults: [],
       expected: 4n,
       complete: true,
+      counts: [{ factory: FACTORY, expected: 4n }],
     });
-    expect(covered.calls.map((c) => c.method)).toEqual(["eth_getCode", "eth_call", "eth_blockNumber", "eth_call"]);
+    expect(covered.calls.map((c) => c.method)).toEqual(["eth_getCode", "eth_getCode", "eth_call", "eth_blockNumber", "eth_call"]);
   });
 });

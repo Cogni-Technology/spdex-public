@@ -1,46 +1,60 @@
 /**
  * The batcher on the local fork, through @spdex/vault: deploy it the way anyone
- * would (through the deterministic deployer, after its factory, if neither is
- * there yet), then make two vaults' first buys in one transaction, and read
- * back what happened — from the vaults' `Bought`, the batcher's `Triggered`
- * and `Batch`, joined by log index, and from the factory's own list — the way
- * a keeper and the report will. A batch that can only fail is asked about with
- * `eth_call` and decoded, not sent.
+ * would (through the deterministic deployer, built for WETH and bound to no
+ * factory, if it isn't there yet), then make two vaults' first buys in one
+ * transaction, and read back what happened — from the vaults' `Bought`, the
+ * batcher's `Triggered` and `Batch`, joined by log index, and from the
+ * factory's own list — the way a keeper and the report will. A clone no
+ * factory vouches for is triggered like any vault: the batcher trusts nothing
+ * a vault says, and measures what `rewardTo` received. A batch that can
+ * only fail is asked about with `eth_call` and decoded, not sent: one whose
+ * vaults are all inside their community window, for an address that never
+ * proved anything, buys nothing; the same batch paying the vaults' owner buys.
+ * Paying a proven SPX holder inside the window is `registry.test.ts`'s.
  *
  * The forge tests (`test/forge/Batcher.t.sol`, `BatchGas.t.sol`) prove the
  * contract's rules and pin its gas on a busy pool. This proves that the
  * encoders and decoders agree with the deployed bytes, and that a real
  * transaction's gas is inside the figures the buy fee is priced from.
  *
- * The shared fork's clock is never touched: each vault starts at the chain's
- * own time, so its first buy is due at once. Every address is fresh, the
- * vaults are this file's own, and it closes them at the end.
+ * The shared fork's clock is never touched: the vaults bought for anyone start
+ * half a slot back, so their 75-second community windows are already over and
+ * their first buys due at once; the in-window ones start at the chain's own
+ * time with a 15-minute window. Every address is fresh, the vaults are this
+ * file's own, and it closes them at the end.
  *
  * Requires a fork: `pnpm anvil:fork`.
  */
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { decodeFunctionResult, encodeFunctionData, parseAbi } from "viem";
+import { decodeFunctionResult, encodeFunctionData, getContractAddress, parseAbi } from "viem";
 import type { Address, Hex } from "@spdex/core";
 import { TOKENS, addressOfKey, generateSpendingKey, httpRpc, prepareTransaction, signPrepared } from "@spdex/chain";
 import {
   BATCHED_BUY_GAS,
   BATCHER_ABI,
+  BATCHER_LIMITS,
   BATCH_FIRST_BUY_EXTRA_GAS,
   BATCH_FIXED_GAS,
   BATCH_PER_BUY_GAS,
   FACTORY_ABI,
+  DEFAULT_TURN_BUCKETS,
+  DETERMINISTIC_DEPLOYER,
   MAINNET_BATCHER,
   MAINNET_FACTORY,
   VAULT_LIMITS,
   batcherAddress,
+  implementationAddress,
+  termsOfPlan,
+  vaultRuntimeCode,
   buyFee,
   decodeBatchRevert,
   decodeBatcherEvent,
   decodeExecuteBatchResult,
   decodeVaultEvent,
   deployBatcherCall,
-  deployFactoryCall,
+  deployReleaseCalls,
+  readVault,
   encodeClose,
   encodeCreateVault,
   encodeExecuteBatch,
@@ -66,7 +80,12 @@ const ETHER = 10n ** 18n;
  * the gas for the first vault alone, with the rest `NotTried`.
  */
 const TWO_VAULT_GAS_LIMIT = 2_000_000n;
-/** What a `rewardTo` that has never held WETH costs a batch, once (see `BatchGas.t.sol`). */
+/**
+ * What a `rewardTo` that has never held WETH costs a batch, once: the first
+ * vault's transfer to it writes its balance from zero (about 17,100 measured
+ * in `BatchGas.t.sol`, inside the 15,000 it allows beside the batch's fixed
+ * budget's headroom).
+ */
 const FRESH_REWARD_TO_EXTRA_GAS = 15_000n;
 
 const erc20 = parseAbi(["function balanceOf(address) view returns (uint256)"]);
@@ -150,9 +169,11 @@ describe("batched buys on the fork, through @spdex/vault", () => {
   let plan: VaultPlan;
   const vaults: Address[] = [];
 
-  /** A vault of `owner`'s, funded in full, whose first buy is due at once. */
-  async function createDueVault(): Promise<Address> {
-    const receipt = await sendOk(owner.key, MAINNET_FACTORY, encodeCreateVault(plan), { value: vaultBudget(plan) });
+  /** A vault of `owner`'s, funded in full, whose first buy is due at once: after its window, or (`inWindow`) inside it. */
+  async function createDueVault(inWindow = false): Promise<Address> {
+    const latest = (await rpc("eth_getBlockByNumber", ["latest", false])) as { timestamp: string };
+    const terms: VaultPlan = inWindow ? { ...plan, interval: 3_600n, communityWindow: 900n, startAt: BigInt(latest.timestamp) } : plan;
+    const receipt = await sendOk(owner.key, MAINNET_FACTORY, encodeCreateVault(terms), { value: vaultBudget(terms) });
     const [created] = vaultsCreatedBy(MAINNET_FACTORY, receipt.logs);
     if (!created) throw new Error("no VaultCreated from the factory in the receipt");
     expect(created.funded).toBe(vaultBudget(plan));
@@ -172,10 +193,13 @@ describe("batched buys on the fork, through @spdex/vault", () => {
       amountPerBuy,
       interval: VAULT_LIMITS.MIN_INTERVAL,
       maxBuys: 2n,
-      // Chain time, never the wall clock: the next block is at or after it, so the first buy is due.
-      startAt: BigInt(latest.timestamp),
+      // Chain time, never the wall clock: half a slot back, so the first buy is
+      // due, and the 75-second community window that opened with it is over.
+      startAt: BigInt(latest.timestamp) - 150n,
       keeperReward: buyFee(amountPerBuy).reward,
       maxSlippageBps: 300n,
+      communityWindow: 75n,
+      turnBuckets: DEFAULT_TURN_BUCKETS,
     };
   });
 
@@ -184,25 +208,28 @@ describe("batched buys on the fork, through @spdex/vault", () => {
     for (const vault of vaults) await sendOk(owner.key, vault, encodeClose());
   });
 
-  it("deploys the batcher through the deterministic deployer, after its factory, where the artifacts say", async () => {
+  it("deploys the batcher through the deterministic deployer, built for WETH and bound to no factory, where the artifacts say", async () => {
     const deployer = await freshAccount(ETHER);
-    const factoryCall = deployFactoryCall();
-    expect(factoryCall.factory).toBe(MAINNET_FACTORY);
-    await ensureDeployed(deployer.key, factoryCall, MAINNET_FACTORY);
+    const [registryCall, factoryCall, batcherCall] = deployReleaseCalls("v2");
+    for (const call of [registryCall!, factoryCall!]) await ensureDeployed(deployer.key, call, call.address);
+    expect(factoryCall!.address).toBe(MAINNET_FACTORY);
 
-    const call = deployBatcherCall(MAINNET_FACTORY);
+    const call = deployBatcherCall();
     expect(call.batcher).toBe(MAINNET_BATCHER);
-    expect(batcherAddress(MAINNET_FACTORY)).toBe(MAINNET_BATCHER);
+    expect(batcherCall).toMatchObject({ name: "batcher", data: call.data, address: MAINNET_BATCHER });
+    expect(batcherAddress(WETH)).toBe(MAINNET_BATCHER);
     await ensureDeployed(deployer.key, call, MAINNET_BATCHER);
 
-    const view = async (functionName: "factory" | "weth") =>
+    const view = async (functionName: "weth" | "MIN_EXECUTE_GAS") =>
       decodeFunctionResult({
         abi: BATCHER_ABI,
         functionName,
         data: (await rpc("eth_call", [{ to: MAINNET_BATCHER, data: encodeFunctionData({ abi: BATCHER_ABI, functionName }) }, "latest"])) as Hex,
       });
-    expect((await view("factory")).toLowerCase()).toBe(MAINNET_FACTORY);
-    expect((await view("weth")).toLowerCase()).toBe(WETH);
+    // What it measures `earned` in: WETH, and nothing about any factory.
+    expect(String(await view("weth")).toLowerCase()).toBe(WETH);
+    expect(await view("MIN_EXECUTE_GAS")).toBe(BATCHER_LIMITS.MIN_EXECUTE_GAS);
+    expect(BATCHER_ABI.some((item) => item.type === "function" && (item.name as string) === "factory")).toBe(false);
   });
 
   it("buys two vaults in one transaction, and its events join the vaults' by log index", async () => {
@@ -223,8 +250,8 @@ describe("batched buys on the fork, through @spdex/vault", () => {
 
     expect(vaultEvents.map(({ event }) => event.emitter)).toEqual([first, second]);
     for (const { log, event } of vaultEvents) {
-      // Each vault paid its caller: the batcher.
-      expect(event).toMatchObject({ keeper: MAINNET_BATCHER, reward, buyNumber: 1n, amountIn: plan.amountPerBuy });
+      // Each vault was called by the batcher, and paid rewardTo itself.
+      expect(event).toMatchObject({ source: "v2", keeper: MAINNET_BATCHER, rewardTo, reward, buyNumber: 1n, amountIn: plan.amountPerBuy, dueSince: plan.startAt });
       expect(event.amountOut >= event.floorOut).toBe(true);
       expect(event.floorOut > 0n).toBe(true);
       expect(event.oracleDepth >= VAULT_LIMITS.MIN_ORACLE_DEPTH).toBe(true);
@@ -237,6 +264,7 @@ describe("batched buys on the fork, through @spdex/vault", () => {
     expect(batch).toMatchObject({
       name: "Batch",
       emitter: MAINNET_BATCHER,
+      source: "v2",
       caller: keeper.address,
       rewardTo,
       listed: 2n,
@@ -247,8 +275,14 @@ describe("batched buys on the fork, through @spdex/vault", () => {
     });
     expect(batcherEvents.filter((e) => e.name === "NotTriggered")).toEqual([]);
     expect(await balanceOf(WETH, rewardTo)).toBe(2n * reward);
+    // No WETH passed through the batcher: every Transfer of it went from a vault to rewardTo or the pair.
     expect(await balanceOf(WETH, MAINNET_BATCHER)).toBe(0n);
     expect(await balanceOf(WETH, keeper.address)).toBe(0n);
+    const transferTopic = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+    const touches = receipt.logs
+      .filter((log) => log.address.toLowerCase() === WETH && log.topics[0] === transferTopic)
+      .flatMap((log) => [log.topics[1], log.topics[2]].map((topic) => `0x${topic!.slice(26)}`));
+    expect(touches).not.toContain(MAINNET_BATCHER);
 
     // Two first buys, paid to a rewardTo that had never held WETH, inside what the fee is priced from.
     const gasUsed = BigInt(receipt.gasUsed);
@@ -316,5 +350,62 @@ describe("batched buys on the fork, through @spdex/vault", () => {
         { vault: first, bought: false, reasonName: "TooSoon" },
       ],
     });
+  });
+  it("triggers a clone no factory vouches for like any vault, and earns what rewardTo received, at the gas the caller gives each", async () => {
+    // A clone of the factory's implementation with the plan's terms, made outside the factory through the
+    // deterministic deployer: the same code, but nothing vouches for it.
+    const terms = termsOfPlan(plan);
+    const runtime = vaultRuntimeCode(implementationAddress(MAINNET_FACTORY), owner.address, terms);
+    const initCode = `0x61${((runtime.length - 2) / 2).toString(16).padStart(4, "0")}3d81600a3d39f3${runtime.slice(2)}` as Hex;
+    const salt = `0x${"5a".repeat(31)}${(vaults.length + 1).toString(16).padStart(2, "0")}` as Hex;
+    const deployer = await freshAccount(ETHER / 10n);
+    await sendOk(deployer.key, DETERMINISTIC_DEPLOYER, `${salt}${initCode.slice(2)}` as Hex);
+    const clone = getContractAddress({ opcode: "CREATE2", from: DETERMINISTIC_DEPLOYER, salt, bytecode: initCode }).toLowerCase() as Address;
+    expect(await rpc("eth_getCode", [clone, "latest"])).toBe(runtime);
+    vaults.push(clone);
+    await sendOk(owner.key, clone, encodeFunctionData({ abi: parseAbi(["function fund() payable"]), functionName: "fund" }), { value: vaultBudget(plan) });
+    const isVault = decodeFunctionResult({
+      abi: FACTORY_ABI,
+      functionName: "isVault",
+      data: (await rpc("eth_call", [{ to: MAINNET_FACTORY, data: encodeFunctionData({ abi: FACTORY_ABI, functionName: "isVault", args: [clone] }) }, "latest"])) as Hex,
+    });
+    expect(isVault).toBe(false);
+
+    const listed = await createDueVault();
+    const payee = (await freshAccount()).address;
+    const receipt = await sendOk(keeper.key, MAINNET_BATCHER, encodeExecuteBatch([listed, clone], payee, 0n, { gasPerVault: 600_000n }), {
+      gas: TWO_VAULT_GAS_LIMIT + 400_000n,
+    });
+    const batch = receipt.logs.map((log) => decodeBatcherEvent(MAINNET_BATCHER, log)).find((event) => event?.name === "Batch");
+    // Both bought; earned is the rise in the payee's WETH, both fees.
+    expect(batch).toMatchObject({ bought: 2n, earned: 2n * plan.keeperReward });
+    expect(await balanceOf(WETH, payee)).toBe(2n * plan.keeperReward);
+    const bought = receipt.logs.map(decodeVaultEvent).filter((event) => event?.name === "Bought").map((event) => event!.emitter);
+    expect(bought).toEqual([listed, clone]);
+  });
+
+  it("inside their community windows buys nothing for an address that never proved, and buys for the vaults' owner", async () => {
+    const [a, b] = [await createDueVault(true), await createDueVault(true)];
+    const stranger = (await freshAccount()).address;
+    const refused = decodeBatchRevert([a, b], await revertOf({ from: keeper.address, to: MAINNET_BATCHER, data: encodeExecuteBatch([a, b], stranger, 0n) }));
+    expect(refused).toMatchObject({ kind: "NothingBought", bought: 0n });
+    expect(refused!.outcomes.map((outcome) => [outcome.vault, outcome.reasonName])).toEqual([
+      [a, "NotEligible"],
+      [b, "NotEligible"],
+    ]);
+    // The owner may always be paid: the same batch naming the vaults' owner buys both, for the owner.
+    const forOwner = (await rpc("eth_call", [{ from: keeper.address, to: MAINNET_BATCHER, data: encodeExecuteBatch([a, b], owner.address, 0n) }, "latest"])) as Hex;
+    expect(decodeExecuteBatchResult([a, b], forOwner)).toMatchObject({ kind: "ok", bought: 2n });
+    // And a vault past its window beside one inside it: only the one past its window buys for the stranger.
+    const past = await createDueVault();
+    const mixed = (await rpc("eth_call", [{ from: keeper.address, to: MAINNET_BATCHER, data: encodeExecuteBatch([a, past], stranger, 0n) }, "latest"])) as Hex;
+    expect(decodeExecuteBatchResult([a, past], mixed).outcomes.map((outcome) => [outcome.bought, outcome.reasonName])).toEqual([
+      [false, "NotEligible"],
+      [true, null],
+    ]);
+    // readVault agrees: a and b are inside their windows, which end 15 minutes after they fell due.
+    const state = (await readVault(rpc, a))!;
+    expect(state.status.windowEndsAt! - state.status.dueSince!).toBe(900n);
+    expect(state.chainTime! < state.status.windowEndsAt!).toBe(true);
   });
 });

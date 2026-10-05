@@ -17,7 +17,7 @@
 import type { Pref } from "./prefs.js";
 
 /** Bump when the disclaimer's text changes, so every browser is shown it again. */
-export const DISCLAIMER_VERSION = "2026-10";
+export const DISCLAIMER_VERSION = "2026-10b";
 
 export const DISCLAIMER_KEY = "spdex.disclaimer.v1";
 
@@ -43,8 +43,9 @@ export function disclaimerSeen(
  * community prototype is published without a lawyer's review, a risk its
  * publisher accepted on 2026-10-02; a release beyond the prototype should have
  * one read it first. It informs; it is not a clickwrap agreement. Change a
- * word, bump DISCLAIMER_VERSION (the text has not been released yet: until it
- * is, edits keep 2026-10, the version it will first ship as).
+ * word, bump DISCLAIMER_VERSION: 2026-10 shipped, and 2026-10b is its text
+ * checked again against v2's vaults (who may be paid a buy's fee, and the
+ * registry among "its contracts").
  *
  * Every sentence must be true of the code (UI rule R3, docs/ARCHITECTURE.md).
  * Re-check these sources whenever a signing path changes:
@@ -56,13 +57,23 @@ export function disclaimerSeen(
  *      lib/submit.ts, the Guard path), every transaction it prepares: since
  *      2026-10-02 nothing in the app signs with a key of its own (the old
  *      spending wallets' withdrawals were removed; senders.ts).
- *   5: a vault's terms are fixed when it is created and `execute` takes no
- *      parameter (AGENTS.md rule 6); the buy fee, at most 0.69% with the
- *      network cost included, goes to whoever triggers the buy
- *      (BUY_FEE_CEILING_BPS, which is the contract's MAX_REWARD_BPS;
- *      RecurringForm: "maybe a keeper run by spDEX's developers").
- *   6: licence AGPL-3.0-or-later in every package.json; the vault contracts
- *      are unaudited (packages/vault).
+ *   5: a vault's terms are fixed when it is created, and `execute`'s one
+ *      parameter (v2) names only who receives the caller's own fee, nothing
+ *      about the buy (AGENTS.md rule 6; the forge fuzz test that any two
+ *      accepted `rewardTo` give byte-identical buys). The buy fee, at most
+ *      0.69% with the network cost included (BUY_FEE_CEILING_BPS, which is
+ *      the contract's MAX_REWARD_BPS), goes to the caller in a v1 vault
+ *      (or the `rewardTo` its batcher's caller names) and to the `rewardTo`
+ *      the caller names in a v2 one. The app creates v2 vaults only
+ *      (`encodeCreateVault`, the v2 factory). Inside a v2 vault's community
+ *      window (60 s to an hour, `VaultLimits`) `rewardTo` must be the owner
+ *      or pass the registry's `isEligible`: a proof of holding MIN_SPX (690
+ *      SPX) at a recent block, and that much now (SpdexDcaVault
+ *      `NotEligible`, SpxHolderRegistry). The developers' keeper is paid
+ *      like anyone (V2_UPGRADE.md decision 28).
+ *   6: licence AGPL-3.0-or-later in every package.json; "its contracts" are
+ *      the vault, factory, batcher and SPX holder registry, all unaudited
+ *      (packages/vault; V2_UPGRADE.md decision 30).
  *   7: "an official release" is a copy at an address its publisher released
  *      it for, the canonical origins its key is allowlisted to (UI rule R8
  *      allows the word here and nowhere else: `OFFICIAL_RELEASE`); the
@@ -120,13 +131,14 @@ export const DISCLAIMER_SECTIONS: readonly { label: string; text: string }[] = [
     label: "Auto-buy vaults.",
     text:
       "A vault you create holds the budget you give it and buys according to the rules you signed, no matter " +
-      "who triggers the buy. The person who triggers each buy is paid a fee of up to 0.69%, including network " +
-      "costs. That person may be one of spDEX's developers.",
+      "who makes the buy. Each buy pays a fee of up to 0.69%, including network costs, to whoever makes it or " +
+      "a wallet they name. New vaults pay only you or a proven holder of 690 SPX for up to an hour after a buy " +
+      "is due. Whoever is paid may be one of spDEX's developers.",
   },
   {
     label: "Unaudited, no warranty.",
     text:
-      "spDEX and its auto-buy vault contracts are a prototype. They have not been independently audited and may " +
+      "spDEX and its contracts are a prototype. They have not been independently audited and may " +
       'contain bugs. They are provided "as is", without warranty of any kind, under the GNU Affero General ' +
       "Public License v3.0 or later. To the extent the law allows, the authors are not liable for any loss.",
   },

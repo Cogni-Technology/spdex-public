@@ -20,6 +20,14 @@
  * carry its own time, days behind the wall clock; a plan started from the form
  * is due at once in that time, so its first buy needs no clock moved at all.
  *
+ * A v2 vault's first minutes after a buy falls due are its community window:
+ * its fee may then be paid only to an SPX holder the registry vouches for, or
+ * back to its owner. Both happen here inside that window, and no test waits
+ * one out (forge pins its edges to the second): the keeper's `rewardTo` is a
+ * real mainnet holder proven on the fork from a recorded proof (`HOLDER`,
+ * e2e/vaults.ts), and Trigger now pays the owner. The holder is paid by every
+ * run, so what it receives is measured as a difference.
+ *
  * What this cannot reach is a *later* buy. The vault spaces buys at least half
  * an interval apart (`_nextBuyAt`), and the shortest interval it accepts is
  * five minutes, so a second window is at least 150 real seconds after the first
@@ -41,6 +49,9 @@
  */
 
 import {
+  CURRENT_SOURCE,
+  DEFAULT_TURN_BUCKETS,
+  DEPLOYMENTS,
   decodeBatcherEvent,
   decodeVaultEvent,
   encodeClose,
@@ -75,8 +86,12 @@ import {
   BATCHER,
   ETHER,
   FACTORY,
+  HOLDER,
+  V1_FACTORY,
+  chainNow,
   closeLeftoverVaults,
-  ensureBatcher,
+  ensureContracts,
+  expectClockWithin,
   expectRoundedUp,
   expectSixDigits,
   fillVaultForm,
@@ -90,7 +105,7 @@ import {
   vaultOnChain,
 } from "./vaults.js";
 
-/** 0.01 ETH a buy: large enough that its buy fee (a fixed amount for network fees plus 10% of that) is not held down by the 0.69% ceiling. */
+/** 0.01 ETH a buy: large enough that its buy fee (a fixed amount for network fees plus 0.25% of the buy) is not held down by the 0.69% ceiling. */
 const BUY = ETHER / 100n;
 const BUYS = 3;
 /** A vault transaction is a Guard simulation, a signature and a receipt on a forked mainnet. */
@@ -113,9 +128,10 @@ async function eventIn<N extends VaultEvent["name"]>(hash: string, vault: string
   return events[0]!;
 }
 
-// The factory the app offers, and the batcher the keeper here sends through.
+// Both releases' factories, the batcher the keeper here sends through, the
+// registry, and the holder it pays, proven.
 test.beforeAll(async () => {
-  await ensureBatcher();
+  await ensureContracts();
 });
 
 test.afterEach(async () => {
@@ -186,6 +202,9 @@ test.describe("vaults", () => {
         startAt: terms.startAt,
         keeperReward: terms.keeperReward,
         maxSlippageBps: terms.maxSlippageBps,
+        communityWindow: terms.communityWindow!,
+        // The app creates every vault without turns until decision 29 calls for them.
+        turnBuckets: DEFAULT_TURN_BUCKETS,
       }),
     );
     // On chain: the vault holds all of it, as WETH, and the owner paid that
@@ -204,14 +223,16 @@ test.describe("vaults", () => {
 
     const spx0 = await tokenBalance(SPX, owner.address);
     // A keeper's hot key pays the network fee; the buy fees go to an address of
-    // its operator's, as `SPDEX_KEEPER_REWARD_TO` sends them.
+    // its operator's, as `SPDEX_KEEPER_REWARD_TO` sends them: a community
+    // keeper's cold wallet, holding the SPX that makes it eligible. The buy is
+    // still inside its community window, so only such an address may be paid.
     const keeper = await freshAccount(ETHER / 20n);
-    const rewardTo = await freshAccount(0n);
+    const holderWeth0 = await tokenBalance(WETH, HOLDER);
     const tick = await keeperTick(forkRpc, {
       config: keeperConfig({
         chainId: FORK_CHAIN_ID,
         keeperKey: keeper.key,
-        rewardTo: rewardTo.address,
+        rewardTo: HOLDER,
         vaults: [vault],
         // Now rather than at a cheap block; one confirmation and no head-lag
         // check, since the idle fork's head is days behind the wall clock.
@@ -225,21 +246,34 @@ test.describe("vaults", () => {
     expect(tick.mined[0]!).toMatchObject({ status: "success", refused: [], notTried: [], earnedWei: terms.keeperReward });
     expect(tick.mined[0]!.bought.map((b) => b.vault)).toEqual([vault]);
     const keeperHash = tick.mined[0]!.hash;
-    // The vault's caller was the batcher, which passed its fee straight on.
+    // The vault's caller was the batcher; the vault paid the holder itself,
+    // inside the window that began when the buy fell due, at the vault's start.
     const bought = await eventIn(keeperHash, vault, "Bought");
-    expect(bought).toMatchObject({ keeper: BATCHER, amountIn: BUY, reward: terms.keeperReward, buyNumber: 1n });
+    expect(bought).toMatchObject({
+      source: CURRENT_SOURCE,
+      keeper: BATCHER,
+      rewardTo: HOLDER,
+      amountIn: BUY,
+      reward: terms.keeperReward,
+      buyNumber: 1n,
+      dueSince: terms.startAt,
+    });
+    const boughtAt = (await forkRpc("eth_getBlockByNumber", [(await receiptOf(keeperHash)).blockNumber, false])) as { timestamp: string };
+    expect(BigInt(boughtAt.timestamp)).toBeLessThan(terms.startAt + terms.communityWindow!);
     const batch = (await receiptOf(keeperHash)).logs.map((log) => decodeBatcherEvent(BATCHER, log)).find((event) => event?.name === "Batch");
-    expect(batch).toMatchObject({ caller: keeper.address, rewardTo: rewardTo.address, bought: 1n, earned: terms.keeperReward, swept: 0n });
+    expect(batch).toMatchObject({ source: CURRENT_SOURCE, caller: keeper.address, rewardTo: HOLDER, bought: 1n, earned: terms.keeperReward });
     const spx1 = await tokenBalance(SPX, owner.address);
     expect(spx1 - spx0).toBe(bought.amountOut);
     expect(bought.amountOut).toBeGreaterThanOrEqual(bought.floorOut);
     expect(bought.amountOut).toBeGreaterThan(0n);
-    // The fee landed at rewardTo, in WETH; nothing stayed with the keeper's key
-    // or the batcher; the vault holds the two buys left.
-    expect(await tokenBalance(WETH, rewardTo.address)).toBe(terms.keeperReward);
+    // The fee landed at the holder, in WETH, straight from the vault; nothing
+    // passed through or stayed with the keeper's key or the batcher; the vault
+    // holds the two buys left, and counts one buy made by a holder in its window.
+    expect((await tokenBalance(WETH, HOLDER)) - holderWeth0).toBe(terms.keeperReward);
     expect(await tokenBalance(WETH, keeper.address)).toBe(0n);
     expect(await tokenBalance(WETH, BATCHER)).toBe(0n);
     expect(await tokenBalance(WETH, vault)).toBe(budget - BUY - terms.keeperReward);
+    expect((await vaultOnChain(vault)).windowBuys).toBe(1n);
 
     // Back on spDEX: the buy it never saw is there, from the vault.
     const back = await context.newPage();
@@ -253,8 +287,11 @@ test.describe("vaults", () => {
     await expect(again.getByTestId("dca-vault-due")).toHaveCount(0);
     await again.getByTestId("dca-history-summary").click();
     await expect(history(again, "bought")).toHaveCount(1, { timeout: 60_000 });
-    // Made by a batch, so the history says so rather than naming the batcher.
-    await expect(history(again, "bought")).toContainText("triggered in a batch, paid");
+    // Made in a batch inside its window, so the history names who made it — a
+    // community keeper — and whom the vault paid, rather than the batcher.
+    // The holder as the card shortens an address: "0xb007…bb8e".
+    const madeByHolder = new RegExp(`triggered by a community keeper, paid ${HOLDER.slice(0, 6)}…${HOLDER.slice(-4)} its [\\d.]+ WETH buy fee`);
+    await expect(history(again, "bought")).toContainText(madeByHolder);
     expect(await sentTransactions(back)).toHaveLength(0);
 
     // ── After a reload with nothing kept but the config: all of it from the chain ──
@@ -268,7 +305,16 @@ test.describe("vaults", () => {
     await openTile(back, "trade");
     await back.getByTestId("connect-button").click();
     const onChain = await vaultOnChain(vault);
-    expect(onChain).toMatchObject({ owner: owner.address, closed: false, buysDone: 1n, totalOut: bought.amountOut, totalRewards: terms.keeperReward });
+    expect(onChain).toMatchObject({
+      release: "v2",
+      factory: FACTORY,
+      owner: owner.address,
+      closed: false,
+      buysDone: 1n,
+      windowBuys: 1n,
+      totalOut: bought.amountOut,
+      totalRewards: terms.keeperReward,
+    });
 
     await openTile(back, "auto-buys");
     await expect(again.getByTestId("dca-progress")).toContainText("1 of 3 buys · 0.01 of 0.03 ETH", { timeout: 60_000 });
@@ -292,7 +338,7 @@ test.describe("vaults", () => {
     await expect(again.getByTestId("dca-next")).toHaveText(/^\d+h \d+m$/);
     await again.getByTestId("dca-history-summary").click();
     await expect(history(again, "bought")).toHaveCount(1, { timeout: 60_000 });
-    await expect(history(again, "bought")).toContainText("triggered in a batch, paid");
+    await expect(history(again, "bought")).toContainText(madeByHolder);
 
     // ── Close and withdraw: everything it holds comes back as ETH ──
     const held = onChain.status.wethBalance;
@@ -325,12 +371,17 @@ test.describe("vaults", () => {
     await expect(again.getByTestId("dca-vault-trigger")).toHaveCount(0);
   });
 
-  test("Trigger now makes a due buy from the owner's wallet: SPX to the owner, the buy fee back as WETH", async ({ context }) => {
+  test("Trigger now makes a due buy from the owner's wallet inside its community window: SPX to the owner, the buy fee back as WETH", async ({
+    context,
+  }) => {
     /*
-     * Anyone may trigger a due buy and be paid its buy fee; "Trigger now" makes
-     * the owner that keeper. One wallet transaction, to the vault, sending no
-     * ether: the owner pays its network fee and nothing else, the tokens land
-     * at the owner, and the buy fee comes back to them as WETH.
+     * Inside a buy's community window its fee may be paid only to an SPX
+     * holder the registry vouches for, or back to the vault's owner; "Trigger
+     * now" is the owner's `execute(owner)`, allowed at any time. One wallet
+     * transaction, to the vault, sending no ether: the owner pays its network
+     * fee and nothing else, the tokens land at the owner, and the buy fee comes
+     * back to them as WETH. A buy paid back to its owner isn't one a holder
+     * made, so the vault doesn't count it as one.
      */
     const owner = await freshAccount(ETHER, { owner: true });
     const wallet = await keyWallet(context, owner);
@@ -346,7 +397,17 @@ test.describe("vaults", () => {
     await expect(due).toContainText("Buy 1 is due — waiting for a keeper", { timeout: TX_TIMEOUT });
     await openTile(page, "auto-buys");
     const vault = (((await card.getByTestId("dca-vault-address").textContent()) ?? "").trim()).toLowerCase();
-    const { terms } = await vaultOnChain(vault);
+    const { terms, status } = await vaultOnChain(vault);
+    expect(status.windowEndsAt).toBe(terms.startAt + terms.communityWindow!);
+
+    // The due banner says until when SPX holders have first claim, in this
+    // device's clock (the fork's runs days behind): the window's end, read as
+    // the chain's time now and carried over to the wall clock. The card's own
+    // read can lag the chain by the seconds since its last block, never ahead.
+    const windowLine = due.getByTestId("dca-vault-window");
+    await expect(windowLine).toHaveText(/^Community window until \d{2}:\d{2}, then open to anyone\.$/, { timeout: 60_000 });
+    const endsOnDevice = Math.floor(Date.now() / 1000) + Number(status.windowEndsAt! - (await chainNow()));
+    expectClockWithin(((await windowLine.textContent()) ?? "").slice("Community window until ".length, -", then open to anyone.".length), endsOnDevice - 120, endsOnDevice + 300);
 
     const trigger = due.getByTestId("dca-vault-trigger");
     await expect(trigger).toBeEnabled({ timeout: 60_000 });
@@ -365,12 +426,15 @@ test.describe("vaults", () => {
     const sent = await sentTransactions(page);
     expect(sent).toHaveLength(sent0 + 1);
     expect(sent.at(-1)!.to?.toLowerCase()).toBe(vault);
-    expect(sent.at(-1)!.data?.toLowerCase()).toBe(encodeExecute());
+    expect(sent.at(-1)!.data?.toLowerCase()).toBe(encodeExecute(owner.address));
     expect(BigInt(sent.at(-1)!.value ?? "0x0")).toBe(0n);
     expect(wallet.hashes).toHaveLength(2);
     const hash = wallet.hashes[1]!;
     const bought = await eventIn(hash, vault, "Bought");
-    expect(bought).toMatchObject({ keeper: owner.address, amountIn: BUY, reward: terms.keeperReward });
+    expect(bought).toMatchObject({ keeper: owner.address, rewardTo: owner.address, amountIn: BUY, reward: terms.keeperReward, dueSince: terms.startAt });
+    const boughtAt = (await forkRpc("eth_getBlockByNumber", [(await receiptOf(hash)).blockNumber, false])) as { timestamp: string };
+    expect(BigInt(boughtAt.timestamp)).toBeLessThan(status.windowEndsAt!);
+    expect((await vaultOnChain(vault)).windowBuys).toBe(0n);
 
     expect((await tokenBalance(SPX, owner.address)) - spx0).toBe(bought.amountOut);
     expect(bought.amountOut).toBeGreaterThan(0n);
@@ -379,7 +443,7 @@ test.describe("vaults", () => {
 
     await card.getByTestId("dca-history-summary").click();
     await expect(history(card, "bought")).toHaveCount(1, { timeout: 60_000 });
-    await expect(history(card, "bought")).toContainText("triggered by you, paid");
+    await expect(history(card, "bought")).toContainText(/triggered by you, paid you its [\d.]+ WETH buy fee/);
 
     // "Reset to recommended" can't take the plan with it: the vault still
     // holds two buys' worth, and its plan is spDEX's only way back to it —
@@ -492,6 +556,8 @@ test.describe("vaults", () => {
       startAt: BigInt(latest.timestamp),
       keeperReward: (BUY * 69n) / 10_000n,
       maxSlippageBps: 300n,
+      communityWindow: 1_800n,
+      turnBuckets: DEFAULT_TURN_BUCKETS,
     };
     const receipt = await sendAs(owner, { to: FACTORY, data: encodeCreateVault(elsewhere), value: vaultBudget(elsewhere) });
     const second = vaultsCreatedBy(FACTORY, receipt.logs)[0]!.vault;
@@ -564,6 +630,8 @@ test.describe("vaults", () => {
       startAt: BigInt(latest.timestamp),
       keeperReward: (BUY * 69n) / 10_000n,
       maxSlippageBps: 200n,
+      communityWindow: 1_800n,
+      turnBuckets: DEFAULT_TURN_BUCKETS,
     };
     const made = async () =>
       vaultsCreatedBy(FACTORY, (await sendAs(owner, { to: FACTORY, data: encodeCreateVault(terms), value: vaultBudget(terms) })).logs)[0]!
@@ -668,12 +736,16 @@ test.describe("vaults", () => {
     await expect(planCard(again).getByTestId("dca-vault-address")).toHaveText(first, { timeout: 60_000 });
     const note = again.getByTestId("dca-strays-note");
     await expect(note.getByTestId("dca-strays-note-text")).toHaveText(
-      /^1 of your 2 vaults isn't shown here: this network service wouldn't let spDEX search the vault factory's records\./,
+      /^1 of your 2 vaults isn't shown here: this network service wouldn't let spDEX search the vault factories' records\./,
       { timeout: 60_000 },
     );
     await expect(note).toContainText("A vault keeps what it holds whether spDEX shows it or not");
     await expect(note.getByTestId("goto-networkService")).toHaveText("Change service");
+    // Where to look for it by hand: each release's factory, the one the app
+    // creates on first; a v1 vault's creation went to v1's.
+    await expect(note).toContainText("include each vault's creation, sent to one of spDEX's vault factories:");
     await expect(note.getByTestId("dca-strays-factory")).toHaveText(FACTORY);
+    await expect(note.getByTestId("dca-strays-factory-v1")).toHaveText(V1_FACTORY);
     await expect(note.locator("details code")).toContainText("query exceeds max block range");
     // Not a tab plan in sight: no tab's heartbeat, and the vaults' subtitle.
     await expect(again.getByTestId("dca-heartbeat")).toHaveCount(0);
@@ -701,24 +773,27 @@ const firstParam = (body: ReturnType<typeof rpcBody>): { address: string | undef
   return { address: text(first.address), to: text(first.to) };
 };
 
-/** Every `eth_getLogs` the page asks of the vault factory, as it asks it. */
+/** Every release's factory: the app searches each for an owner's vaults. */
+const FACTORIES: ReadonlySet<string | undefined> = new Set(DEPLOYMENTS.map((d) => d.factory.toLowerCase()));
+
+/** Every `eth_getLogs` the page asks of a vault factory, as it asks it. */
 function watchFactoryLogQueries(page: Page): unknown[] {
   const queries: unknown[] = [];
   page.on("request", (request) => {
     if (!request.url().startsWith(FORK_URL)) return;
     const body = rpcBody(request.postData());
-    if (body?.method === "eth_getLogs" && firstParam(body)?.address === FACTORY) queries.push(firstParam(body));
+    if (body?.method === "eth_getLogs" && FACTORIES.has(firstParam(body)?.address)) queries.push(firstParam(body));
   });
   return queries;
 }
 
-/** A network service that refuses every log query of the vault factory, as a hosted one capping ranges does. */
+/** A network service that refuses every log query of either vault factory, as a hosted one capping ranges does. */
 async function refuseFactoryLogs(page: Page): Promise<void> {
   await page.route(
     (url) => url.href.startsWith(FORK_URL),
     async (route) => {
       const body = rpcBody(route.request().postData());
-      if (body?.method !== "eth_getLogs" || firstParam(body)?.address !== FACTORY) return route.fallback();
+      if (body?.method !== "eth_getLogs" || !FACTORIES.has(firstParam(body)?.address)) return route.fallback();
       return route.fulfill({
         status: 200,
         headers: { "access-control-allow-origin": "*" },

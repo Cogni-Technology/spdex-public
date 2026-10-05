@@ -75,36 +75,65 @@ call `close()` on it from the owner's wallet:
 - in any wallet that lets you add data: send 0 ETH to the vault with data
   `0x43d726d6` (that is `close()`).
 
-spDEX never asks you to do this. Do it only for a vault whose `owner()` is
-your address.
+The call is the same for a vault of either release, v1 or v2. spDEX never asks
+you to do this. Do it only for a vault whose `owner()` is your address.
 
-The explorer route may not exist. The factory, the vault implementation every
-vault is a copy of, and the batcher have their source verified on Sourcify and
-Etherscan. But a vault is an EIP-1167 clone with its terms appended to its
-code, and whether an explorer recognises one as a copy of the verified
-implementation, and offers Write as Proxy, hasn't been seen yet: when they were
-verified, no vault existed to look at. The raw call always works: `close()` sends
-everything the vault holds to its owner as ETH (as WETH to an owner that can't
-take ether), and only the owner can call it. The panel lists the vaults in this browser's settings, each in full, with
-a link to it on Etherscan on Ethereum.
+**Making a due buy yourself.** A v2 vault has one more call worth knowing:
+`execute(owner)`, which makes a due buy and pays its fee back to the owner.
+Its community window never refuses it, so it works the moment a buy falls
+due, inside the community window or after it, whoever sends it. In any wallet
+that lets you add data, send 0 ETH to the vault with data `0x4b64e492` (that
+is `execute(address)`) followed by the owner's address left-padded with zeros
+to 32 bytes: 24 zeros, then the address's 40 hex digits without its `0x`.
 
-**Finding your vaults without spDEX.** The factory lists every vault it has
+```
+0x4b64e492000000000000000000000000<the owner's address, 40 hex digits, no 0x>
+```
+
+It buys only when a buy is due, which the vault's `status()` says (its first
+answer, `due`); otherwise it reverts, and costs only the gas of a revert. What
+it buys, how much and at what floor are the vault's terms, as for anyone's
+call. A v1 vault's buy is still `execute()`, data `0x61461954`, and its fee
+goes to whoever sends it.
+
+The explorer route may not exist. v1's factory, the vault implementation every
+v1 vault is a copy of, and v1's batcher have their source verified on Sourcify
+and Etherscan, and v2's contracts are verified the same way when they are
+deployed (`docs/RELEASE.md`). But a vault is an EIP-1167 clone with its terms
+appended to its code, and whether an explorer recognises one as a copy of the
+verified implementation, and offers Write as Proxy, hasn't been seen yet: when
+v1's were verified, no vault existed to look at. The raw call always works:
+`close()` sends everything the vault holds to its owner as ETH (as WETH to an
+owner that can't take ether), and only the owner can call it. The panel lists
+the vaults in this browser's settings, each in full, with a link to it on
+Etherscan on Ethereum.
+
+**Finding your vaults without spDEX.** Each factory lists every vault it has
 made (`vaultCount()`, then `vaultsPage(offset, limit)`, at most 1,000 at a
-time), and each vault's `owner()` says whose it is. The release's factory,
-from `packages/vault/deployments.json`:
+time), and each vault's `owner()` says whose it is. There is one factory per
+release, from `packages/vault/deployments.json`. v1's, on mainnet since block
+26,100,366:
 
 ```
 0xe4a1410a9Ee0833D41e7514306E65Ad729B7199E
 ```
 
-The panel prints it in full, since a shortened address is useless without
+v2's, the address this build deploys it to; it makes vaults once it is
+deployed and `deployments.json` records its block:
+
+```
+0x164080E374F3A924245c3a99fBaDbd2C98ed48eB
+```
+
+The panel prints each in full, since a shortened address is useless without
 spDEX to expand it.
 
-In the app, **Find my vaults from the factory's list** does exactly that
-search for the connected wallet: it reads every listed vault's owner and
-compares them in the page, at one block, through Multicall3. That is 2 +
-⌈N/1000⌉ + ⌈N/200⌉ requests for N listed vaults, and fewer once owners are
-cached, since an owner never changes. It searches the newest 5,000 vaults at
+In the app, **Find my vaults from the factories' lists** does exactly that
+search for the connected wallet, on each listed factory: it reads every listed
+vault's owner and compares them in the page, at one block, through
+Multicall3. That is 2 + ⌈N/1000⌉ + ⌈N/200⌉ requests for a factory with N
+listed vaults, and fewer once owners are cached, since an owner never
+changes. It searches the newest 5,000 vaults at
 most, and says how many it searched: the count is the network service's
 answer, and a wrong one mustn't set off endless requests. An older vault
 past that is found the way above, from any tool that reads the list. It is for network services that limit
@@ -113,8 +142,12 @@ panel also runs it by itself when that happens. It isn't a privacy measure:
 your service still sees your address, as it does for every balance read, and
 who owns a vault is public on chain.
 
-**Keeping your vaults buying.** Anyone can make a due vault buy. Run a keeper
-(`docs/KEEPER.md`) to keep yours buying.
+**Keeping your vaults buying.** Anyone can make a v1 vault's due buy. A v2
+vault's buy is open to anyone once its community window has passed; inside
+the window, an SPX holder's keeper can make it and be paid, or anyone can by
+paying the fee back to you. Run a keeper (`docs/KEEPER.md`) with your own
+address as its `rewardTo` to keep yours buying, or send `execute(owner)`
+yourself (above).
 
 **Your settings and records.** Export your settings (Settings → Settings file)
 and your records (Your activity → Download CSV). This browser's storage can be

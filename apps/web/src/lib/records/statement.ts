@@ -180,6 +180,41 @@ export function kindLabel(kind: RecordRow["kind"] | string): string {
   }
 }
 
+/**
+ * Who made a v2 vault buy, in a few words, on screen and on paper: "Made by
+ * you", "Made by a community keeper". Null for any other row, and when who
+ * made it can't be told, which then goes unsaid rather than guessed.
+ *
+ * A v1 vault buy (no `rewardTo`) reads as it always has, with no such line:
+ * v2 is what asks who made each buy (docs/V2_UPGRADE.md, Your activity), and
+ * a v1 log tells only who called, which for the owner's own Help run batch is
+ * the batcher, not a keeper. The CSV's `made_by` still says it.
+ */
+export function makerText(row: Pick<RecordRow, "vaultBuy">): string | null {
+  if (row.vaultBuy === undefined || row.vaultBuy.rewardTo === null) return null;
+  switch (row.vaultBuy.maker) {
+    case "owner":
+      return "Made by you";
+    case "returned":
+      // Anyone may name the owner as the one paid: the fee came back, but it wasn't the owner's doing.
+      return "Made by someone else; the fee came back to you";
+    case "community":
+      return "Made by a community keeper";
+    case "open":
+      return "Made after the community window, when anyone could";
+    default:
+      return null;
+  }
+}
+
+/** A statement row's "What": "Vault buy · Daily SPX · made by a community keeper". */
+export function statementWhat(row: Pick<RecordRow, "kind" | "planLabel" | "vaultBuy">): string {
+  const maker = makerText(row);
+  return [kindLabel(row.kind), row.planLabel, maker === null ? undefined : maker.replace(/^Made/, "made")]
+    .filter((part) => part !== undefined)
+    .join(" · ");
+}
+
 /** "6,912.3 SPX" to six significant digits, or null when the amount is unknown or the token unlisted. */
 export function legAmount(leg: Pick<RecordRow["sold"], "token" | "amount">, tokens: readonly TokenInfo[] = TOKEN_LIST): string | null {
   const info = tokenFor(leg.token, tokens);
