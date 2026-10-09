@@ -1,0 +1,93 @@
+/*
+ * The backdrop's picture, shipped with the app.
+ *
+ * theme.css ("Art") fixes the layer behind the page and lays it under the
+ * masthead and the widget's gap too; this names the picture it lays, and
+ * where it lays it. The picture is ./assets/backdrop (README.md beside it
+ * says how it was made): 2560 × 1440, as AVIF (70 KB) and WebP (109 KB).
+ * A browser that can choose by type() takes the AVIF; one that can't
+ * (Chrome before 113, Safari before 17) is never shown the image-set() and
+ * keeps the WebP.
+ *
+ * Same origin, always: Vite copies both files into the build's assets with a
+ * content hash, and the CSP's `img-src 'self'` covers them. Named only where
+ * there are three columns (85em), which no phone reaches, held either way;
+ * and never on an iPhone or iPad, whose Safari can't fix a background to the
+ * window, so the masthead's piece of the picture would not line up with the
+ * rest (that is what `-webkit-touch-callout` tells apart). Under more
+ * contrast, forced colours and print theme.css sets --bgart-image to none,
+ * so nothing loads there either.
+ */
+
+@media (min-width: 85em) {
+  @supports not (-webkit-touch-callout: none) {
+    :root { --bgart-image: url("./assets/backdrop/backdrop.webp"); }
+    @supports (background-image: image-set("a.avif" type("image/avif"))) {
+      :root {
+        --bgart-image: image-set(url("./assets/backdrop/backdrop.avif") type("image/avif"), url("./assets/backdrop/backdrop.webp") type("image/webp"));
+      }
+    }
+  }
+}
+
+/*
+ * Where it goes. Two things in the picture must never sit under a sticker,
+ * the widget or the centre column: the lead banner's SPX print (the
+ * picture's x 134-233, y 579-683) and the SPX coin inside the crystal
+ * (x 1933-2080, y 468-632). theme.css keeps the stickers to each rail's
+ * right-hand side, so the left rail is clear along the window's edge and the
+ * right rail beside the centre column. The picture is placed from the
+ * layout's own measures, so one set of rules holds at every window size and
+ * text size:
+ *
+ *   --bgart-w  the picture's width: at least the window (cover), and wide
+ *              enough that, with the print 16px in from the window's left
+ *              edge, the coin starts 16px right of the centre column (12px
+ *              past a tile's 4px shadow). The column's right edge is
+ *              50vw + min(25rem, 50vw - 48px - the rail's minimum), from the
+ *              three-column grid (Page layout in theme.css); 1799 is the
+ *              print-to-coin distance in the picture, so the width is that
+ *              edge × 2560/1799. It is also tall enough that lowering the
+ *              picture (y) can always clear the widget: 2560/468 × the top.
+ *   x          the print 16px in from the left edge, unless the picture
+ *              would then stop short of the window's right edge.
+ *   y          anchored at the bottom (the camp and the cliffs stand on the
+ *              window's floor), unless that lifts the coin's top above
+ *              --bgart-top, 12px under the widget's bottom edge; then lowered
+ *              just enough, at most to the picture's top edge.
+ *
+ * In a tall window (3:2 and squarer; the rule starts at 1.52:1, so the
+ * 1.54:1 of a MacBook's full screen keeps the default) covering the height
+ * makes the picture so wide that, with the print pinned, the coin lands
+ * under the stamp. There the coin wins: the picture slides left until the
+ * coin clears the stickers (198px in from the right edge), and the print is
+ * cut by the window's left edge or slides past it. In a window under about
+ * 700px tall the pinned display dock can cover the print. Checked in the page
+ * at 486 window sizes from 1360 × 618 to 3840 × 2160, at each text size;
+ * e2e/shell.spec.ts keeps a sample of them. vw counts a classic (not
+ * overlay) scrollbar, so beside one the coin sits up to the scrollbar's
+ * width further right: further from the centre column, nearer the stamp.
+ */
+@media (min-width: 85em) {
+  :root {
+    --bgart-rail: 14.5rem;
+    --bgart-top: calc(36px + 12rem);
+    --bgart-w: max(100vw, 177.778vh, (50vw + min(25rem, 50vw - 48px - var(--bgart-rail))) * 1.42301, var(--bgart-top) * 5.47009);
+    --bgart-x: max(100vw - var(--bgart-w), 16px - var(--bgart-w) * 0.05234);
+    --bgart-y: max(100vh - var(--bgart-w) * 0.5625, min(0px, var(--bgart-top) - var(--bgart-w) * 0.18281));
+    --bgart-size: var(--bgart-w) auto;
+    --bgart-position: var(--bgart-x) var(--bgart-y);
+  }
+}
+/* From 90em the rails are 17rem at least, and the widget is shorter. */
+@media (min-width: 90em) {
+  :root {
+    --bgart-rail: 17rem;
+    --bgart-top: calc(36px + 10.75rem);
+  }
+}
+@media (min-width: 85em) and (max-aspect-ratio: 152/100) {
+  :root {
+    --bgart-x: max(100vw - var(--bgart-w), min(16px - var(--bgart-w) * 0.05234, 100vw - 198px - var(--bgart-w) * 0.8125));
+  }
+}

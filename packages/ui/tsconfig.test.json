@@ -1,0 +1,12 @@
+{
+  // The stylesheet test reads theme.css from disk, so it needs Node's types,
+  // which the components deliberately do not get (see tsconfig.json).
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "jsx": "react-jsx",
+    "types": ["node"]
+  },
+  "include": ["src/**/*"]
+}

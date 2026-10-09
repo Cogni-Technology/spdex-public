@@ -1,0 +1,12 @@
+{
+  // Tests run in Node and may use `process`, so they get Node types — while
+  // `src` deliberately does not. Keeping these separate is what makes
+  // "src must not depend on Node APIs" a compile error rather than a convention.
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "lib": ["ES2022", "WebWorker"],
+    "types": ["node"]
+  },
+  "include": ["test/**/*", "src/**/*", "scripts/**/*.ts"]
+}

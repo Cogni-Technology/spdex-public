@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  push: { branches: [main] }
+  pull_request:
+  # Actions → CI → Run workflow: a run without a push, on any branch or tag.
+  workflow_dispatch:
+
+jobs:
+  verify:
+    # Pinned rather than ubuntu-latest, which moves to Ubuntu 26 from
+    # 2026-10-19: the browser install below has to support the image it gets.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      # Fork tests, the parity gate and the red-team suite all need anvil.
+      # Without it `pnpm verify --strict` fails rather than skipping, which is
+      # the point: CI must never report green on a partial run.
+      #
+      # Pinned to the release the gate runs with locally: a new Foundry can
+      # change how the fork tests measure gas (1.8 made isolate mode the
+      # default, which packages/vault/foundry.toml turns off), and an unpinned
+      # one changes under a commit that didn't.
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.7.1
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm exec playwright install --with-deps chromium
+
+      # Mainnet state the forks have read, kept between runs. anvil and the
+      # forge tests fetch each account and storage slot from the archive
+      # endpoint once and keep it in ~/.foundry/cache/rpc. The pinned block never
+      # changes, so state from any earlier run is still right; each run starts
+      # from the newest cache and saves what it added. Without it every run
+      # starts cold, and the fork-backed stages wait on thousands of archive
+      # reads that a free endpoint throttles.
+      - uses: actions/cache/restore@v4
+        with:
+          path: ~/.foundry/cache/rpc
+          key: fork-state-${{ hashFiles('.env.defaults') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: fork-state-${{ hashFiles('.env.defaults') }}-
+
+      # The pinned fork the fork-backed stages run against, as `pnpm anvil:fork`
+      # in another terminal is locally (docs/DEVELOPMENT.md). Nothing in the
+      # gate starts it. It serves only once the upstream has produced
+      # SPDEX_FORK_BLOCK_HASH at SPDEX_FORK_BLOCK, so its "fork verified" line
+      # means the right chain, and it keeps running for the steps below.
+      - name: Start the pinned fork
+        run: |
+          pnpm anvil:fork > anvil-fork.log 2>&1 &
+          fork=$!
+          for _ in $(seq 1 90); do
+            if grep -q "fork verified" anvil-fork.log; then exit 0; fi
+            if ! kill -0 "$fork" 2>/dev/null; then cat anvil-fork.log; exit 1; fi
+            sleep 2
+          done
+          cat anvil-fork.log
+          exit 1
+        env:
+          SPDEX_FORK_RPC_URL: ${{ secrets.SPDEX_FORK_RPC_URL }}
+
+      - name: Verify
+        run: pnpm verify --strict
+        env:
+          SPDEX_FORK_RPC_URL: ${{ secrets.SPDEX_FORK_RPC_URL }}
+
+      # anvil writes what it fetched to its cache when it stops, so it is
+      # stopped (TERM, never KILL) before the cache is saved, pass or fail: a
+      # failed run's reads still spare the next run.
+      - name: Stop the pinned fork
+        if: always()
+        run: |
+          pkill -TERM -x anvil || true
+          for _ in $(seq 1 60); do pgrep -x anvil > /dev/null || exit 0; sleep 1; done
+          echo "anvil didn't stop within a minute"
+
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: ~/.foundry/cache/rpc
+          key: fork-state-${{ hashFiles('.env.defaults') }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      # The gate's report lives in .verify/, a hidden directory, which the
+      # upload leaves out unless told otherwise.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: verify-report
+          include-hidden-files: true
+          path: |
+            .verify/report.json
+            anvil-fork.log

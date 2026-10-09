@@ -1,0 +1,4 @@
+# The report writes its tables here (docker compose --profile tools run --rm report).
+# Kept in git only so the directory exists, owned by whoever cloned, before Docker mounts it.
+*
+!.gitignore

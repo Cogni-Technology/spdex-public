@@ -1,0 +1,27 @@
+{
+  "name": "@spdex/vault",
+  "version": "0.0.0",
+  "private": true,
+  "license": "AGPL-3.0-or-later",
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./keeper": "./src/keeper.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.test.json",
+    "build:artifacts": "node scripts/build-artifacts.mjs",
+    "check:artifacts": "node scripts/build-artifacts.mjs --check",
+    "test:forge": "node scripts/forge.mjs test"
+  },
+  "dependencies": {
+    "@spdex/chain": "workspace:*",
+    "@spdex/core": "workspace:*",
+    "viem": "^2.56.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0"
+  }
+}

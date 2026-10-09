@@ -1,0 +1,40 @@
+/*
+ * Auto-buy's layout: the Recurring form's short copy and
+ * the auto-buys panel inside its tile. Overrides only; the auto-buy block in
+ * packages/ui/src/theme.css stays as it is. rem throughout, so the text-size
+ * setting scales it.
+ */
+
+/* "ⓘ" after a sentence: the longer explanation, one hover, tap or Tab away.
+   Mono and small, so it reads as a mark rather than a word. */
+.spdex-info {
+  display: inline-block;
+  font-family: var(--font-data);
+  font-size: 0.875em;
+  font-weight: 700;
+  line-height: 1;
+  text-decoration: none;
+}
+.spdex-term:has(> .spdex-info) { text-decoration: none; }
+
+/* The two limits, one line under the choice cards (it was two bullets). */
+p.spdex-dca-limits {
+  margin: 0 0 0.75rem;
+  padding: 0;
+  font-size: 0.8125rem;
+}
+
+/* "How auto-buy works": the saying closes the list, set apart from it. */
+.spdex-dca-how + .spdex-saying { margin-top: 0.75rem; }
+
+/* The vault card's Risk and Buys lines are now a few words each: one row. */
+.spdex-choice__line .spdex-term { white-space: nowrap; }
+
+/* "See it in Auto-buys", after the started banner's sentence. */
+.spdex-banner .spdex-goto { margin-left: 0.25rem; }
+
+/* In the Auto-buys tile: the subtitle is the body's first line. */
+.spdex-dca-tile > .spdex-panel__subtitle:first-child { margin-top: 0; }
+
+/* "10-minute average" in a narrow row: kept whole, never broken at its hyphen. */
+.spdex-dca-nobreak { white-space: nowrap; }

@@ -1,0 +1,169 @@
+# The spDEX keeper and its report, with Docker Compose. docs/KEEPER.md is the
+# guide; this file is meant to be run from this directory:
+#
+#   docker compose up -d --build                     the keeper, on mainnet
+#   docker compose --profile tools run --rm report   the report, into ./report
+#
+# and, against a local fork (pnpm anvil:fork), never with mainnet secrets:
+#
+#   SPDEX_FORK_VAULTS=0x…,0x… docker compose --profile fork run --rm keeper-fork --once
+#   docker compose --profile fork run --rm report-fork --to-block latest
+#
+# The keeper listens on nothing and contacts only the endpoints in ./secrets.
+# Its key and endpoints are files there, mounted read-only; nothing secret is
+# in .env, in this file or in the image.
+
+name: spdex-keeper
+
+x-image: &image
+  image: spdex-keeper:local
+  build:
+    # The repository root; its .dockerignore lets in only what the keeper runs on.
+    context: ../..
+    dockerfile: docker/keeper/Dockerfile
+    args:
+      GIT_SHA: ${SPDEX_KEEPER_GIT_SHA:-}
+
+x-hardening: &hardening
+  # The operator's own uid and gid (set KEEPER_UID and KEEPER_GID in .env when
+  # `id -u` / `id -g` are not 1000), so the secret files they made are readable
+  # as they are, with no chown and no root.
+  user: "${KEEPER_UID:-1000}:${KEEPER_GID:-1000}"
+  init: true
+  read_only: true
+  tmpfs: [/tmp]
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  mem_limit: 256m
+  logging:
+    driver: json-file
+    options:
+      max-size: 10m
+      max-file: "5"
+
+services:
+  keeper:
+    <<: [*image, *hardening]
+    # The keeper exits when its own watchdog sees ticks stop, and this brings
+    # it back. Plain Compose never restarts a container for being unhealthy.
+    restart: unless-stopped
+    # Time to finish the tick in progress and write its state on `docker compose stop`.
+    stop_grace_period: 30s
+    env_file: .env
+    environment:
+      SPDEX_KEEPER_KEY_FILE: /run/secrets/keeper_key
+      SPDEX_KEEPER_RPC_URL_FILE: /run/secrets/rpc_url
+      # An empty file means no private endpoint: sends go to the public mempool, with a warning.
+      SPDEX_KEEPER_SEND_URL_FILE: /run/secrets/send_url
+      # An empty file means no dead-man's switch. A ping URL is a secret too: whoever has it can silence the alert.
+      SPDEX_KEEPER_HEARTBEAT_URL_FILE: /run/secrets/heartbeat_url
+    secrets: [keeper_key, rpc_url, send_url, heartbeat_url]
+    # A node on this machine is host.docker.internal from inside the container; its 127.0.0.1 is the container's own.
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    volumes:
+      # The named volume, or a directory of the operator's (KEEPER_DATA in .env).
+      - ${KEEPER_DATA:-keeper-data}:/data
+
+  # The keeper against a local fork: standalone, with no env_file and no
+  # mainnet secret, limited to the vaults it is given. Host networking, because
+  # anvil listens on the host's 127.0.0.1; that needs rootful Docker on Linux.
+  # Its settings have names of their own (SPDEX_FORK_*): Compose fills the
+  # `${…}` below from .env as well as from the shell, and a mainnet keeper's
+  # SPDEX_KEEPER_* settings there must never reach it.
+  keeper-fork:
+    <<: [*image, *hardening]
+    profiles: [fork]
+    network_mode: host
+    stop_grace_period: 30s
+    # A shared fork holds other people's test vaults, so this keeper refuses to
+    # start without an allowlist, unless it is only asked for its address.
+    # (A `${VAR:?}` guard would do it in Compose, but Compose checks those for
+    # every service, and `docker compose up` would fail for the mainnet keeper.)
+    entrypoint:
+      - sh
+      - -c
+      - >-
+        if [ -z "$$SPDEX_KEEPER_VAULTS" ] && [ "$$1" != --print-address ]; then echo "keeper-fork: set SPDEX_FORK_VAULTS to the fork vaults it may trigger" >&2; exit 1; fi;
+        exec node --experimental-transform-types --disable-warning=ExperimentalWarning
+        --import ./packages/vault/scripts/ts-hooks.mjs packages/vault/scripts/keeper.ts "$$@"
+      - keeper-fork
+    environment:
+      SPDEX_KEEPER_RPC_URL: ${SPDEX_FORK_URL:-http://127.0.0.1:8545}
+      SPDEX_KEEPER_SEND_URL: ""
+      SPDEX_KEEPER_SEND_WHEN: now
+      SPDEX_KEEPER_DEPLOY_BATCHER: "1"
+      SPDEX_KEEPER_CONFIRMATIONS: "1"
+      # An idle fork's head is as old as its last transaction.
+      SPDEX_KEEPER_MAX_HEAD_LAG_SECONDS: "0"
+      SPDEX_KEEPER_VAULTS: ${SPDEX_FORK_VAULTS:-}
+      SPDEX_KEEPER_REWARD_TO: ${SPDEX_FORK_REWARD_TO:-}
+      # Never prove on a fork, whatever .env says: anvil can't prove the blocks it mines, and its "finalized"
+      # block is one of them. A fork's eligible holder is proven from recorded mainnet proofs by its tests.
+      SPDEX_KEEPER_PROVE: "0"
+      SPDEX_KEEPER_KEY_FILE: /run/secrets/fork_key
+    secrets: [fork_key]
+    volumes:
+      - keeper-fork-data:/data
+
+  report:
+    <<: [*image, *hardening]
+    profiles: [tools]
+    entrypoint: &report
+      - node
+      - --experimental-transform-types
+      - --disable-warning=ExperimentalWarning
+      - --import
+      - ./packages/vault/scripts/ts-hooks.mjs
+      - packages/vault/scripts/keeper-report.ts
+      - --keeper-log
+      - /data/keeper-*.jsonl
+      - --keeper-state
+      - /data/state.json
+      - --out
+      - /report
+    env_file: .env
+    environment:
+      # An endpoint of its own for the report, one with wide eth_getLogs ranges; an empty file means the keeper's.
+      SPDEX_REPORT_RPC_URL_FILE: /run/secrets/report_rpc_url
+      SPDEX_KEEPER_RPC_URL_FILE: /run/secrets/rpc_url
+    secrets: [rpc_url, report_rpc_url]
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    volumes:
+      # The keeper's logs and state, read-only; the tables land in ./report.
+      - ${KEEPER_DATA:-keeper-data}:/data:ro
+      - ./report:/report
+    healthcheck:
+      disable: true
+
+  report-fork:
+    <<: [*image, *hardening]
+    profiles: [fork]
+    network_mode: host
+    entrypoint: *report
+    environment:
+      SPDEX_REPORT_RPC_URL: ${SPDEX_FORK_URL:-http://127.0.0.1:8545}
+      # A local fork has no rate limit to respect.
+      SPDEX_REPORT_MAX_RPS: "50"
+    volumes:
+      - keeper-fork-data:/data:ro
+      - ./report:/report
+    healthcheck:
+      disable: true
+
+secrets:
+  keeper_key:
+    file: ./secrets/keeper_key
+  rpc_url:
+    file: ./secrets/rpc_url
+  send_url:
+    file: ./secrets/send_url
+  heartbeat_url:
+    file: ./secrets/heartbeat_url
+  report_rpc_url:
+    file: ./secrets/report_rpc_url
+  fork_key:
+    file: ./secrets/fork_key
+
+volumes:
+  keeper-data:
+  keeper-fork-data:

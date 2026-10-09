@@ -1,0 +1,28 @@
+# The keeper image's build context is the repository root (docker/keeper/Dockerfile).
+#
+# An allow-list, not a deny-list: everything is left out, and only what the
+# keeper and its report run on is let back in. A deny-list fails open — a new
+# secret file nobody thought to list would go into the context, and from there
+# into a layer anyone with the image can read. This way `.env.local` (which
+# holds the fork's archive RPC URL), docker/keeper/.env, docker/keeper/secrets/
+# and every key or report on the machine can never enter the build.
+*
+
+!package.json
+!pnpm-lock.yaml
+!pnpm-workspace.yaml
+!.npmrc
+!packages/core/package.json
+!packages/core/src
+!packages/chain/package.json
+!packages/chain/src
+!packages/vault/package.json
+!packages/vault/src
+!packages/vault/scripts
+!scripts/env.mjs
+
+# Left out again inside what was let back in: tests, installed dependencies,
+# and any environment file, wherever it is.
+**/*.test.ts
+**/node_modules
+**/.env*

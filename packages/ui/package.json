@@ -1,0 +1,13 @@
+{
+  "name": "@spdex/ui",
+  "version": "0.0.0",
+  "private": true,
+  "license": "AGPL-3.0-or-later",
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": { ".": "./src/index.ts", "./theme.css": "./src/theme.css" },
+  "scripts": { "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.test.json" },
+  "peerDependencies": { "react": "^19.0.0" },
+  "devDependencies": { "@types/react": "^19.0.0", "react": "^19.3.0" }
+}

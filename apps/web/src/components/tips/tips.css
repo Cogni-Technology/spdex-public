@@ -1,0 +1,230 @@
+/* ── The tip registry: tags, the first-tip check, the picker's lists, and
+   Settings → Tips' "My tip list". The Tip row's own frame (.spdex-tiprow,
+   .spdex-tippill, .spdex-tippick) is in the theme; this adds to it. Sizes in
+   rem, so the display dock's text size scales them (css.test.ts). ────────── */
+
+/* A recipient's tag, inside its pill: LISTED, MINE, UNLISTED, RETIRED. */
+.spdex-tiptag {
+  align-self: stretch;
+  display: inline-flex;
+  align-items: center;
+  border-right: 1.5px solid var(--ink);
+  font-family: var(--font-data);
+  font-size: 0.5625rem;
+  font-weight: 700;
+  letter-spacing: 1.2px;
+  padding: 0 6px;
+  text-transform: uppercase;
+  background: var(--paper);
+  color: var(--ink);
+}
+.spdex-tiptag--listed { background: var(--c-cyan); color: var(--accent-ink); }
+.spdex-tiptag--mine { background: var(--c-lime); color: var(--accent-ink); }
+/* Warning style: only loaded settings name it. */
+.spdex-tiptag--unlisted { background: var(--c-yellow); color: var(--accent-ink); }
+/* Attention style: taken off the list. */
+.spdex-tiptag--retired { background: var(--c-magenta); color: var(--accent-ink); }
+.spdex-tiptag .spdex-term { border-bottom: 0; }
+
+/* A chosen recipient that won't be tipped: dashed, and it says so. */
+.spdex-tippill--skipped { border-style: dashed; box-shadow: none; }
+.spdex-tippill--skipped .spdex-tippill__name { text-decoration: line-through; text-decoration-thickness: 1.5px; }
+/* Waiting for the first-tip check: dashed, but not struck through — not a refusal. */
+.spdex-tippill--waiting { border-style: dashed; box-shadow: none; }
+.spdex-tippill__skip {
+  color: var(--ink);
+  font-size: 0.625rem;
+  font-weight: 700;
+  letter-spacing: 0.8px;
+  padding: 0 8px 0 0;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+/* The first-tip check and the retired-entry choice: a card under the row. */
+.spdex-tipconfirm {
+  background: var(--surface);
+  border: var(--line) solid var(--ink);
+  border-left-width: 6px;
+  border-left-color: var(--warn);
+  box-shadow: 4px 4px 0 0 var(--shadow);
+  margin-top: 14px;
+  padding: 10px 14px 12px;
+}
+.spdex-tipconfirm:focus-visible { outline: var(--focus-ring) solid var(--ink); outline-offset: 2px; }
+.spdex-tipconfirm__title {
+  font-family: var(--font-data);
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 1.2px;
+  margin: 0 0 8px;
+  text-transform: uppercase;
+}
+.spdex-tipconfirm__who { font-size: 0.875rem; font-weight: 600; margin: 8px 0 4px; }
+.spdex-tipconfirm__who .spdex-tiptag { display: inline-block; border: 1.5px solid var(--ink); padding: 1px 6px; vertical-align: 0.1em; }
+.spdex-tipconfirm__ens { color: var(--text-dim); font-family: var(--font-data); font-weight: 400; }
+.spdex-tipconfirm .spdex-hex { display: block; font-size: 0.9375rem; line-height: 1.6; margin: 2px 0 6px; }
+.spdex-tipconfirm__look { font-size: 0.8125rem; margin: 6px 0; }
+.spdex-tipconfirm__look--danger {
+  background: var(--danger);
+  color: var(--accent-ink);
+  font-weight: 700;
+  padding: 4px 8px;
+}
+.spdex-tipconfirm .spdex-actions { margin-top: 8px; }
+.spdex-tipconfirm__names { margin: 0; }
+.spdex-tipconfirm__names .spdex-tipconfirm__look { display: block; }
+
+/* The picker's two lists. */
+.spdex-tippick__section {
+  align-items: baseline;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  justify-content: space-between;
+  margin: 12px 0 2px;
+}
+.spdex-tippick__section:first-of-type { margin-top: 2px; }
+.spdex-tippick__label {
+  font-family: var(--font-data);
+  font-size: 0.6875rem;
+  font-weight: 700;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+}
+.spdex-tippick__facts {
+  color: var(--text-dim);
+  font-family: var(--font-data);
+  font-size: 0.65625rem;
+  font-weight: 700;
+  letter-spacing: 0.6px;
+}
+.spdex-tippick__address .spdex-hex { font-size: 0.75rem; font-weight: 400; }
+.spdex-tippick__new { margin: 10px 0 2px; }
+
+/* Adding an address: three fields that sit side by side where they fit. */
+.spdex-tipadd { margin: 10px 0 0; }
+.spdex-tipadd__fields { display: flex; flex-wrap: wrap; gap: 8px 12px; }
+.spdex-tipadd__fields > .spdex-field { flex: 1 1 11rem; margin: 0; min-width: 0; }
+.spdex-tipadd__fields > .spdex-tipadd__target { flex: 1 1 100%; }
+.spdex-tipadd__mono { font-family: var(--font-data); }
+.spdex-tipadd .spdex-actions { margin-top: 10px; }
+.spdex-tipadd__review { margin-top: 10px; }
+.spdex-tipadd__review .spdex-banner { margin: 6px 0; }
+.spdex-tipadd__review .spdex-hex { font-size: 0.8125rem; }
+/* The address being checked, at full ink, as the first-tip check shows it. */
+.spdex-tipadd__resolved { color: var(--ink); font-size: 0.8125rem; font-weight: 600; margin: 0 0 6px; }
+.spdex-tipadd__resolved .spdex-hex { font-size: 0.9375rem; }
+/* A lookalike's address above this one, to compare them group by group. */
+.spdex-tipadd__compare {
+  align-items: baseline;
+  display: grid;
+  gap: 2px 8px;
+  grid-template-columns: auto 1fr;
+  margin-top: 6px;
+}
+.spdex-tipadd__compare > span { font-weight: 600; }
+
+/* Settings → Tips: "My tip list". */
+.spdex-tiplist { margin: 0 0 14px; }
+.spdex-tiplist__head {
+  align-items: baseline;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  justify-content: space-between;
+  margin: 0 0 6px;
+}
+.spdex-tiplist__title {
+  font-family: var(--font-data);
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 1.5px;
+  margin: 0;
+  text-transform: uppercase;
+}
+.spdex-tiplist__entries { list-style: none; margin: 0; padding: 0; }
+.spdex-tiplist__entry {
+  align-items: flex-start;
+  border-bottom: 1px dashed var(--hairline);
+  display: flex;
+  gap: 10px;
+  padding: 10px 0;
+}
+.spdex-tiplist__entry:last-child { border-bottom: 0; }
+.spdex-tiplist__who { flex: 1 1 auto; font-size: 0.8125rem; min-width: 0; }
+.spdex-tiplist__who > .spdex-hex { display: block; font-weight: 400; margin-top: 2px; }
+.spdex-tiplist__name { font-weight: 600; }
+.spdex-tiplist__meta { color: var(--text-dim); font-family: var(--font-data); font-size: 0.75rem; }
+.spdex-tiplist__state {
+  border: 1.5px solid var(--ink);
+  display: inline-block;
+  font-family: var(--font-data);
+  font-size: 0.5625rem;
+  font-weight: 700;
+  letter-spacing: 1px;
+  margin-left: 8px;
+  padding: 1px 5px;
+  text-transform: uppercase;
+  vertical-align: 0.15em;
+}
+.spdex-tiplist__state--ok { background: var(--c-lime); color: var(--accent-ink); }
+.spdex-tiplist__note { color: var(--text-dim); display: block; font-size: 0.75rem; margin-top: 2px; }
+.spdex-tiplist__actions { display: flex; flex: none; gap: 4px; }
+/* 44px targets, as every other small control on the page. */
+.spdex-tiplist__btn {
+  align-items: center;
+  background: var(--surface);
+  border: 1.5px solid var(--ink);
+  color: var(--ink);
+  cursor: pointer;
+  display: inline-flex;
+  font-family: var(--font-data);
+  font-size: 1rem;
+  font-weight: 700;
+  height: 2.75rem;
+  justify-content: center;
+  width: 2.75rem;
+}
+.spdex-tiplist__btn:hover:not([aria-disabled="true"]) { background: var(--c-cyan); }
+.spdex-tiplist__btn--remove:hover:not([aria-disabled="true"]) { background: var(--c-magenta); color: var(--accent-ink); }
+.spdex-tiplist__btn[aria-disabled="true"] { cursor: default; opacity: 0.4; }
+.spdex-tiplist__btn:focus-visible { outline: var(--focus-ring) solid var(--ink); outline-offset: 2px; }
+.spdex-tiplist__undo { font-size: 0.8125rem; margin: 6px 0; }
+.spdex-tiplist__skipped { font-size: 0.75rem; margin: 4px 0 0; padding-left: 1.2em; }
+.spdex-tiplist .spdex-disclosure { margin-top: 10px; }
+
+@media (max-width: 480px) {
+  /* Buttons under the name on a phone, so a long address keeps the width. */
+  .spdex-tiplist__entry { flex-wrap: wrap; }
+  .spdex-tiplist__actions { margin-left: auto; }
+}
+
+@media (forced-colors: active) {
+  .spdex-tiptag,
+  .spdex-tiplist__state { forced-color-adjust: none; background: Canvas; color: CanvasText; border-color: CanvasText; }
+  .spdex-tipconfirm { border-left-color: Highlight; }
+  .spdex-tipconfirm__look--danger { forced-color-adjust: none; background: Mark; color: MarkText; }
+}
+
+/* "Why these?" and "This browser only" end their rows: from where a tip can
+   hang right (the theme's phone strip below 621px), it hangs left from the
+   word's right edge, as a row value's does, so it never runs off the page. */
+@media (min-width: 621px) {
+  .spdex-tippick__section .spdex-term__tip,
+  .spdex-tiplist__head .spdex-term__tip { left: auto; right: 0; }
+}
+
+/* In the settings-link prompt: the addresses a link would tip. */
+.spdex-staged-tips { margin: 10px 0 12px; }
+.spdex-staged-tips .spdex-hex,
+.spdex-staged-tips .spdex-tipconfirm__look { display: block; }
+.spdex-staged-tips .spdex-tiptag { display: inline-block; border: 1.5px solid var(--ink); padding: 1px 6px; }
+
+/* Focused after a removal, an undo or a hide, so a keyboard keeps its place. */
+.spdex-tiplist__entry:focus-visible,
+.spdex-tiplist__undo:focus-visible,
+.spdex-tiplist__entries:focus-visible { outline: var(--focus-ring) solid var(--ink); outline-offset: 2px; }
+
+/* Expert → Tips: each address whole, grouped by four, under its name. */
+.spdex-tips__who > .spdex-hex { display: block; font-size: 0.75rem; font-weight: 400; margin-top: 2px; }

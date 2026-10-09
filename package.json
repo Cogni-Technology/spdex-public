@@ -1,0 +1,52 @@
+{
+  "name": "spdex",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Modular, sovereign swap interface for SPX6900",
+  "license": "AGPL-3.0-or-later",
+  "packageManager": "pnpm@12.4.2",
+  "engines": {
+    "node": ">=22.13.1"
+  },
+  "scripts": {
+    "build": "turbo build",
+    "dev": "turbo dev",
+    "lint": "turbo lint",
+    "typecheck": "turbo typecheck",
+    "test": "vitest",
+    "test:run": "vitest run",
+    "test:integration": "vitest run --project integration",
+    "test:parity": "vitest run --project parity",
+    "test:redteam": "vitest run --project redteam",
+    "test:e2e": "playwright test",
+    "anvil:fork": "node scripts/anvil-fork.mjs",
+    "verify": "node scripts/verify.mjs",
+    "clean": "turbo clean && rm -rf .verify node_modules/.cache",
+    "build:release": "node scripts/build-release.mjs",
+    "ipfs:cid": "node scripts/ipfs-cid.mjs",
+    "verify:reproducible": "node scripts/verify-reproducible.mjs",
+    "dev:fund": "node scripts/dev-fund.mjs",
+    "dev:web": "pnpm --filter @spdex/web dev",
+    "dev:keys": "node scripts/dev-keys.mjs",
+    "shots": "playwright test -c playwright.theme.config.ts",
+    "fx:bands": "node --experimental-transform-types --disable-warning=ExperimentalWarning --import ./packages/vault/scripts/ts-hooks.mjs packages/chain/scripts/fx-bands.ts",
+    "keeper": "node --experimental-transform-types --disable-warning=ExperimentalWarning --import ./packages/vault/scripts/ts-hooks.mjs packages/vault/scripts/keeper.ts",
+    "keeper:report": "node --experimental-transform-types --disable-warning=ExperimentalWarning --import ./packages/vault/scripts/ts-hooks.mjs packages/vault/scripts/keeper-report.ts",
+    "keeper:smoke": "node --experimental-transform-types --disable-warning=ExperimentalWarning --import ./packages/vault/scripts/ts-hooks.mjs packages/vault/scripts/keeper-smoke.mjs",
+    "mainnet:smoke": "playwright test -c playwright.mainnet.config.ts",
+    "mainnet:smoke:wallets": "node --experimental-transform-types --disable-warning=ExperimentalWarning --import ./packages/vault/scripts/ts-hooks.mjs e2e-mainnet/wallets-cli.ts",
+    "mainnet:smoke:sweep": "node --experimental-transform-types --disable-warning=ExperimentalWarning --import ./packages/vault/scripts/ts-hooks.mjs e2e-mainnet/sweep-cli.ts",
+    "mainnet:smoke:fork": "node e2e-mainnet/fork-cli.mjs"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.63.0",
+    "@types/node": "^22.10.0",
+    "turbo": "^2.11.2",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.1",
+    "ipfs-unixfs-importer": "^17.1.1",
+    "blockstore-core": "^7.0.1",
+    "multiformats": "^14.0.5"
+  }
+}

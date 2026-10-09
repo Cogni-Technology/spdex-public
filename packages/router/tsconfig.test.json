@@ -1,0 +1,13 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "lib": ["ES2022", "WebWorker"],
+    "types": ["node"],
+    // The integration test drives the real venue module, which ships as plain
+    // JS so the same bytes run in the sandbox.
+    "allowJs": true,
+    "checkJs": false
+  },
+  "include": ["test/**/*", "src/**/*"]
+}

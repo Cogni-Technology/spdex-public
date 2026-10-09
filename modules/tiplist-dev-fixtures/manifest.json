@@ -1,0 +1,18 @@
+{
+  "id": "tiplist-dev-fixtures",
+  "version": "1.0.0",
+  "apiVersion": "1.0.0",
+  "kind": "tiplist",
+  "displayName": "Test tip entries",
+  "description": "Test tip entries for a local fork: public development accounts, not real people. Loaded only on a local test network.",
+  "capabilities": [],
+  "contracts": [],
+  "limits": {
+    "maxFuel": "1000000",
+    "maxMemory": "8388608",
+    "maxCallsPerQuote": 0
+  },
+  "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "publicKey": "0x00",
+  "signature": "0x00"
+}

@@ -1,0 +1,64 @@
+name: Something didn't work
+description: A bug, a confusing screen, or a message that was wrong.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing spDEX. The app records nothing about you, so this form is how we find out.
+        **Never paste a seed phrase, a private key, or your network service's URL here** (those URLs often contain an API key).
+        A security problem goes to a private security advisory instead (docs/SECURITY.md), never a public issue.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, and what you saw. A screenshot helps; crop out anything private.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+  - type: dropdown
+    id: where
+    attributes:
+      label: Where
+      options:
+        - Welcome, new aeon
+        - Buy SPX (one-time)
+        - Buy SPX (recurring, confirm each buy)
+        - Set and forget (vault)
+        - Tips
+        - Your SPX
+        - Markets
+        - Collective DCA / Help run the network
+        - Settings
+        - The disclaimer or first screen
+        - Somewhere else
+    validations:
+      required: true
+  - type: input
+    id: build
+    attributes:
+      label: Which build
+      description: The address you opened (on an IPFS gateway it includes the CID).
+  - type: input
+    id: setup
+    attributes:
+      label: Browser, wallet and text size
+      description: e.g. Firefox 140, Rabby, A+
+  - type: dropdown
+    id: network
+    attributes:
+      label: Network
+      options:
+        - Ethereum
+        - A local fork (developers)
+        - Not sure
+  - type: checkboxes
+    id: private
+    attributes:
+      label: Nothing private
+      options:
+        - label: I haven't pasted a seed phrase, a private key or a network service URL.
+          required: true

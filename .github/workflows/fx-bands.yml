@@ -1,0 +1,34 @@
+name: Currency bands
+
+# Every currency's live rate against its reference (`pnpm fx:bands`,
+# packages/chain/scripts/fx-bands.ts). The app reads every rate live; a
+# reference only bounds what it believes, and moves with the fork's pinned
+# block. This fails when a currency drifts past 3× of its reference, well
+# before the 5× at which the app stops using it, so there is time to move
+# them. A failed scheduled run is emailed to whoever last changed the cron
+# line below, as GitHub does for every scheduled workflow.
+on:
+  schedule:
+    # Mondays, 06:17 UTC: off the hour, when scheduled runs queue.
+    - cron: "17 6 * * 1"
+  # Actions → Currency bands → Run workflow: a check now.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bands:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Every currency well inside its band
+        run: pnpm fx:bands
+        env:
+          SPDEX_FORK_RPC_URL: ${{ secrets.SPDEX_FORK_RPC_URL }}

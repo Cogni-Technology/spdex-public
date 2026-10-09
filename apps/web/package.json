@@ -1,0 +1,31 @@
+{
+  "name": "@spdex/web",
+  "version": "0.0.0",
+  "private": true,
+  "license": "AGPL-3.0-or-later",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "@spdex/chain": "workspace:*",
+    "@spdex/config": "workspace:*",
+    "@spdex/core": "workspace:*",
+    "@spdex/guard": "workspace:*",
+    "@spdex/host": "workspace:*",
+    "@spdex/router": "workspace:*",
+    "@spdex/ui": "workspace:*",
+    "@spdex/vault": "workspace:*",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^5.0.0",
+    "vite": "^8.3.0"
+  }
+}

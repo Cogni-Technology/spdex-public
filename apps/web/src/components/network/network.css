@@ -1,0 +1,259 @@
+/*
+ * Network area: the Collective DCA panel and Trust and exits.
+ *
+ * Built from the theme's tokens only, so NEON and PASTEL both hold: text is
+ * always ink on surface or paper, and an accent is only ever a fill or a
+ * rule beside ink, never the colour of words (lime on paper fails contrast).
+ */
+
+/* Six tiles: two across on a phone, three from 621px, whatever their labels' widths. */
+.spdex-network-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin: 4px 0 16px;
+}
+@media (min-width: 621px) {
+  .spdex-network-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+
+/* "at least", above the figure it qualifies, small enough not to crowd a tile. */
+.spdex-network-atleast {
+  display: block;
+  font-family: var(--font-data);
+  font-size: 0.65625rem;
+  font-weight: 700;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  line-height: 1.4;
+}
+
+/* A figure that shows every digit on tap: the tile's own type, with a dotted rule saying it does something. */
+.spdex-network-figure {
+  font: inherit;
+  letter-spacing: inherit;
+  color: inherit;
+  background: none;
+  border: 0;
+  border-bottom: 2px dotted rgba(var(--ink-rgb), calc(0.45 + var(--hairline-boost)));
+  padding: 0;
+  margin: 0;
+  cursor: pointer;
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+/* Every digit is long: it steps down to a size that fits a phone's half-width tile. */
+.spdex-network-figure--exact {
+  font-family: var(--font-data);
+  font-size: 0.8125rem;
+  font-weight: 700;
+  line-height: 1.35;
+  letter-spacing: 0;
+}
+/* Only where a pointer hovers: on a touch screen a tapped figure kept the fill. */
+@media (hover: hover) {
+  .spdex-network-figure:hover { background: var(--c-lime); }
+}
+.spdex-network-figure:focus-visible { outline: var(--line) solid var(--ink); outline-offset: 2px; }
+.spdex-network-row__value .spdex-network-figure { text-align: right; }
+
+/* The rows under the grid: label and figure on one line, the hint under both. */
+.spdex-network-rows { margin: 0 0 12px; }
+.spdex-network-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  column-gap: 12px;
+  padding: 7px 0;
+  border-bottom: 1px dashed rgba(var(--ink-rgb), calc(0.14 + var(--hairline-boost)));
+}
+.spdex-network-row:last-child { border-bottom: 0; }
+.spdex-network-row__label {
+  color: var(--text-dim);
+  font-family: var(--font-data);
+  font-size: 0.71875rem;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+}
+.spdex-network-row__value {
+  margin: 0;
+  color: var(--ink);
+  font-family: var(--font-data);
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+.spdex-network-row__value .spdex-network-atleast { display: inline; font-size: 0.65625rem; margin-right: 4px; }
+/* On a phone the long labels need the whole width: label, figure, then hint, one under another. */
+@media (max-width: 620px) {
+  .spdex-network-row { grid-template-columns: minmax(0, 1fr); }
+  .spdex-network-row__value,
+  .spdex-network-row__value .spdex-network-figure { text-align: left; }
+  .spdex-network-row__value { margin-top: 2px; }
+}
+.spdex-network-row__hint {
+  grid-column: 1 / -1;
+  margin: 2px 0 0;
+  font-size: 0.71875rem;
+  color: var(--text-faint);
+}
+
+/* A CID or an origin is one long word; it breaks rather than push a phone's page sideways. */
+.spdex-network-verify { overflow-wrap: anywhere; }
+
+.spdex-network-line { margin: 0 0 8px; }
+.spdex-network-line:last-child { margin-bottom: 0; }
+.spdex-network-line--quiet { color: var(--text-dim); }
+.spdex-network-line--strong { font-weight: 700; }
+
+/* Always shown with the figures, never folded: what the counts leave out. */
+.spdex-network-caveat {
+  margin: 16px 0 0;
+  padding: 8px 0 8px 12px;
+  border-left: 4px solid var(--c-magenta);
+  font-size: 0.75rem;
+  color: var(--text-dim);
+}
+
+/* Something to act on with care: ink on paper, marked by a warning rule. */
+.spdex-network-warn {
+  margin: 10px 0 0;
+  padding: 8px 10px;
+  background: var(--paper);
+  border-left: 4px solid var(--warn);
+  font-size: 0.75rem;
+  color: var(--text);
+}
+
+/* Commands to paste into a terminal: they wrap rather than scroll the page sideways. */
+.spdex-network-commands {
+  margin: 10px 0 8px;
+  padding: 10px 12px;
+  background: var(--paper);
+  border: var(--line) solid var(--ink);
+  font-family: var(--font-data);
+  font-size: 0.75rem;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.spdex-network-copyrow { margin: 0 0 8px; }
+
+/* "If spDEX disappeared": one thing a person can do per item, spaced to read one at a time. */
+.spdex-network-list {
+  margin: 0;
+  padding-left: 18px;
+}
+.spdex-network-list > li { margin: 0 0 12px; }
+.spdex-network-list > li:last-child { margin-bottom: 0; }
+.spdex-network-list > li::marker { color: var(--ink); }
+
+.spdex-network-addresses {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 0;
+}
+.spdex-network-addresses > li {
+  padding: 6px 0;
+  border-top: 1px dashed rgba(var(--ink-rgb), calc(0.14 + var(--hairline-boost)));
+}
+.spdex-network-addresses__label {
+  display: block;
+  font-size: 0.75rem;
+  color: var(--text-dim);
+}
+
+/* An address, its explorer link and Copy: they wrap as a group, the address never cut. */
+.spdex-network-addressline {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+  max-width: 100%;
+  vertical-align: middle;
+}
+.spdex-network-line .spdex-network-addressline { margin: 2px 0; }
+
+.spdex-network-search { margin-top: 4px; }
+.spdex-network-search > .spdex-actions { margin-top: 10px; }
+.spdex-network-search [data-testid="vault-search-list-result"] { margin-top: 10px; }
+
+/* ── Help run the network: a folded panel of its own ── */
+.spdex-helprun { color: var(--text); }
+/* You pay and You get: side by side from 621px, one under the other on a phone. */
+.spdex-helprun__pair {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 10px;
+  margin: 10px 0;
+}
+@media (min-width: 621px) {
+  .spdex-helprun__pair { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+.spdex-helprun__side {
+  padding: 8px 10px;
+  background: var(--paper);
+  border-left: 4px solid var(--ink);
+  min-width: 0;
+}
+.spdex-helprun__side--wide { margin: 0 0 10px; }
+.spdex-helprun__label {
+  display: block;
+  font-family: var(--font-data);
+  font-size: 0.65625rem;
+  font-weight: 700;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+.spdex-helprun__value {
+  display: block;
+  margin-top: 2px;
+  font-size: 0.8125rem;
+  overflow-wrap: anywhere;
+}
+.spdex-helprun__vaults { margin: 4px 0 8px; }
+.spdex-helprun__list { list-style: none; margin: 0; padding: 0; }
+.spdex-helprun__list > li { border-top: 1px dashed rgba(var(--ink-rgb), calc(0.14 + var(--hairline-boost))); }
+.spdex-helprun__list > li:first-child { border-top: 0; }
+/* A 44px row on a phone, so each box is easy to hit. */
+.spdex-helprun__vault {
+  display: grid;
+  grid-template-columns: auto auto minmax(0, 1fr);
+  align-items: center;
+  gap: 4px 10px;
+  min-height: 44px;
+  cursor: pointer;
+}
+.spdex-helprun__vault > code { font-family: var(--font-data); font-size: 0.75rem; }
+.spdex-helprun__fee { font-size: 0.75rem; color: var(--text-dim); text-align: right; }
+.spdex-helprun__reasons { margin: 6px 0 0; padding-left: 18px; font-size: 0.75rem; overflow-wrap: anywhere; }
+.spdex-helprun__reasons > li { margin: 2px 0; }
+
+/* ── Second opinion, in Expert → Safety ── */
+.spdex-second { margin: 12px 0 16px; }
+.spdex-second__url { font-family: var(--font-data); font-size: 0.75rem; overflow-wrap: anywhere; }
+.spdex-second > .spdex-disclosure { margin-top: 10px; }
+
+/* ── In a tile ──────────────────────────────────────────────────────────── */
+
+/* The collective's subtitle is the tile body's first line. */
+.spdex-collective > .spdex-panel__subtitle:first-child,
+.spdex-walkaway > .spdex-panel__subtitle:first-child { margin-top: 0; }
+
+/* Where a line points in spDEX: its buttons after the sentence. */
+.spdex-network-places { display: inline-flex; flex-wrap: wrap; gap: 0.25rem 0.5rem; vertical-align: baseline; }
+
+/* close(), two ways, under the line that says what it does. */
+.spdex-network-ways { margin: 0.25rem 0 0.5rem; padding-left: 1.125rem; }
+.spdex-network-ways > li + li { margin-top: 0.25rem; }
+
+/* Touch targets: a figure that unfolds its digits is a button, 44px each way on phones and touch screens,
+   however few digits it shows ("968" is 38px wide). */
+@media (max-width: 38.75em), (pointer: coarse) {
+  .spdex-network-figure { min-width: 44px; min-height: 44px; }
+}
+
+/* Remind me before my proof lapses reuses the auto-buy panel's reminder tick,
+   whose negative top margin tucks it under that panel's header; here it
+   follows buttons, and would slide under them. */
+.spdex-dca-check.spdex-dca-notify.spdex-keeping-notify { margin: 12px 0 8px; }

@@ -1,0 +1,11 @@
+{
+  // Covers the repo-root files: build scripts, config, the e2e specs and the mainnet smoke suite.
+  // DOM is included because Playwright specs evaluate code inside the page.
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "types": ["node"]
+  },
+  "include": ["scripts/**/*", "e2e/**/*", "e2e-mainnet/**/*", "*.config.ts"]
+}

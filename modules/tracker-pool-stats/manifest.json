@@ -1,0 +1,22 @@
+{
+  "id": "tracker-pool-stats",
+  "version": "1.0.0",
+  "apiVersion": "1.0.0",
+  "kind": "tracker",
+  "displayName": "Pool statistics",
+  "description": "Reads the real balances each pool holds, by calling balanceOf on the tokens it declares.",
+  "capabilities": ["chain:read"],
+  "contracts": [
+    "0xe0f63a424a4439cbe457d80e4f4b51ad25b2c56c",
+    "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+    "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+  ],
+  "limits": {
+    "maxFuel": "5000000",
+    "maxMemory": "16777216",
+    "maxCallsPerQuote": 64
+  },
+  "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "publicKey": "0x00",
+  "signature": "0x00"
+}

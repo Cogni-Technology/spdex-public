@@ -1,0 +1,59 @@
+/*
+ * The display faces, shipped with the app.
+ *
+ * Three families from spx6900.com's look, bundled so every visitor sees them
+ * rather than a system fallback: Orbitron (titles, buttons; one variable file,
+ * weights 400 to 900), Space Mono Regular and Bold (figures and labels), and
+ * Bebas Neue (big numbers and tile titles). theme.css names each first in its
+ * stack (--font-display, --font-data, --font-stat); body text keeps the system
+ * UI stack, so Inter is not bundled.
+ *
+ * Each file is the one in the google/fonts repository (ofl/orbitron,
+ * ofl/spacemono, ofl/bebasneue), unmodified, with that directory's OFL.txt
+ * beside it: all three are under the SIL Open Font License 1.1, which allows
+ * bundling them with software as long as the licence text travels with each
+ * copy. In the source, that is the OFL.txt beside each font; in a build, the
+ * same three files, which vite.config.ts (`fontLicences`) emits at
+ * assets/fonts/<family>/OFL.txt. (A font's name table carries only its
+ * copyright line and the licence's name and URL, not the text.) The
+ * Orbitron file is renamed only (from `Orbitron[wght].ttf`, whose brackets
+ * don't belong in a URL); its bytes are untouched.
+ *
+ * Same origin, always: Vite copies each file into the build's assets with a
+ * content hash, and the CSP's `default-src 'self'` already covers fonts. No
+ * `local()` source either, so every browser draws the same glyphs whatever it
+ * has installed. `font-display: swap` shows the fallback at once and swaps the
+ * face in when it arrives, so no text waits on a font.
+ */
+
+@font-face {
+  font-family: "Orbitron";
+  font-style: normal;
+  font-weight: 400 900;
+  font-display: swap;
+  src: url("./assets/fonts/orbitron/Orbitron-VariableFont_wght.ttf") format("truetype");
+}
+
+@font-face {
+  font-family: "Space Mono";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("./assets/fonts/spacemono/SpaceMono-Regular.ttf") format("truetype");
+}
+
+@font-face {
+  font-family: "Space Mono";
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url("./assets/fonts/spacemono/SpaceMono-Bold.ttf") format("truetype");
+}
+
+@font-face {
+  font-family: "Bebas Neue";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("./assets/fonts/bebasneue/BebasNeue-Regular.ttf") format("truetype");
+}
