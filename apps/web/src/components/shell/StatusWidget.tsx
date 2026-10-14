@@ -4,6 +4,8 @@
  *
  * - The title bar says the link's state as a word and a glyph (● ONLINE,
  *   ▲ SLOW, ✕ OFFLINE, ○ NO SERVICE), so colour is never the only signal.
+ * - With no service yet, "Connect to Ethereum →", the way to Welcome's
+ *   first step where one is chosen.
  * - NET, WALLET and, with plans, PLANS; the rest under DETAILS. BLOCK is
  *   first under DETAILS in Simple, and beside NET in Expert, as the phone
  *   bar's block number is.
@@ -39,6 +41,7 @@ import type { View } from "../../lib/prefs.js";
 import { maskRpcUrl, rpcUrlMasked } from "../../lib/rpcDisplay.js";
 import type { SecondOpinionStatus } from "../../lib/simulation.js";
 import { safetyTestText, secondOpinionStripText, type SafetyTest } from "../../lib/summary.js";
+import { STATUS_CONNECT } from "../../lib/tour.js";
 import { CopyHex } from "../dca/common.js";
 
 /** Where the widget hears about the second opinion: the Engine. */
@@ -91,6 +94,8 @@ export interface StatusWidgetProps {
   locale?: string;
   /** Simple keeps the block under Details; Expert shows it in the list. Simple when not given. */
   view?: View;
+  /** With no service chosen, where one is: Welcome's first step. The link shows only when given. */
+  onConnectService?: () => void;
 }
 
 function Item({ label, children, testId }: { label: ReactNode; children: ReactNode; testId?: string }) {
@@ -116,6 +121,7 @@ export function StatusWidget({
   announce,
   locale,
   view = "recommended",
+  onConnectService,
 }: StatusWidgetProps) {
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [expanded, setExpanded] = useState(false);
@@ -196,6 +202,13 @@ export function StatusWidget({
         </span>
       </div>
       <div className="spdex-widget__body" id="status-widget-body" data-expanded={expanded ? "true" : "false"}>
+        {rpc === null && onConnectService !== undefined ? (
+          <p className="spdex-widget__connect">
+            <button type="button" className="spdex-widget__link" data-testid="status-connect-service" onClick={onConnectService}>
+              {STATUS_CONNECT}
+            </button>
+          </p>
+        ) : null}
         <dl className="spdex-widget__list">
           <Item label={<Term tip={GLOSSARY.network}>Net</Term>} testId="chain-name">
             {networkName(config.chainId)}

@@ -190,7 +190,7 @@ a stranger's copy) and not from a built-in domain.
 | `VITE_SPDEX_SOURCE_URL` | The `git clone` in Verify this build, the footer's Source link, and two doc links built from it as GitHub browses a repository (`<source>/blob/HEAD/<path>#<anchor>`, so the source should be a GitHub or GitLab address): "Becoming a community keeper" in Help run the network and Community keeping, and the list of services that answer `eth_getProof` beside Paste a proof | "This build doesn't say where its source is published." The two doc links are left out |
 | `VITE_SPDEX_FEEDBACK_URL` | The footer's Feedback link | No link: testers have no way to reach the issue forms |
 | `VITE_SPDEX_APP_URL` | The link on "I bought" cards and in calendar files | "open #receipt=… in any spDEX", and no link in calendar files |
-| `VITE_SPDEX_DEFAULT_RPC_URL` and `VITE_SPDEX_CANONICAL_ORIGIN` | The built-in network service, offered last on the first screen at those origins | The first screen offers no built-in service: a key of their own or the public service |
+| `VITE_SPDEX_DEFAULT_RPC_URL` and `VITE_SPDEX_CANONICAL_ORIGIN` | The built-in network service, offered beside the visitor's own in Welcome's first step at those origins | Welcome's first step offers no built-in service: a key of their own or the public service |
 
 - [ ] All five are set, the key and its origins together or neither.
 - [ ] `pnpm fx:bands` passes, as the weekly "Currency bands" workflow should

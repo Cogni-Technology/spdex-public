@@ -200,8 +200,8 @@ describe("header summaries", () => {
   });
 
   it("count Welcome's steps, and name the rest short", () => {
-    expect(startSummary(["done", "done", "current"], false).text).toBe("2 of 3 done");
-    expect(startSummary(["done", "done", "current"], true).text).toBe("make a card");
+    expect(startSummary(["done", "done", "done", "current"], false).text).toBe("3 of 4 done");
+    expect(startSummary(["done", "done", "done", "current"], true).text).toBe("make a card");
     expect(receiptSummary(`0xab12${"0".repeat(56)}ef90`).text).toBe("0xab12…ef90");
     expect(settingsSummary({ view: "recommended", features: 3, currency: "USD" }).text).toBe("Simple · 3 features · USD");
   });

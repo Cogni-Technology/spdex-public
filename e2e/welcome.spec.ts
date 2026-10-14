@@ -1,5 +1,7 @@
 /**
- * "Welcome, new aeon": the three steps a newcomer sees above the Trade card.
+ * "Welcome, new aeon": the four steps a newcomer sees above the Trade card,
+ * the first of which (choosing a network service) is done for every spec
+ * that seeds one.
  *
  * Every other spec starts with Welcome hidden, as it starts with the Features
  * dialog seen; these opt in with `showWelcome: true`. The claims are that
@@ -19,7 +21,7 @@ test.describe("welcome", () => {
     await installWallet(page, { address: account });
     await seedConfig(page, {}, { showWelcome: true });
     await page.goto("/");
-    // A newcomer's page starts with the three steps open, not a column of headers.
+    // A newcomer's page starts with the steps open, not a column of headers.
     await expect(page.getByTestId("tile-start")).toHaveAttribute("aria-expanded", "true");
     await expect(page.getByTestId("welcome-panel")).toBeVisible();
     await expect(page.locator('[data-tile][data-open="true"]')).toHaveCount(1);
@@ -48,7 +50,7 @@ test.describe("welcome", () => {
     await expect(page.getByTestId("footer")).toContainText("Community project.");
     await expect(page.getByTestId("features-modal")).toHaveCount(0);
 
-    // Step 3, the first buy, points first at the Trade card's contract line and opens it. The
+    // Step 4, the first buy, points first at the Trade card's contract line and opens it. The
     // contract is the one the listings name, checksummed and in full: the
     // groups of four are spaced by the stylesheet, so the text is the address
     // exactly, as a selection or Copy takes it.
@@ -65,24 +67,27 @@ test.describe("welcome", () => {
     await expect(page.getByTestId("features-modal")).toBeVisible();
   });
 
-  test("ticks a step from the page's state: connecting finishes step 1 and reads the ETH for step 2", async ({ page, account }) => {
+  test("ticks a step from the page's state: connecting finishes the wallet step and reads the ETH for the next", async ({ page, account }) => {
     await installWallet(page, { address: account });
     await seedConfig(page, {}, { showWelcome: true });
     await page.goto("/");
     await openTile(page, "trade");
 
     await openTile(page, "start");
-    await expect(page.getByTestId("welcome-step-1")).toHaveAttribute("data-state", "current");
-    await page.getByTestId("welcome-connect").click();
+    // The seeded service is step 1, done, and says which it is.
     await expect(page.getByTestId("welcome-step-1")).toHaveAttribute("data-state", "done");
-    await expect(page.getByTestId("welcome-connected")).toContainText(`${checksumAddress(account).slice(0, 6)}…`);
-    // anvil's accounts hold ether, so step 2 is done too, and says how much from the chain.
-    await expect(page.getByTestId("welcome-balance")).toContainText("Your wallet holds", { timeout: 30_000 });
+    await expect(page.getByTestId("welcome-service")).toContainText("Using");
+    await expect(page.getByTestId("welcome-step-2")).toHaveAttribute("data-state", "current");
+    await page.getByTestId("welcome-connect").click();
     await expect(page.getByTestId("welcome-step-2")).toHaveAttribute("data-state", "done");
+    await expect(page.getByTestId("welcome-connected")).toContainText(`${checksumAddress(account).slice(0, 6)}…`);
+    // anvil's accounts hold ether, so the ETH step is done too, and says how much from the chain.
+    await expect(page.getByTestId("welcome-balance")).toContainText("Your wallet holds", { timeout: 30_000 });
+    await expect(page.getByTestId("welcome-step-3")).toHaveAttribute("data-state", "done");
     // The first buy, contract check included, is the one step open; there is no step the page can't tick.
-    await expect(page.getByTestId("welcome-step-3")).toHaveAttribute("data-state", "current");
-    await expect(page.getByTestId("welcome-step-3").getByTestId("welcome-show-contract")).toBeVisible();
-    await expect(page.locator('[data-testid^="welcome-step-"]')).toHaveCount(3);
+    await expect(page.getByTestId("welcome-step-4")).toHaveAttribute("data-state", "current");
+    await expect(page.getByTestId("welcome-step-4").getByTestId("welcome-show-contract")).toBeVisible();
+    await expect(page.locator('[data-testid^="welcome-step-"]')).toHaveCount(4);
   });
 
   test("Pick an amount leads to the card's chips, and the $69 chip fills the One-time ETH → SPX amount in dollars, sending nothing", async ({

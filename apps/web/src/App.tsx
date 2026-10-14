@@ -109,7 +109,10 @@ import {
 } from "./lib/tiles.js";
 import { DISCLAIMER_PREF, DISCLAIMER_VERSION, disclaimerSeen } from "./lib/disclaimer.js";
 import { onBuyDueClick, onProofLapseClick } from "./lib/reminders/notify.js";
-import { BuiltInServiceNotice, FirstRun } from "./components/FirstRun.js";
+import { BuiltInServiceNotice, FirstRun, ServiceChoices } from "./components/FirstRun.js";
+import { TourHello } from "./components/tour/TourHello.js";
+import { TourGuide } from "./components/tour/TourGuide.js";
+import { TOUR_SEEN, TOUR_STOPS, tourBack, tourNext, tourStartsOnArrival, type TourPlace } from "./lib/tour.js";
 import { OneTimeSwap, SLOW_SEND_MS, TradeCard, type BuyMode, type PendingSend } from "./components/Swap.js";
 import { OlderSavePrompt, StagedConfigPrompt } from "./components/ConfigIo.js";
 import { Masthead } from "./components/shell/Masthead.js";
@@ -178,6 +181,10 @@ export function App() {
   // anything is read with it, in memory only (`builtInServiceInUse`); one with
   // no service yet waits for the disclaimer (below).
   const [config, setConfig] = useState<SpdexConfig>(() => builtInServiceInUse(loadConfig(), builtIn));
+  // The built-in service counts as chosen where it is used without asking,
+  // even behind the disclaimer before its URL is set: nothing asks for one.
+  const serviceChosen =
+    (config.rpc.url !== null && config.rpc.url !== "") || (builtIn.automatic !== null && config.rpc.source === "bundled");
   // The config as of the latest write, for callbacks that must not be rebuilt
   // on every config change (the quoting-key comparison, the chain-adoption probe).
   const configRef = useRef(config);
@@ -310,15 +317,31 @@ export function App() {
   const [reviewing, setReviewing] = useState(false);
   const firstVisitGate = !disclaimerSeen(disclaimerVersion);
   const gateOpen = firstVisitGate || reviewing;
-  const [pageInert, setPageInert] = useState(gateOpen);
+
+  // ── The first-visit tour (lib/tour.ts) ──────────────────────────────────
+
+  // The welcome card, then a walk round the page. Started by itself only as a
+  // first visit's disclaimer closes, for a newcomer (`onGateDone`); the
+  // footer offers it again. Finished or skipped is remembered in this browser.
+  const [tourStore] = useState(() => createPrefStore(TOUR_SEEN, pageStorage(), pageEvents()));
+  const [tour, setTour] = useState<TourPlace | null>(null);
+  const tourStop = tour !== null && tour.phase === "stop" ? (TOUR_STOPS[tour.index] ?? null) : null;
+  // Under the welcome card, and at every stop that only points, the page
+  // takes no input; at the stop where a service is chosen, it does.
+  const tourHoldsPage = tour !== null && tourStop?.interactive !== true;
+
+  // The page is inert under the disclaimer and the tour, and stays inert a
+  // moment after either lets go (`ARM_AFTER_MS`).
+  const pageHeld = gateOpen || tourHoldsPage;
+  const [pageInert, setPageInert] = useState(pageHeld);
   useEffect(() => {
-    if (gateOpen) {
+    if (pageHeld) {
       setPageInert(true);
       return;
     }
     const timer = setTimeout(() => setPageInert(false), ARM_AFTER_MS);
     return () => clearTimeout(timer);
-  }, [gateOpen]);
+  }, [pageHeld]);
   // Where focus goes back to after a review: what opened it (the footer's
   // link). The dialog can't put it back itself, since the page is still inert
   // when the dialog closes; once the page takes input again, it goes back.
@@ -334,9 +357,18 @@ export function App() {
     setReviewing(true);
   }, []);
   const onGateDone = useCallback(() => {
-    if (firstVisitGate) disclaimerStore.set(DISCLAIMER_VERSION);
+    if (firstVisitGate) {
+      disclaimerStore.set(DISCLAIMER_VERSION);
+      const arriving = tourStartsOnArrival({
+        seen: tourStore.get(),
+        serviceChosen,
+        welcomeShown: !welcomeStore().get() && WELCOME_CHAINS.has(config.chainId),
+        cameForSomething: receipt.cameFor || staged !== null,
+      });
+      if (arriving) setTour({ phase: "hello" });
+    }
     setReviewing(false);
-  }, [firstVisitGate, disclaimerStore]);
+  }, [firstVisitGate, disclaimerStore, tourStore, serviceChosen, config.chainId, receipt.cameFor, staged]);
 
   // Aa DISPLAY: the dock, in flow under the masthead (pinned open on wide
   // screens, at every text size).
@@ -888,6 +920,39 @@ export function App() {
     if (welcome.hidden && !welcomeWasHidden.current && openTileId === "start") openTileById("trade");
     welcomeWasHidden.current = welcome.hidden;
   }, [welcome.hidden, openTileId, openTileById]);
+
+  // The tour's moves. Each stop opens its tile (and Buy SPX's tab) first.
+  useEffect(() => {
+    if (tourStop === null) return;
+    openTileById(tourStop.tile);
+    if (tourStop.buyMode !== undefined) setBuyMode(tourStop.buyMode);
+  }, [tourStop, openTileById]);
+  // Choosing a service at the first stop moves on by itself; arriving at it
+  // with one already chosen (the tour again) doesn't.
+  const wasChosen = useRef(serviceChosen);
+  useEffect(() => {
+    if (serviceChosen && !wasChosen.current && tour !== null && tour.phase === "stop" && tourStop?.interactive === true) {
+      setTour(tourNext(tour));
+    }
+    wasChosen.current = serviceChosen;
+  }, [serviceChosen, tour, tourStop]);
+  /** Ends the tour, remembered as seen; focus goes to the open tile's header once the page takes input again. */
+  const endTour = useCallback(() => {
+    setTour(null);
+    tourStore.set(true);
+    gateOpener.current = openTileId === null ? null : document.querySelector<HTMLElement>(`[data-testid="tile-${openTileId}"]`);
+  }, [tourStore, openTileId]);
+  const tourOn = useCallback(() => {
+    if (tour === null) return;
+    const next = tourNext(tour);
+    if (next === null) endTour();
+    else setTour(next);
+  }, [tour, endTour]);
+  /** The footer's "Show me around again": from the welcome card, Welcome brought back if it was hidden. */
+  const tourAgain = useCallback(() => {
+    if (welcome.hidden) welcomeStore().set(false);
+    setTour({ phase: "hello" });
+  }, [welcome.hidden]);
   const [activityOpen, setActivityOpen] = useState(false);
   const [stackSeen, stackRef] = useSeenOnScreen<HTMLDivElement>();
   // One read of the records for the page, handed to every panel that shows
@@ -989,7 +1054,7 @@ export function App() {
   }, [reveal]);
 
   // The Recurring tab's amount, from the Features dialog or a Welcome step.
-  // From a step, "← Back to steps (n of 3)" returns to it (`returnTo`).
+  // From a step, "← Back to steps (n of 4)" returns to it (`returnTo`).
   const goToRecurring = useCallback(
     (from?: HTMLElement, backLabel?: string) => {
       setFeaturesOpen(false);
@@ -1172,8 +1237,8 @@ export function App() {
    * a dialog nobody asked for.
    */
   useEffect(() => {
-    // Never over the disclaimer: it waits until that has closed.
-    if (gateOpen || !config.rpc.url || featuresSeen()) return;
+    // Never over the disclaimer or the tour: it waits until they have closed.
+    if (gateOpen || tour !== null || !config.rpc.url || featuresSeen()) return;
     if (receipt.cameFor) return;
     if (!welcomeStore().get() && WELCOME_CHAINS.has(config.chainId)) return;
     setFeaturesOpen(true);
@@ -1739,11 +1804,11 @@ export function App() {
    * Welcome's last step points at the trade card rather than repeat it:
    * the One-time swap set to ETH → SPX (so the contract line and the dollar
    * chips are there), then `testId` brought into view in the Trade tile and
-   * focused, with "← Back to steps (n of 3)" to return to the step. Nothing
+   * focused, with "← Back to steps (n of 4)" to return to the step. Nothing
    * is filled in, quoted or sent.
    */
-  const welcomeState = welcomeSteps(account, welcome.ethBalance);
-  const stepsBack = welcomeBackLabel(account, welcome.ethBalance);
+  const welcomeState = welcomeSteps(serviceChosen, account, welcome.ethBalance);
+  const stepsBack = welcomeBackLabel(serviceChosen, account, welcome.ethBalance);
   const toTradeCard = (testId: string, step?: HTMLElement) => {
     setBuyMode("once");
     if (tokenInSymbol !== "ETH" || tokenOutSymbol !== "SPX") choosePair({ in: "ETH", out: "SPX" });
@@ -1857,22 +1922,23 @@ export function App() {
     document.querySelector<HTMLElement>("#display-dock button")?.focus();
   };
 
-  // The built-in service counts as chosen where it is used without asking,
-  // even behind the disclaimer before its URL is set: the tiles render (with
-  // no engine, so nothing is read), never the chooser.
-  const serviceChosen =
-    (config.rpc.url !== null && config.rpc.url !== "") || (builtIn.automatic !== null && config.rpc.source === "bundled");
+  // The chooser as a page of its own, in place of the tiles: Settings' Change
+  // service, and a newcomer whose Welcome (where the choice is made
+  // otherwise) is hidden or on a chain it doesn't serve.
+  const chooserPage = changingService || (!serviceChosen && !welcome.shown);
   const receiptShown = receipt.target !== null && rpc !== null && engine !== null;
   const tileIds = TILE_ORDER.filter(
     (id) =>
       (id !== "receipt" || receiptShown) && (id !== "start" || welcome.shown) && (id !== "auto-buys" || autoBuy.hasPanel),
   );
-  // The tile shown open: the chosen one, or Buy SPX when the chosen one isn't
-  // on the page (Welcome on a chain it doesn't serve, or before the network
-  // service is read), so the page never loads as a column of closed headers.
-  // Render-time only: once Welcome appears, the stored choice shows again.
-  const shownOpen =
-    tiles.openId !== null && !tileIds.includes(tiles.openId) ? (tileIds.includes("trade") ? "trade" : null) : tiles.openId;
+  // The tile shown open: the chosen one, or, when the chosen one isn't on the
+  // page (a shared receipt before a service is chosen, Welcome on a chain it
+  // doesn't serve), Welcome while a service is still to be chosen there, else
+  // Buy SPX, so the page never loads as a column of closed headers.
+  // Render-time only: once the chosen one appears, it shows again.
+  const fallbackOpen: TileId | null =
+    !serviceChosen && tileIds.includes("start") ? "start" : tileIds.includes("trade") ? "trade" : null;
+  const shownOpen = tiles.openId !== null && !tileIds.includes(tiles.openId) ? fallbackOpen : tiles.openId;
   const isShownOpen = (id: TileId) => shownOpen === id;
   const tile = (id: TileId) => ({ id, chip: TILES[id].chip, title: TILES[id].title, summary: summaries[id] });
 
@@ -1899,11 +1965,11 @@ export function App() {
         {/* Fixed behind everything, never inside the centre column (a stacking context above the stickers). */}
         <Backdrop />
         <div className="spdex-skip">
-          {serviceChosen ? (
+          {chooserPage ? null : (
             <button type="button" className="spdex-skip__link" onClick={skipToTrade}>
               Skip to Buy SPX
             </button>
-          ) : null}
+          )}
           <button type="button" className="spdex-skip__link" onClick={skipToDisplay}>
             Display settings
           </button>
@@ -1920,6 +1986,10 @@ export function App() {
 
           <div className="spdex-shell__right">
             <StatusWidget
+              // While a service is still to be chosen in Welcome's first step: the way there.
+              {...(!serviceChosen && welcome.shown
+                ? { onConnectService: () => void reveal("welcome-step-1", { block: "start" }) }
+                : {})}
               config={config}
               rpc={rpc}
               secondOpinion={engine}
@@ -2101,7 +2171,7 @@ export function App() {
                 ) : null}
               </div>
 
-              {!serviceChosen || changingService ? (
+              {chooserPage ? (
                 <FirstRun
                   bundledUrl={bundled}
                   // Refused once in this visit: not offered again until a reload.
@@ -2142,6 +2212,20 @@ export function App() {
                   {welcome.shown ? (
                     <Tile {...tile("start")}>
                       <Welcome
+                        serviceChosen={serviceChosen}
+                        serviceName={serviceChosen ? serviceNameOf(config.rpc) : null}
+                        serviceChooser={
+                          serviceChosen ? null : (
+                            <ServiceChoices
+                              bundledUrl={bundled}
+                              bundledRefused={builtInRefused !== null}
+                              fallbackUrl={fallback}
+                              onChoose={onChooseRpc}
+                              pendingReceipt={receipt.target !== null}
+                            />
+                          )
+                        }
+                        onChangeService={() => setChangingService(true)}
                         account={account}
                         chainId={config.chainId}
                         ethBalance={welcome.ethBalance}
@@ -2333,7 +2417,12 @@ export function App() {
             </main>
 
             {/* After <main>, so it is the page's contentinfo landmark. */}
-            <Footer onDisclaimer={reviewDisclaimer} firstRun={!serviceChosen} />
+            <Footer
+              onDisclaimer={reviewDisclaimer}
+              firstRun={chooserPage && !serviceChosen}
+              // The tour starts in Welcome, which shows only on Ethereum and the fork.
+              {...(WELCOME_CHAINS.has(config.chainId) ? { onTour: tourAgain } : {})}
+            />
             {/* The drawing at the very end, under the footer: nothing sits on it. */}
             <LinkMap />
           </div>
@@ -2356,6 +2445,19 @@ export function App() {
       </div>
 
       {gateOpen ? <DisclaimerGate review={!firstVisitGate} onDone={onGateDone} /> : null}
+      {/* Outside the page, which is inert while they show (but at the stop where a service is chosen). */}
+      {tour !== null && tour.phase === "hello" && !gateOpen ? (
+        <TourHello onGo={() => setTour(tourNext(tour))} onSkip={endTour} />
+      ) : null}
+      {tour !== null && tour.phase === "stop" && !gateOpen ? (
+        <TourGuide
+          index={tour.index}
+          ready={serviceChosen}
+          onNext={tourOn}
+          onBack={() => setTour(tourBack(tour))}
+          onEnd={endTour}
+        />
+      ) : null}
       </TipsContext.Provider>
     </TilesContext.Provider>
   );

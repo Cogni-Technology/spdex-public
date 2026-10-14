@@ -1605,6 +1605,31 @@ are `TileGroup` and `Tile` in `packages/ui`.
   its publisher accepted, and the source says so in a `NOT REVIEWED BY A
   LAWYER` note. A release beyond the prototype should have a lawyer read it
   first. The footer's **Disclaimer** link shows it again.
+- **Connecting** is Welcome's first step, **Connect to Ethereum**
+  (`ServiceChoices` in `components/FirstRun.tsx`), so the tiles are on the
+  page before there is a service, reading nothing: a service of the person's
+  own, and beside it the built-in service where it works here, else the free
+  public one. Once chosen, the step says which, with **Change**. `FirstRun`,
+  the chooser as a page in place of the tiles, is Settings' Change service,
+  the built-in notice's "Choose a service", and the way on for someone with
+  no service whose Welcome is hidden or on a chain it doesn't serve. While
+  there is no service, the status panel links to the step ("Connect to
+  Ethereum →").
+- **The first-visit tour** (`lib/tour.ts`, `components/tour/`). As a first
+  visit's disclaimer closes, a newcomer (no service yet, Welcome on the page,
+  not here for a shared receipt or a settings link) gets the welcome card, in
+  the disclaimer's frame so the two read as one popup's two pages, then a walk
+  round the page: a spotlight on one place at a time and a short bubble,
+  beside the place where there are three columns (85em), else a sheet along
+  the bottom with a bar along the top. The first stop, Connecting, is the only
+  one that takes clicks: Next waits for a service, and choosing one moves on.
+  At every other stop the page is inert, a press on it does nothing, and
+  focus stays on the bubble, never a control (R2); Next ignores a press for
+  400 ms after each stop, so a double click is not two steps. Finished or
+  skipped is kept in `spdex.tour.v1`, and the footer's **Show me around
+  again** starts it from the card. Its words are the publisher's script; no
+  bubble is a place's only copy of a limit (R6): the vault card it points at
+  keeps UNAUDITED, the buy fee and the cap on screen.
 - **Display settings** (`components/shell/DisplayDock.tsx`): colour mode, text
   size (A, A+, A++; A+ by default), motion and contrast, kept in
   `spdex.a11y.v2` (only what differs from the default; motion and contrast
@@ -1623,7 +1648,10 @@ are `TileGroup` and `Tile` in `packages/ui`.
   crystal, never the Ethereum logo glyph), and quiet sky behind the centre
   column. The coin is composited from SPX6900's logo file (the one exception
   to R8, below); `apps/web/src/assets/backdrop/README.md` says how the picture
-  was made and how to replace it.
+  was made and how to replace it. The tour's welcome card carries one more
+  picture, a community meme (R8's second exception, below;
+  `apps/web/src/assets/tour/README.md`), bundled like the backdrop and loaded
+  only when the card shows.
   - `Backdrop.tsx` is one empty element that `packages/ui/src/theme.css` fixes
     behind the page (z-index -1) under the paper's halftone;
     `apps/web/src/backdrop.css` names the picture only from 85em, which no
@@ -1717,12 +1745,18 @@ where the rules are.
   `lib/disclaimer.ts`) is the one use of the word: a copy at the address its
   publisher released it for, never a claim about SPX6900; `copy.test.ts` and
   `e2e/shell.spec.ts` take out exactly that and still refuse the word anywhere
-  else. One exception to the rest, and only one: the SPX6900 logo, the
+  else. Two exceptions to the rest, and only two. The SPX6900 logo, the
   community's mark, is the coin in the backdrop picture (sealed in the
   crystal, printed on the lead banner), composited from the logo file and used
   as the community uses it, to say what the page is for. It is never spDEX's
   own mark, never a claim to speak for SPX6900, and not under the
-  repository's licence (README, License).
+  repository's licence (README, License). And the tour's welcome card shows a
+  community meme ("3% BTC, 97% SPX6900"), chosen by the publisher on
+  2026-10-14 knowing it was shared in a Telegram chat, by an unknown author,
+  with no licence, and shows real people. It is not under the repository's
+  licence either; `apps/web/src/assets/tour/README.md` records where it came
+  from and how to replace it. Its caption is a joke, which the disclaimer's
+  "Jokes aren't claims" and "Not advice" cover.
 
 ## What there is deliberately none of
 

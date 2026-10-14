@@ -1,0 +1,191 @@
+/*
+ * The first-visit tour: the welcome card (in the disclaimer's frame), the
+ * spotlight, and its bubble (beside the place where there are three columns,
+ * a sheet with a bar above it elsewhere).
+ *
+ * Built from theme.css's tokens only, so NEON, PASTEL and MORE contrast all
+ * apply. Above the page's own layers (the pinned widget, dock and key hints
+ * are 900, a term's tip 950), under a dialog's backdrop (1000).
+ */
+
+/* ── The welcome card ──────────────────────────────────────────────────── */
+
+.spdex-hello.spdex-gate {
+  max-width: 48.75rem;
+  container-type: inline-size;
+  container-name: spdex-hello;
+}
+.spdex-hello__grid { display: flex; flex-direction: column; gap: 0.875rem; }
+/* Narrow: the label first, then the picture, then the words. */
+.spdex-hello__text { display: contents; }
+.spdex-hello__chip { order: -1; align-self: flex-start; }
+.spdex-hello .spdex-gate__chip,
+.spdex-hello .spdex-gate__title { margin: 0; }
+.spdex-hello__art { margin: 0; display: flex; justify-content: center; }
+.spdex-hello__art img {
+  display: block;
+  width: auto;
+  height: auto;
+  max-width: 100%;
+  /* Sized to the window, so the buttons are on screen without scrolling. */
+  max-height: clamp(8.75rem, 100vh - 26rem, 26rem);
+  max-height: clamp(8.75rem, 100dvh - 26rem, 26rem);
+  border: var(--line) solid var(--ink);
+  box-shadow: var(--drop) var(--drop) 0 0 var(--shadow);
+}
+.spdex-hello__body { margin: 0; font-size: 1rem; line-height: 1.55; color: var(--text); }
+.spdex-hello__more { display: none; }
+.spdex-hello__actions { display: flex; flex-wrap: wrap; align-items: center; gap: 0.875rem 1.25rem; }
+.spdex-hello__skip { font-family: var(--font-data); font-size: 0.8125rem; letter-spacing: 0.5px; }
+
+/* Wide: the picture beside the words, and room for the second paragraph. */
+@container spdex-hello (min-width: 37.5rem) {
+  .spdex-hello__grid { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 6fr); gap: 1.625rem; align-items: center; }
+  .spdex-hello__text { display: flex; flex-direction: column; gap: 0.875rem; min-width: 0; }
+  .spdex-hello__chip { order: 0; }
+  .spdex-hello__art img {
+    max-height: clamp(13.75rem, 100vh - 7rem, 31.25rem);
+    max-height: clamp(13.75rem, 100dvh - 7rem, 31.25rem);
+  }
+  .spdex-hello__more { display: block; }
+}
+
+/* ── The spotlight ─────────────────────────────────────────────────────── */
+
+.spdex-tour__dim {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 960;
+  /* The layer itself takes nothing; its painted parts do. */
+  pointer-events: none;
+}
+.spdex-tour__shade { fill: rgba(var(--ink-rgb), 0.55); pointer-events: visiblePainted; }
+/* Over the hole at a stop that only points: a click there does nothing. */
+.spdex-tour__catch { fill: transparent; pointer-events: visiblePainted; }
+.spdex-tour__ring { fill: none; stroke: var(--c-lime); stroke-width: 4; pointer-events: none; }
+
+/* ── The bubble ────────────────────────────────────────────────────────── */
+
+.spdex-tour__bubble {
+  position: fixed;
+  z-index: 970;
+  width: 18.75rem;
+  max-width: calc(100vw - 1.75rem);
+  display: grid;
+  gap: 0.625rem;
+  padding: 0.875rem 1rem;
+  background: var(--surface);
+  border: var(--line) solid var(--ink);
+  box-shadow: 6px 6px 0 0 var(--shadow);
+  color: var(--text);
+  outline: none;
+}
+.spdex-tour__bubble:focus-visible { outline: var(--focus-ring) solid var(--c-lime); outline-offset: 3px; }
+/* Beside a place, unseen until the first frame has placed it (still focusable meanwhile). */
+.spdex-tour__bubble:not(.spdex-tour__bubble--sheet):not([data-placed]) { opacity: 0; }
+.spdex-tour__bubble p,
+.spdex-tour__bubble h2 { margin: 0; }
+.spdex-tour__chip {
+  justify-self: start;
+  margin: 0;
+  padding: 2px 8px;
+  border: var(--line) solid var(--c-magenta);
+  font-family: var(--font-data);
+  font-size: 0.6875rem;
+  font-weight: 700;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  white-space: nowrap;
+  color: var(--ink);
+}
+.spdex-tour__head { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; }
+.spdex-tour__title {
+  font-family: var(--font-display);
+  font-size: 0.9375rem;
+  font-weight: 800;
+  letter-spacing: 1.5px;
+  line-height: 1.3;
+  text-transform: uppercase;
+}
+.spdex-tour__body { font-size: 0.9375rem; line-height: 1.5; }
+.spdex-tour__wait {
+  justify-self: start;
+  padding: 3px 8px;
+  border: var(--line) solid var(--ink);
+  background: var(--c-yellow);
+  font-family: var(--font-data);
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  color: var(--ink);
+}
+.spdex-tour__actions { display: flex; flex-wrap: wrap; align-items: center; gap: 0.625rem; padding-top: 2px; }
+.spdex-tour__actions .spdex-button { padding: 9px 13px; }
+.spdex-tour__skip { margin-left: auto; font-family: var(--font-data); font-size: 0.75rem; letter-spacing: 0.5px; white-space: nowrap; }
+.spdex-tour .spdex-button[aria-disabled="true"],
+.spdex-tour__arrow[aria-disabled="true"] {
+  background: var(--paper);
+  color: var(--text-faint);
+  border-color: var(--muted);
+  box-shadow: 4px 4px 0 0 var(--muted);
+  cursor: not-allowed;
+}
+
+/* ── Narrower than three columns: a bar on top, a sheet below ──────────── */
+
+.spdex-tour__bar {
+  position: fixed;
+  top: 0.625rem;
+  left: 0.625rem;
+  right: 0.625rem;
+  z-index: 970;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.625rem;
+  padding: 0.4375rem 0.625rem;
+  background: var(--surface);
+  border: var(--line) solid var(--ink);
+  box-shadow: 4px 4px 0 0 var(--shadow);
+}
+.spdex-tour__bar .spdex-tour__chip { font-size: 0.625rem; letter-spacing: 1.5px; padding: 2px 6px; }
+.spdex-tour__links { display: flex; gap: 0.75rem; }
+.spdex-tour__links .spdex-linkbutton { font-family: var(--font-data); font-size: 0.6875rem; letter-spacing: 0.5px; white-space: nowrap; }
+.spdex-tour__links .spdex-tour__skip { margin-left: 0; font-size: 0.6875rem; }
+
+.spdex-tour__bubble--sheet {
+  left: 0.625rem;
+  right: 0.625rem;
+  bottom: 0.625rem;
+  top: auto;
+  width: auto;
+  max-width: none;
+  max-height: 46vh;
+  overflow: auto;
+  gap: 0.5rem;
+  padding: 0.625rem 0.75rem 0.75rem;
+}
+.spdex-tour__bubble--sheet .spdex-tour__title { font-size: 0.875rem; }
+.spdex-tour__bubble--sheet .spdex-tour__body { font-size: 0.875rem; line-height: 1.45; }
+.spdex-tour__arrows { display: flex; gap: 0.5rem; flex: none; }
+.spdex-tour__arrow {
+  display: grid;
+  place-items: center;
+  width: 2.625rem;
+  height: 2.25rem;
+  padding: 0;
+  border: var(--line) solid var(--ink);
+  background: var(--surface);
+  box-shadow: 3px 3px 0 0 var(--shadow);
+  color: var(--ink);
+  font-family: var(--font-body);
+  font-size: 1.125rem;
+  font-weight: 700;
+  line-height: 1;
+  cursor: pointer;
+}
+.spdex-tour__arrow--next { background: var(--c-lime); color: var(--accent-ink); }
+.spdex-tour__arrow:focus-visible { outline: var(--focus-ring) solid var(--ink); outline-offset: 2px; }

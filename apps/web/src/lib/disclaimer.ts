@@ -17,7 +17,7 @@
 import type { Pref } from "./prefs.js";
 
 /** Bump when the disclaimer's text changes, so every browser is shown it again. */
-export const DISCLAIMER_VERSION = "2026-10b";
+export const DISCLAIMER_VERSION = "2026-10c";
 
 export const DISCLAIMER_KEY = "spdex.disclaimer.v1";
 
@@ -43,9 +43,10 @@ export function disclaimerSeen(
  * community prototype is published without a lawyer's review, a risk its
  * publisher accepted on 2026-10-02; a release beyond the prototype should have
  * one read it first. It informs; it is not a clickwrap agreement. Change a
- * word, bump DISCLAIMER_VERSION: 2026-10 shipped, and 2026-10b is its text
+ * word, bump DISCLAIMER_VERSION: 2026-10 shipped, 2026-10b is its text
  * checked again against v2's vaults (who may be paid a buy's fee, and the
- * registry among "its contracts").
+ * registry among "its contracts"), and 2026-10c says where the network
+ * service is chosen now that it is Welcome's first step, not a first screen.
  *
  * Every sentence must be true of the code (UI rule R3, docs/ARCHITECTURE.md).
  * Re-check these sources whenever a signing path changes:
@@ -82,7 +83,8 @@ export function disclaimerSeen(
  *      by a button elsewhere (lib/store.ts `autoBundledRpc`,
  *      `bundledRpcAvailable`; App.tsx); not offered at all without a key or
  *      away from a canonical origin, where the chooser leaves it out
- *      (FirstRun.tsx); another is one click away
+ *      (FirstRun.tsx `ServiceChoices`, Welcome's first step, "Connect to
+ *      Ethereum"); another is one click away
  *      (Settings → Network service, Change service); a service sees your
  *      IP address (FirstRun.tsx, the glossary); modules and tip lists are
  *      untrusted (modules/tiplist-spx-community/module.js); settings links
@@ -145,7 +147,7 @@ export const DISCLAIMER_SECTIONS: readonly { label: string; text: string }[] = [
   {
     label: "Third-party services.",
     text:
-      "spDEX reads blockchain data through a network service that can see your IP address: the one you choose on the first screen. " +
+      "spDEX reads blockchain data through a network service that can see your IP address: the one you choose when you connect to Ethereum. " +
       `${OFFICIAL_RELEASE}, the publisher's built-in service is among the choices. Relays, keepers, ` +
       "markets, add-ons, tip lists and settings links come from other people, who can see what you send them. " +
       "spDEX has no control over any of these. Copies hosted elsewhere may have been modified, so check the build.",

@@ -1672,6 +1672,8 @@ textarea.spdex-code {
   cursor: pointer;
 }
 .spdex-widget__link:hover { background: var(--c-lime); }
+/* With no service yet: the way to Welcome's first step, first in the list. */
+.spdex-widget__connect { margin: 0 0 0.5rem; }
 .spdex-widget__link:focus-visible { outline: var(--focus-ring) solid var(--ink); outline-offset: 2px; }
 .spdex-widget__link--due {
   padding: 1px 6px;
@@ -2022,6 +2024,35 @@ textarea.spdex-code {
 /* 12px: on a phone the button wraps under the field and the hint follows the
    button, whose 4px shadow left 8px looking like 4. */
 .spdex-first-run__option > .spdex-field__hint { margin: 12px 0 0; }
+
+/* Welcome's first step: the person's own service, and one other, each a
+   card of its own. On a phone the cards lose their shadow, so a step inside a
+   tile inside the page isn't four frames deep. */
+.spdex-connect { display: grid; gap: 14px; }
+.spdex-connect > .spdex-first-run__receipt { margin: 0; }
+.spdex-connect__choice {
+  display: grid;
+  gap: 10px;
+  align-content: start;
+  padding: 14px;
+  border: var(--line) solid var(--ink);
+  box-shadow: 3px 3px 0 0 var(--shadow);
+  background: var(--surface);
+}
+.spdex-connect__choice p { margin: 0; }
+.spdex-connect__title {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: 0.71875rem;
+  font-weight: 800;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  color: var(--ink);
+}
+.spdex-connect__choice .spdex-first-run__guide { margin: 0; }
+@media (max-width: 38.75em) {
+  .spdex-connect__choice { padding: 12px; box-shadow: none; }
+}
 
 .spdex-first-run__heading {
   font-family: var(--font-display);

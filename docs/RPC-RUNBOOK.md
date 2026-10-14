@@ -17,18 +17,20 @@ month), or keep the site working once someone has drained the month.
 
 ## How the app uses it
 
-- **Every visitor chooses.** After the disclaimer, the first-run screen
-  recommends a free key of the visitor's own (Alchemy's sign-up walked
-  through), then a free public service, and last, as a quiet link, the
-  built-in service: only where a key is built in
+- **Every visitor chooses.** After the disclaimer, in Welcome's first step,
+  Connect to Ethereum (where the first-visit tour starts), a visitor uses a
+  service of their own (Alchemy's sign-up walked through in a fold) or, beside
+  it, the built-in service: only where a key is built in
   (`VITE_SPDEX_DEFAULT_RPC_URL`) and the page is at one of
   `VITE_SPDEX_CANONICAL_ORIGIN`'s origins, or anywhere if the build names none
   (`bundledRpcAvailable`, `apps/web/src/lib/store.ts`). On an IPFS gateway, a
-  self-hosted copy or a fork the key wouldn't work, so it isn't offered.
-  Nothing is sent to it until it is picked.
-- **What is chosen stays chosen.** Settings' Change service shows the same
-  screen, keeps the current service until another is chosen, and never brings
-  the built-in one back on its own.
+  self-hosted copy or a fork the key wouldn't work, so it isn't offered, and
+  the free public service is offered in its place. Nothing is sent to either
+  until it is picked.
+- **What is chosen stays chosen.** Settings' Change service shows the chooser
+  as a page of its own (a key of their own, the public service, and last, as
+  a quiet link, the built-in service), keeps the current service until another
+  is chosen, and never brings the built-in one back on its own.
 - **"Built-in" means this copy's key, never a saved one.** A browser that saved
   an older build's key uses this build's from its next load, so a rotation
   reaches returning visitors by itself. The swap is never saved
@@ -40,7 +42,7 @@ month), or keep the site working once someone has drained the month.
   operator, and it usually can't test-run (`eth_simulateV1`): without that the
   Guard falls back to static checks and shows **UNVERIFIED** in bold.
   Test-running every swap is what the built-in service buys.
-- **The operator sees you.** The disclaimer, the first-run screen, Settings →
+- **The operator sees you.** The disclaimer, Welcome's first step, Settings →
   Network service and the glossary all say that the service in use sees the
   person's IP address and queries.
 

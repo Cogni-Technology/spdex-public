@@ -618,7 +618,7 @@ test.describe("tip registry", () => {
     const viewer = await other.newPage();
     await viewer.goto(`/#receipt=${FORK_CHAIN_ID}:${buy}+${tips}`);
     await skipDisclaimer(viewer);
-    await openTile(viewer, "trade");
+    await openTile(viewer, "start");
     await viewer.getByTestId("rpc-url-input").fill(FORK_URL);
     await viewer.getByTestId("rpc-save").click();
     await openTile(viewer, "receipt");

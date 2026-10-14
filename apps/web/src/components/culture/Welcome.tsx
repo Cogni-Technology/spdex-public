@@ -1,9 +1,15 @@
 /**
- * "Welcome, new aeon": three steps from nothing to a first SPX, on Ethereum.
+ * "Welcome, new aeon": four steps from nothing to a first SPX, on Ethereum.
  *
- * It is how-to, never why-to: a wallet, ETH on Ethereum rather than another
- * network, and a first buy of a few dollars, the SPX6900 contract checked
- * before it. One short line a step; the rest is one tap away (a `Term`).
+ * It is how-to, never why-to: a network service to read Ethereum through, a
+ * wallet, ETH on Ethereum rather than another network, and a first buy of a
+ * few dollars, the SPX6900 contract checked before it. One short line a step;
+ * the rest is one tap away (a `Term`).
+ *
+ * The first step is where a newcomer chooses the service (`ServiceChoices`,
+ * which the page hands in), so Welcome is on the page before there is one;
+ * the first-visit tour starts there (lib/tour.ts). Once chosen, the step
+ * says which, with a way to change it.
  * That spDEX is a community project is said by the masthead, the disclaimer
  * and the footer, so it isn't said again here.
  *
@@ -26,7 +32,7 @@
  * wallet and the ETH side by side, the buy across under them.
  *
  * In a tile (`open` defined) it drops its own panel and title, which the
- * tile's header says, and reports "2 of 3 done" as the header's summary.
+ * tile's header says, and reports "2 of 4 done" as the header's summary.
  *
  * Hiding it is remembered in this browser (`spdex.welcome.v1`), like the
  * theme, and never in the config. `welcomeStore()` is the page's one copy of
@@ -48,6 +54,7 @@ import { shortAddress } from "../../lib/dca/format.js";
 import { NATIVE_ETH } from "../../lib/tokens.js";
 import { useTiles, type TilePanelProps, type TileSummary } from "../../lib/tiles.js";
 import { useBalance } from "../../lib/useBalance.js";
+import { CONNECT_COPY } from "../../lib/tour.js";
 import { CopyButton, InfoTerm } from "../dca/common.js";
 import { useTileSummary } from "../dca/tilePanel.js";
 import "./culture.css";
@@ -62,6 +69,14 @@ export const GET_ETH_URL = "https://ethereum.org/get-eth/";
 export const FIND_WALLET_URL = "https://ethereum.org/wallets/find-wallet/";
 
 export interface WelcomeProps extends TilePanelProps {
+  /** A network service is chosen: the first step is done. */
+  serviceChosen: boolean;
+  /** The service in use, by name ("the built-in service", a masked address), once chosen. */
+  serviceName: string | null;
+  /** The ways to choose one, shown in the first step until one is chosen. */
+  serviceChooser?: ReactNode;
+  /** Settings' Change service, from the first step once it is done. */
+  onChangeService?: () => void;
   account: Address | null;
   chainId: number;
   /** Null while it is being read (or with no wallet); "unreadable" when the read failed. */
@@ -89,7 +104,7 @@ export function Welcome(props: WelcomeProps): JSX.Element | null {
   const store = props.store ?? welcomeStore();
   const hidden = usePref(store);
   const hide = () => store.set(true);
-  const states = welcomeSteps(props.account, props.ethBalance);
+  const states = welcomeSteps(props.serviceChosen, props.account, props.ethBalance);
   useTileSummary(props.onSummary, welcomeSummary(states, props.firstBuy));
   if (hidden || !WELCOME_CHAINS.has(props.chainId)) return null;
   const inTile = props.open !== undefined;
@@ -123,7 +138,43 @@ export function Welcome(props: WelcomeProps): JSX.Element | null {
   const content = (
     <>
       <ol className="spdex-welcome__steps">
-        <Step n={1} title="Get a wallet" state={states[0]} status={<WalletStatus {...props} />}>
+        <Step
+          n={1}
+          title={CONNECT_COPY.title}
+          info={<InfoTerm tip={CONNECT_COPY.privacy} label="Who can see what" testId="rpc-privacy-notice" />}
+          state={states[0]}
+          status={
+            props.serviceChosen ? (
+              <p className="spdex-welcome__status" data-testid="welcome-service">
+                <span>Using {props.serviceName ?? "a network service"}</span>
+                {props.onChangeService !== undefined ? (
+                  <button
+                    type="button"
+                    className="spdex-linkbutton"
+                    data-testid="welcome-change-service"
+                    onClick={props.onChangeService}
+                  >
+                    Change
+                  </button>
+                ) : null}
+              </p>
+            ) : null
+          }
+        >
+          {props.serviceChosen ? null : (
+            <>
+              <p>{CONNECT_COPY.lead}</p>
+              {props.serviceChooser}
+            </>
+          )}
+        </Step>
+
+        <Step
+          n={2}
+          title="Get a wallet"
+          state={states[1]}
+          status={props.serviceChosen || props.account !== null ? <WalletStatus {...props} /> : null}
+        >
           <p>
             Use a browser-extension wallet, or your wallet app&apos;s browser.{" "}
             <Term tip="QR-code and passkey wallets can't connect yet.">Which wallets?</Term>
@@ -131,9 +182,9 @@ export function Welcome(props: WelcomeProps): JSX.Element | null {
         </Step>
 
         <Step
-          n={2}
+          n={3}
           title="Get ETH on Ethereum"
-          state={states[1]}
+          state={states[2]}
           status={
             props.account === null ? null : (
               <p className="spdex-welcome__status" data-testid="welcome-balance">
@@ -154,7 +205,7 @@ export function Welcome(props: WelcomeProps): JSX.Element | null {
           </p>
         </Step>
 
-        <Step n={3} title="Make a first buy" state={states[2]} status={null}>
+        <Step n={4} title="Make a first buy" state={states[3]} status={null}>
           <p>Check the address first: same name, other address = not SPX.</p>
           <p>
             <button
@@ -215,13 +266,13 @@ export function Welcome(props: WelcomeProps): JSX.Element | null {
   );
 }
 
-/** How many of the three steps are done: the ticks `welcomeSteps` gives. */
+/** How many of the four steps are done: the ticks `welcomeSteps` gives. */
 export function stepsDone(states: readonly StepState[]): number {
   return states.filter((state) => state === "done").length;
 }
 
 /**
- * The tile header's summary: "2 of 3 done", or, after a first buy, "make a
+ * The tile header's summary: "2 of 4 done", or, after a first buy, "make a
  * card" (or "first SPX in" for a buy the card can't show).
  */
 export function welcomeSummary(states: readonly StepState[], firstBuy: RecordRow | null): TileSummary {
@@ -229,40 +280,51 @@ export function welcomeSummary(states: readonly StepState[], firstBuy: RecordRow
   return { text: `${stepsDone(states)} of ${states.length} done` };
 }
 
-/** What "← Back to …" says after a step's button showed a place: "steps (2 of 3)". */
-export function welcomeBackLabel(account: Address | null, ethBalance: WelcomeProps["ethBalance"]): string {
-  const states = welcomeSteps(account, ethBalance);
+/** What "← Back to …" says after a step's button showed a place: "steps (2 of 4)". */
+export function welcomeBackLabel(
+  serviceChosen: boolean,
+  account: Address | null,
+  ethBalance: WelcomeProps["ethBalance"],
+): string {
+  const states = welcomeSteps(serviceChosen, account, ethBalance);
   return `steps (${stepsDone(states)} of ${states.length})`;
 }
 
 export type StepState = "done" | "current" | "later";
 
 /**
- * Where each step stands. A wallet is step 1, ETH in it step 2, and the first
- * buy (the contract checked first) opens once both are done. It never ticks
- * here: a first buy replaces the steps with "Your first SPX is in."
+ * Where each step stands. A network service is step 1, a wallet step 2, ETH
+ * in it step 3, and the first buy (the contract checked first) opens once
+ * those are done. It never ticks here: a first buy replaces the steps with
+ * "Your first SPX is in." With no service, nothing past the first step can
+ * be read, so the rest wait.
  */
 export function welcomeSteps(
+  serviceChosen: boolean,
   account: Address | null,
   ethBalance: WelcomeProps["ethBalance"],
-): [StepState, StepState, StepState] {
+): [StepState, StepState, StepState, StepState] {
   const hasWallet = account !== null;
-  const hasEth = hasWallet && typeof ethBalance === "bigint" && ethBalance > 0n;
-  const first: StepState = hasWallet ? "done" : "current";
-  const second: StepState = hasEth ? "done" : hasWallet ? "current" : "later";
-  const third: StepState = hasEth ? "current" : "later";
-  return [first, second, third];
+  const hasEth = serviceChosen && hasWallet && typeof ethBalance === "bigint" && ethBalance > 0n;
+  const connect: StepState = serviceChosen ? "done" : "current";
+  const wallet: StepState = hasWallet ? "done" : serviceChosen ? "current" : "later";
+  const eth: StepState = hasEth ? "done" : serviceChosen && hasWallet ? "current" : "later";
+  const buy: StepState = hasEth ? "current" : "later";
+  return [connect, wallet, eth, buy];
 }
 
 function Step({
   n,
   title,
+  info,
   state,
   status,
   children,
 }: {
   n: number;
   title: string;
+  /** An ⓘ after the title: what the step means, one tap away. */
+  info?: ReactNode;
   state: StepState;
   /**
    * Where the step stands, in one line ("Connected: 0x…", the balance) or the
@@ -281,15 +343,16 @@ function Step({
         <h3 className="spdex-welcome__title">
           {title}
           {state === "done" ? <span className="spdex-sr"> (done)</span> : null}
+          {info}
         </h3>
-        <div className="spdex-welcome__detail">{children}</div>
+        {children === null ? null : <div className="spdex-welcome__detail">{children}</div>}
         {status}
       </div>
     </li>
   );
 }
 
-/** Step 1's line: connected (with the full address to copy, which step 2 needs), a Connect button, or no wallet. */
+/** The wallet step's line: connected (with the full address to copy, which the ETH step needs), a Connect button, or no wallet. */
 function WalletStatus({ account, walletAvailable, onConnect }: Pick<WelcomeProps, "account" | "walletAvailable" | "onConnect">) {
   if (account !== null) {
     const address = checksumAddress(account);
@@ -371,7 +434,10 @@ export function useWelcomeHidden(store: PrefStore<boolean> = welcomeStore()): bo
 export interface WelcomeOnPage {
   /** Hidden in this browser (then the strip offers "Getting started"). */
   hidden: boolean;
-  /** On screen: a network service is chosen, it is on Ethereum or the fork, and it isn't hidden. */
+  /**
+   * On screen: on Ethereum or the fork (the default before a service is
+   * chosen), and not hidden. A newcomer chooses the service in its first step.
+   */
   shown: boolean;
   /** The wallet's ETH, for the second step. */
   ethBalance: WelcomeProps["ethBalance"];
@@ -402,9 +468,9 @@ export function useWelcome(input: {
   reveal?: (target: string, opts?: { block?: ScrollLogicalPosition }) => Promise<boolean>;
 }): WelcomeOnPage {
   const hidden = useWelcomeHidden();
-  const shown = input.rpc !== null && !hidden && WELCOME_CHAINS.has(input.chainId);
+  const shown = !hidden && WELCOME_CHAINS.has(input.chainId);
   const own = useBalance(input.rpc, NATIVE_ETH.address, input.account, {
-    enabled: shown && (input.cardEth === undefined || input.cardEth === null),
+    enabled: shown && input.rpc !== null && (input.cardEth === undefined || input.cardEth === null),
     key: input.balanceKey,
     refresh: input.refresh,
   });

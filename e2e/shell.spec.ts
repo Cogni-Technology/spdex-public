@@ -18,6 +18,7 @@ import {
   openTile,
   seedDisclaimer,
   watchRpc,
+  WELCOME_KEY,
 } from "./fixtures.js";
 import { DISCLAIMER_KEY, DISCLAIMER_VERSION, OFFICIAL_RELEASE } from "../apps/web/src/lib/disclaimer.js";
 
@@ -31,6 +32,7 @@ const MONEY = [
   "dca-remove-plans-confirm",
   "reset-config",
   "change-rpc",
+  "welcome-change-service",
   "dca-enable",
   "rpc-use-bundled",
   "rpc-use-fallback",
@@ -257,7 +259,7 @@ test.describe("the tiles", () => {
     await expect(page.getByTestId("tile-trade")).toHaveAttribute("aria-expanded", "true");
     await expect(page.getByTestId("tile-start")).toHaveAttribute("aria-expanded", "false");
     const back = page.getByTestId("goto-back");
-    await expect(back).toHaveText(/^← Back to steps \(\d of 3\)$/);
+    await expect(back).toHaveText(/^← Back to steps \(\d of 4\)$/);
     expect(await focusOnMoney(page)).toBe(false);
     await back.click();
     await expect(page.getByTestId("tile-start")).toHaveAttribute("aria-expanded", "true");
@@ -346,14 +348,27 @@ test.describe("the tiles", () => {
 
 test.describe("the footer", () => {
   test("is the page's contentinfo, and on the first-run screen offers nothing that needs tiles or Settings", async ({ page }) => {
+    // The chooser is a page of its own, in place of the tiles, only where
+    // Welcome (whose first step it is otherwise) is hidden.
+    await page.addInitScript((key) => localStorage.setItem(key, "hidden"), WELCOME_KEY);
     await page.goto("/");
     await expect(page.getByTestId("first-run")).toBeVisible();
+    await expect(page.locator("[data-tile]")).toHaveCount(0);
     const footer = page.getByRole("contentinfo");
     await expect(footer).toHaveCount(1);
     await expect(footer).toContainText("Community project.");
     await expect(page.getByTestId("goto-trust")).toHaveCount(0);
     await expect(page.getByTestId("key-hints")).toHaveCount(0);
     await expect(page.getByTestId("footer-disclaimer")).toBeVisible();
+  });
+
+  test("on a first visit, where Welcome's first step is the chooser, offers the tour again and Check this build", async ({ page }) => {
+    await page.goto("/");
+    await expect(page.getByTestId("welcome-step-1").getByTestId("first-run")).toBeVisible();
+    await expect(page.getByTestId("footer-tour")).toHaveText("Show me around again");
+    await expect(page.getByTestId("goto-trust")).toHaveCount(1);
+    // The status panel's way to the same step.
+    await expect(page.getByTestId("status-connect-service")).toHaveText("Connect to Ethereum →");
   });
 });
 
