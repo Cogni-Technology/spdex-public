@@ -40,6 +40,13 @@ describe("disclaimer version", () => {
     expect(disclaimerSeen("2026-10")).toBe(false);
   });
 
+  it("shows the text again to a browser that continued past it when the service was chosen on a first screen", () => {
+    // 2026-10b said "the one you choose on the first screen"; the choice is
+    // Welcome's first step now, "Connect to Ethereum".
+    expect(disclaimerSeen("2026-10b")).toBe(false);
+    expect(DISCLAIMER_SECTIONS[6]!.text).not.toContain("first screen");
+  });
+
   it("imports nothing at run time, so the e2e fixtures can read it without the app", () => {
     const source = readFileSync(fileURLToPath(new URL("./disclaimer.ts", import.meta.url)), "utf8");
     const imports = [...source.matchAll(/^import\s+(?!type\b)[^;]*;/gm)].map((m) => m[0]);
@@ -80,7 +87,7 @@ describe("disclaimer text", () => {
     // `bundledRpcAvailable`); elsewhere the chooser says it isn't offered.
     const services = DISCLAIMER_SECTIONS[6]!.text;
     expect(services).toContain(
-      `can see your IP address: the one you choose on the first screen. ${OFFICIAL_RELEASE}, the publisher's built-in service is among the choices.`,
+      `can see your IP address: the one you choose when you connect to Ethereum. ${OFFICIAL_RELEASE}, the publisher's built-in service is among the choices.`,
     );
     // The glossary says the same in its own words.
     expect(GLOSSARY.networkService).toContain(

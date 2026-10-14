@@ -194,9 +194,9 @@ runs `--strict`.
 
 4. **No telemetry, analytics, or error reporting.** Not behind a flag. Every
    request the app makes goes to the network service in use (the one the
-   person chose on the first screen; the built-in one the disclaimer names is
-   among the choices and never used without asking) or the relay the person
-   chose. A link the person clicks is fine; a fetch anywhere else is not, nor a
+   person chose in Welcome's first step, Connect to Ethereum, or Settings'
+   Change service; the built-in one the disclaimer names is among the choices
+   and never used without asking) or the relay the person chose. A link the person clicks is fine; a fetch anywhere else is not, nor a
    remote image, font, script or frame.
    - The mechanical check is partial. `apps/web/src/no-requests.test.ts` (in
      `unit`) parses the app's, host packages', module SDK's and first-party
@@ -418,6 +418,10 @@ apps/web            Vite SPA
   lib/reminders       calendar files, the buy-due and proof-lapse notifications
   lib/finality.ts     + components/trust: the Sent → Included → Final badge
   lib/culture         Welcome, Your stack, the "I bought" card, #receipt=, sayings, preset amounts
+  lib/tour.ts         + components/tour: the first-visit tour (the welcome card, then a spotlight
+                      on one place at a time); its first stop is Welcome's first step, Connect
+                      to Ethereum (FirstRun.tsx `ServiceChoices`); the card's picture and its
+                      licence: assets/tour/README.md
   lib/network         Collective DCA; Help run the network (batch.ts: due buys from the person's
                       wallet, private sending only, in-window only for an eligible wallet);
                       Community keeping (keeping.ts: eligibility, Prove my SPX, Prove another

@@ -16,6 +16,9 @@
  * the key hints (they describe tiles) nor "Check this build" (it goes to a
  * Settings section) is shown until a network service is chosen.
  *
+ * "Show me around again" starts the first-visit tour from its welcome card
+ * (lib/tour.ts), wherever Welcome, where it begins, can show.
+ *
  * Rendered after `<main>`, so it is the page's `contentinfo` landmark and a
  * screen reader can jump to the disclaimer line.
  */
@@ -24,8 +27,18 @@ import { KeyHints } from "@spdex/ui";
 import { FOOTER_LINE } from "../../lib/disclaimer.js";
 import { feedbackUrl, sourceUrl } from "../../lib/links.js";
 import { GoTo } from "../../lib/places.js";
+import { TOUR_REPLAY } from "../../lib/tour.js";
 
-export function Footer({ onDisclaimer, firstRun = false }: { onDisclaimer: () => void; firstRun?: boolean }) {
+export function Footer({
+  onDisclaimer,
+  firstRun = false,
+  onTour,
+}: {
+  onDisclaimer: () => void;
+  firstRun?: boolean;
+  /** Starts the tour again; the link shows only when given. */
+  onTour?: () => void;
+}) {
   const source = sourceUrl();
   const feedback = feedbackUrl();
   return (
@@ -40,6 +53,13 @@ export function Footer({ onDisclaimer, firstRun = false }: { onDisclaimer: () =>
             Disclaimer
           </button>
         </li>
+        {onTour !== undefined ? (
+          <li>
+            <button type="button" className="spdex-footer__link" data-testid="footer-tour" onClick={onTour}>
+              {TOUR_REPLAY}
+            </button>
+          </li>
+        ) : null}
         {firstRun ? null : (
           <li>
             <GoTo place="trust">Check this build</GoTo>

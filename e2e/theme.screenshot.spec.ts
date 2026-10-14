@@ -70,7 +70,7 @@ for (const { mode, suffix } of MODES) {
     test("first run", async ({ page, account }) => {
       await installWallet(page, { address: account });
       await page.goto("/");
-      await openTile(page, "trade");
+      await openTile(page, "start");
       await expect(page.getByTestId("first-run")).toBeVisible();
       await expectMode(page);
       await page.screenshot({ path: shot("01-first-run"), fullPage: true });

@@ -100,10 +100,11 @@ ignore the name and open a CID directly, which is the point.
 ## What changes on an IPFS copy
 
 The built-in service's key is allowlisted to the canonical origins
-(`VITE_SPDEX_CANONICAL_ORIGIN`), and the app offers it, last on the first
-screen, only there; it never uses it without asking. On a gateway the key
-won't work, so the first screen leaves it out and offers a key of the user's
-own or the public service (`docs/RPC-RUNBOOK.md`). A stable name that serves
+(`VITE_SPDEX_CANONICAL_ORIGIN`), and the app offers it, beside the user's own
+service in Welcome's first step (Connect to Ethereum), only there; it never
+uses it without asking. On a gateway the key won't work, so that step leaves
+it out and offers a key of the user's own or the public service
+(`docs/RPC-RUNBOOK.md`). A stable name that serves
 the release, such as `https://<name>.eth.limo`, can be a canonical origin too:
 list it in `VITE_SPDEX_CANONICAL_ORIGIN` (comma-separated, each with its
 `https://`; the build refuses a bare host) and in the key's Alchemy Domains

@@ -42,7 +42,8 @@ test.describe("recommended mode", () => {
     await installWallet(page, { address: account });
     await page.goto("/");
     await skipDisclaimer(page);
-    await openTile(page, "trade");
+    // Welcome's first step, where a newcomer chooses: open on load.
+    await openTile(page, "start");
 
     // No backend means no default that works everywhere: the bundled key is
     // allowlisted to the canonical origin, so a local copy has to be told.
@@ -65,7 +66,7 @@ test.describe("recommended mode", () => {
     await installWallet(page, { address: account });
     await page.goto("/");
     await skipDisclaimer(page);
-    await openTile(page, "trade");
+    await openTile(page, "start");
 
     await page.getByTestId("rpc-url-input").fill("not-a-url");
     await page.getByTestId("rpc-save").click();

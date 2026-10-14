@@ -98,9 +98,10 @@ test.describe("receipt", () => {
     const viewer = await other.newPage();
     await viewer.goto(`/#receipt=${FORK_CHAIN_ID}:${hash}`);
     await skipDisclaimer(viewer);
-    await openTile(viewer, "trade");
-    // Nothing is read before a network service is chosen, and the first-run
-    // screen says why this visit is waiting.
+    // Welcome, where the service is chosen, is open while there is none.
+    await openTile(viewer, "start");
+    // Nothing is read before a network service is chosen, and Welcome's
+    // first step says why this visit is waiting.
     await expect(viewer.getByTestId("first-run-receipt")).toHaveText(
       "Someone shared a transaction. Choose a network service and spDEX will show what the chain says about it.",
     );

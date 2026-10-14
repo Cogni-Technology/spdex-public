@@ -144,6 +144,11 @@ export default defineConfig({
     // The Welcome panel. Every other spec starts with it hidden, as it starts
     // with the Features dialog seen; these opt in with `showWelcome: true`.
     { name: "welcome", testMatch: /welcome\.spec\.ts/, use: { ...devices["Desktop Chrome"], launchOptions } },
+    // The first-visit tour: the welcome card after a first visit's
+    // disclaimer, then the walk round the page, at the default size (where
+    // its bubble is a sheet) and on a phone. One spec chooses the fork as its
+    // service; nothing is sent.
+    { name: "tour", testMatch: /tour\.spec\.ts/, use: { ...devices["Desktop Chrome"], launchOptions } },
     // The "I bought" card and the #receipt= view: a real swap, a card made
     // from it, and the view opened from that link in a fresh context. Real
     // transactions, so the same budget and retry rule as records.

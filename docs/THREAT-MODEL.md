@@ -136,10 +136,12 @@ It can lie about state, so it can lie about a simulation.
   service; a card's claim is never taken on its own word.
 
 So the endpoint is disclosed, never hidden. The built-in service is never used
-without asking: it is offered, last, on the first screen, only on the origins
-its publisher hosts (its key is allowlisted to them), once the person has
-continued past the disclaimer, which names it and says it sees their IP
-address. Elsewhere, first-run asks. It shows in the status panel and Settings
+without asking: it is offered beside the person's own service in Welcome's
+first step (Connect to Ethereum), and last on Settings' Change service, only
+on the origins its publisher hosts (its key is allowlisted to them), once the
+person has continued past the disclaimer, which names it and says it sees
+their IP address. Elsewhere, that step offers the free public service in its
+place. It shows in the status panel and Settings
 → Network service, one click from another. The privacy notice says what the
 operator sees, the app never moves anyone to another operator by itself (a
 failing built-in service gets a notice and a button, not a switch), and the
@@ -1467,8 +1469,8 @@ Each is stated, with its reasoning, in the section named.
   none can underpay, but a later leg can revert after earlier ones executed.
   The app says so on any route with more than one leg.
 - **Anonymity.** Your endpoint operator sees your address and your queries,
-  the built-in service's publisher included; the disclaimer, the first-run
-  screen and Settings → Network service say so. Private sending hides you
+  the built-in service's publisher included; the disclaimer, Welcome's first
+  step (its ⓘ) and Settings → Network service say so. Private sending hides you
   from the *mempool*, not from your node. Some reads say less than they might:
   the currency rates are one request whichever currency you chose, and
   Collective DCA's reads never name your address. But opening a `#receipt=`

@@ -11,6 +11,7 @@ import { test as base, expect, type BrowserContext, type Page, type Request } fr
 import { headlessWalletScript } from "../packages/testing/src/wallet.js";
 import { recommendedConfig } from "../packages/config/src/index.js";
 import { DISCLAIMER_KEY, DISCLAIMER_VERSION } from "../apps/web/src/lib/disclaimer.js";
+import { TOUR_KEY } from "../apps/web/src/lib/tour.js";
 
 export const FORK_URL = process.env["SPDEX_FORK_URL"] ?? "http://127.0.0.1:8545";
 
@@ -701,6 +702,25 @@ export async function seedDisclaimer(context: BrowserContext): Promise<void> {
   );
 }
 
+/**
+ * Marks the first-visit tour as seen in every page of `context`, before each
+ * load, as the `tourSeen` fixture does for the default context. It starts by
+ * itself only as a first visit's disclaimer closes, so this matters to a spec
+ * that shows the disclaimer; tour.spec.ts opts out with `showTour: true`.
+ */
+export async function seedTour(context: BrowserContext): Promise<void> {
+  await context.addInitScript(
+    (key: string) => {
+      try {
+        window.localStorage.setItem(key, "seen");
+      } catch {
+        // A page with no storage (about:blank) has no tour either.
+      }
+    },
+    TOUR_KEY,
+  );
+}
+
 let nextAccount = 0;
 
 /**
@@ -711,7 +731,13 @@ let nextAccount = 0;
  * since leftovers there are exactly what let a broken approval path look
  * healthy.
  */
-export const test = base.extend<{ account: string; showDisclaimer: boolean; disclaimerSeen: void }>({
+export const test = base.extend<{
+  account: string;
+  showDisclaimer: boolean;
+  disclaimerSeen: void;
+  showTour: boolean;
+  tourSeen: void;
+}>({
   /**
    * Every spec starts with the disclaimer already seen, at the version the
    * app ships (imported, so a new version needs no edit here), as it starts
@@ -722,6 +748,15 @@ export const test = base.extend<{ account: string; showDisclaimer: boolean; disc
   disclaimerSeen: [
     async ({ context, showDisclaimer }, use) => {
       if (!showDisclaimer) await seedDisclaimer(context);
+      await use();
+    },
+    { auto: true },
+  ],
+  /** Every spec starts with the tour seen, as with the disclaimer; tour.spec.ts opts in with `showTour: true`. */
+  showTour: [false, { option: true }],
+  tourSeen: [
+    async ({ context, showTour }, use) => {
+      if (!showTour) await seedTour(context);
       await use();
     },
     { auto: true },

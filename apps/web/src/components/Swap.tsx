@@ -105,7 +105,10 @@ export function TradeCard({
           ]}
         />
       </div>
-      <div hidden={buyMode !== "once"}>{oneTime}</div>
+      {/* The One-time tab's whole form: what the tour points at on a phone (lib/tour.ts). */}
+      <div hidden={buyMode !== "once"} data-testid="buy-once">
+        {oneTime}
+      </div>
       <div hidden={buyMode !== "recurring"}>{recurring}</div>
     </>
   );

@@ -82,14 +82,15 @@ describe("FreeKeyGuide", () => {
     expect(html).not.toMatch(/<details[^>]*data-testid="rpc-infura-guide"[^>]*\sopen/);
     // And it says plainly what hasn't been checked about it.
     expect(html).toMatch(/Its safety check and SPX proofs haven.{0,10}t been tested yet/);
-    // Alchemy's own guide is a step away.
+    // "alchemy.com" opens Alchemy's own guide, not its home page.
     expect(html).toContain('href="https://www.alchemy.com/docs/create-an-api-key"');
+    expect(html).not.toContain('href="https://www.alchemy.com"');
   });
 
   it("only links out: each link opens a new tab with no referrer, and nothing is loaded from those sites", () => {
     const html = render();
     const links = [...html.matchAll(/<a [^>]*>/g)].map((m) => m[0]).filter((tag) => /alchemy|infura/.test(tag));
-    expect(links).toHaveLength(3);
+    expect(links).toHaveLength(2);
     for (const tag of links) {
       expect(tag).toContain('target="_blank"');
       expect(tag).toContain('rel="noreferrer noopener"');

@@ -100,15 +100,18 @@ added it for you).
 2. **Before you swap**, the disclaimer, comes first on a first visit and again
    whenever its text changes. Any key (Enter, say), a click outside the text
    or **Continue** closes it; the footer's **Disclaimer** link shows it again
-3. **Connect to Ethereum** asks which network service to use. Under **Your own
-   free key**, skip the sign-up steps, enter `http://127.0.0.1:8545` in **Your
-   key's URL** and click **Use this**. If **Use a free public service** is
-   offered, skip it: that is the real network, not your fork
+3. A welcome card offers a short tour (**Show me around**, or **Skip the
+   tour**; the footer's **Show me around again** brings it back). Either way,
+   **Connect to Ethereum**, the first step of **Welcome, new aeon**, asks which
+   network service to use. Under **Use your own service**, enter
+   `http://127.0.0.1:8545` and click **Use this** (the sign-up steps under
+   **How to get a free key** are for the real network). If **Use a free public
+   service** is offered, skip it: that is the real network, not your fork
 4. The page is a column of tiles, one open at a time: **Welcome, new aeon**,
    **Buy SPX**, **Your SPX**, **Markets**, **Collective DCA** and
    **Settings**. Click a header, or use ↑/↓ and Enter. **Welcome, new aeon**
-   is three steps for someone new to SPX6900: a wallet, ETH on Ethereum and a
-   first buy. While it's there, the **Features** dialog doesn't open by itself
+   is four steps for someone new to SPX6900: a network service (done above), a
+   wallet, ETH on Ethereum and a first buy. While it's there, the **Features** dialog doesn't open by itself
    (**Settings** → **Features** opens it). **Hide this** puts Welcome away,
    and **Buy SPX** is then the tile open on load; **Settings** → **Getting
    started** brings it back. The status panel at the top says whether your

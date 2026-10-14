@@ -61,10 +61,11 @@ we have an **Expert mode** in settings that will do the trick for you.
 
 1. Open **<https://www.spdex.io>**.
 2. Read the disclaimer.
-3. Choose a network service. We recommend your own free key from an RPC
-   provider, and the first screen shows how to get one. Though you can click
-   "Continue with spDEX's built-in service" on the **Connect to Ethereum**
-   page to use an RPC URL courtesy of the spDEX team.
+3. Choose a network service. A short tour starts at **Connect to Ethereum**,
+   the first step of the **Welcome** tile. We recommend your own free key from
+   an RPC provider, and the step shows how to get one. Though you can pick
+   "Use the built-in service" beside it to use an RPC URL courtesy of the
+   spDEX team.
 4. Connect your wallet on Ethereum.
 
 New to this? The **Welcome** tile walks you through a first buy. To practice

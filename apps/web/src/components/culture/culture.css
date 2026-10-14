@@ -235,6 +235,11 @@
   .spdex-welcome__step--done .spdex-welcome__detail,
   .spdex-welcome__step--later .spdex-welcome__detail,
   .spdex-welcome__step--later .spdex-welcome__status { display: none; }
+  /* The number is a square beside the title, not a bar down the step, so
+     what the step says gets the whole width. */
+  .spdex-welcome__step { display: block; position: relative; }
+  .spdex-welcome__num { position: absolute; top: 12px; left: 0; }
+  .spdex-welcome__title { min-height: 30px; padding-left: 42px; }
 }
 
 /* Wider: cards, all open, two to a row; a last card alone in its row (the
@@ -443,11 +448,13 @@
   border-top: 1px solid var(--hairline);
 }
 
-/* Touch targets: Welcome's two quiet links, the contract line's summary and
+/* Touch targets: Welcome's quiet links (its foot's two, and a step's line's
+   Change), the contract line's summary and
    every preset chip (amounts, the "69 buys" count, goals, the card's sizes)
    reach 44px on phones and touch screens, as the rest of the page does. */
 @media (max-width: 38.75em), (pointer: coarse) {
-  .spdex-welcome__foot .spdex-linkbutton { min-height: 44px; }
+  .spdex-welcome__foot .spdex-linkbutton,
+  .spdex-welcome__status .spdex-linkbutton { min-height: 44px; }
   .spdex-presets__chip { min-height: 44px; }
   .spdex-contract-line > summary { min-height: 44px; padding-block: 0.75rem; box-sizing: border-box; }
 }

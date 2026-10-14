@@ -30,6 +30,8 @@ class Store {
 function render(over: Partial<WelcomeProps> = {}): string {
   return renderToStaticMarkup(
     createElement(Welcome, {
+      serviceChosen: true,
+      serviceName: "the built-in service",
       account: null,
       chainId: 1,
       ethBalance: null,
@@ -50,13 +52,19 @@ const textOf = (html: string) => html.replace(/<[^>]+>/g, " ").replaceAll("&#x27
 
 describe("welcomeSteps", () => {
   it("ticks a step from the page's state, never from a click", () => {
-    expect(welcomeSteps(null, null)).toEqual(["current", "later", "later"]);
-    expect(welcomeSteps(ME, null)).toEqual(["done", "current", "later"]);
-    expect(welcomeSteps(ME, "unreadable")).toEqual(["done", "current", "later"]);
-    expect(welcomeSteps(ME, 0n)).toEqual(["done", "current", "later"]);
-    expect(welcomeSteps(ME, 1n)).toEqual(["done", "done", "current"]);
+    expect(welcomeSteps(true, null, null)).toEqual(["done", "current", "later", "later"]);
+    expect(welcomeSteps(true, ME, null)).toEqual(["done", "done", "current", "later"]);
+    expect(welcomeSteps(true, ME, "unreadable")).toEqual(["done", "done", "current", "later"]);
+    expect(welcomeSteps(true, ME, 0n)).toEqual(["done", "done", "current", "later"]);
+    expect(welcomeSteps(true, ME, 1n)).toEqual(["done", "done", "done", "current"]);
     // ETH in a wallet nobody connected is nothing the page can see.
-    expect(welcomeSteps(null, 10n ** 18n)).toEqual(["current", "later", "later"]);
+    expect(welcomeSteps(true, null, 10n ** 18n)).toEqual(["done", "current", "later", "later"]);
+  });
+
+  it("starts at choosing a service, and waits for one before anything can be read", () => {
+    expect(welcomeSteps(false, null, null)).toEqual(["current", "later", "later", "later"]);
+    // Nothing can be read without a service, so a balance from before one is no tick.
+    expect(welcomeSteps(false, ME, 1n)).toEqual(["current", "done", "later", "later"]);
   });
 
   it("has no step the page can't tick: the contract check is the buy step's first line", () => {
@@ -65,8 +73,9 @@ describe("welcomeSteps", () => {
       'data-testid="welcome-step-1"',
       'data-testid="welcome-step-2"',
       'data-testid="welcome-step-3"',
+      'data-testid="welcome-step-4"',
     ]);
-    const buy = html.slice(html.indexOf('data-testid="welcome-step-3"'));
+    const buy = html.slice(html.indexOf('data-testid="welcome-step-4"'));
     expect(textOf(buy)).toContain("Make a first buy");
     expect(buy.indexOf('data-testid="welcome-show-contract"')).toBeGreaterThan(-1);
     expect(buy.indexOf('data-testid="welcome-show-contract"')).toBeLessThan(buy.indexOf('data-testid="welcome-to-amount"'));
@@ -176,10 +185,34 @@ describe("Welcome", () => {
     const unmeasured = render({ firstBuy: { ...firstBuy, bought: { ...firstBuy.bought, measured: false } } });
     expect(unmeasured).not.toContain("make-card");
     // The tile header says what's next.
-    expect(welcomeSummary(welcomeSteps(ME, 1n), firstBuy)).toEqual({ text: "make a card" });
-    expect(welcomeSummary(welcomeSteps(ME, 1n), { ...firstBuy, bought: { ...firstBuy.bought, measured: false } })).toEqual({
+    expect(welcomeSummary(welcomeSteps(true, ME, 1n), firstBuy)).toEqual({ text: "make a card" });
+    expect(welcomeSummary(welcomeSteps(true, ME, 1n), { ...firstBuy, bought: { ...firstBuy.bought, measured: false } })).toEqual({
       text: "first SPX in",
     });
+  });
+});
+
+describe("Welcome's first step", () => {
+  it("holds the ways to choose a service until one is chosen, with who sees what one tap away", () => {
+    const html = render({ serviceChosen: false, serviceName: null, serviceChooser: createElement("p", { "data-testid": "chooser" }) });
+    const first = html.slice(html.indexOf('data-testid="welcome-step-1"'), html.indexOf('data-testid="welcome-step-2"'));
+    expect(textOf(first)).toContain("Connect to Ethereum");
+    expect(textOf(first)).toContain("In order to DCA into SPX6900, you must first connect to the Ethereum network.");
+    expect(first).toContain('data-testid="chooser"');
+    expect(first).toContain('data-testid="rpc-privacy-notice"');
+    expect(textOf(first)).toContain("The service you pick sees your IP address, the addresses you look up and what you send.");
+    expect(first).toContain('data-state="current"');
+    // No wallet to connect before there is a service to read it through.
+    expect(html).not.toContain('data-testid="welcome-connect"');
+  });
+
+  it("says which service is in use once chosen, with a way to change it", () => {
+    const html = render({ onChangeService: () => {} });
+    const first = html.slice(html.indexOf('data-testid="welcome-step-1"'), html.indexOf('data-testid="welcome-step-2"'));
+    expect(textOf(first)).toContain("Using the built-in service");
+    expect(first).toContain('data-testid="welcome-change-service"');
+    expect(first).toContain('data-state="done"');
+    expect(first).not.toContain("In order to DCA");
   });
 });
 
@@ -191,15 +224,15 @@ describe("Welcome in a tile", () => {
     expect(html).not.toContain("spdex-panel");
     expect(textOf(html)).not.toContain("Welcome, new aeon");
     // Effects don't run in a static render; the summary itself is a pure function.
-    expect(welcomeSummary(welcomeSteps(ME, 1n), null)).toEqual({ text: "2 of 3 done" });
-    expect(welcomeSummary(welcomeSteps(null, null), null)).toEqual({ text: "0 of 3 done" });
+    expect(welcomeSummary(welcomeSteps(true, ME, 1n), null)).toEqual({ text: "3 of 4 done" });
+    expect(welcomeSummary(welcomeSteps(false, null, null), null)).toEqual({ text: "0 of 4 done" });
     expect(told).toEqual([]);
   });
 
   it("names the steps for the back chip, with how far along they are", () => {
-    expect(stepsDone(welcomeSteps(ME, 0n))).toBe(1);
-    expect(welcomeBackLabel(ME, 1n)).toBe("steps (2 of 3)");
-    expect(welcomeBackLabel(null, null)).toBe("steps (0 of 3)");
+    expect(stepsDone(welcomeSteps(true, ME, 0n))).toBe(2);
+    expect(welcomeBackLabel(true, ME, 1n)).toBe("steps (3 of 4)");
+    expect(welcomeBackLabel(false, null, null)).toBe("steps (0 of 4)");
   });
 });
 

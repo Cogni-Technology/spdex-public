@@ -111,7 +111,7 @@ export function receiptSummary(hash: string): TileSummary {
   return { text: `${hash.slice(0, 6)}…${hash.slice(-4)}` };
 }
 
-/** NEW: how many of Welcome's three steps are done, or the card offer after a first buy. */
+/** NEW: how many of Welcome's four steps are done, or the card offer after a first buy. */
 export function startSummary(steps: readonly string[], firstBuy: boolean): TileSummary {
   if (firstBuy) return { text: "make a card" };
   return { text: `${steps.filter((step) => step === "done").length} of ${steps.length} done` };
@@ -171,7 +171,7 @@ export interface RevealOptions {
   focus?: boolean;
   /** Where "← Back to …" returns: the element focused again, in its tile. */
   returnTo?: HTMLElement | null;
-  /** The back chip's words after "Back to", when the origin tile's title isn't the right name ("steps (2 of 3)"). */
+  /** The back chip's words after "Back to", when the origin tile's title isn't the right name ("steps (2 of 4)"). */
   backLabel?: string;
 }
 
@@ -218,6 +218,7 @@ export const MONEY_CONTROLS = [
   '[data-testid="accept-staged"]',
   '[data-testid="reset-config"]',
   '[data-testid="change-rpc"]',
+  '[data-testid="welcome-change-service"]',
   '[data-testid="rpc-save"]',
   '[data-testid="second-opinion-save"]',
   '[data-testid="older-save-restore"]',
